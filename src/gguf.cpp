@@ -177,7 +177,14 @@ LoadReport parse_gguf(R& r,std::uint64_t file_size){
         set("qwen2moe.expert_count",out.config.expert_count);set("qwen2moe.expert_used_count",out.config.expert_used_count);
         set("qwen3moe.expert_count",out.config.expert_count);set("qwen3moe.expert_used_count",out.config.expert_used_count);
         if(key=="prism.hadamard.block_size"&&type!=ARRAY)out.config.hadamard_block_size=static_cast<std::uint32_t>(number);
+        if(key=="prism.hadamard.version"&&type!=ARRAY)out.config.hadamard_version=static_cast<std::uint32_t>(number);
         if(key=="prism.hadamard.tied_output")out.config.hadamard_tied_output=number!=0;
+        if(key=="prism.hadamard.gdn_v_grouped")out.config.hadamard_gdn_v_grouped=number!=0;
+        if((key=="prism.hadamard.transform"||key=="prism.hadamard.axis"||key=="prism.hadamard.sign_mode")&&type==STRING){
+            auto& dst=key=="prism.hadamard.transform"?out.config.hadamard_transform
+                    :key=="prism.hadamard.axis"?out.config.hadamard_axis:out.config.hadamard_sign_mode;
+            dst=value;
+        }
         if(key=="general.architecture"&&type==STRING){out.config.architecture_name=value;out.config.architecture=model::identify_architecture(value);}
         if(key=="general.name"&&type==STRING)out.config.model_name=value;
         set("tokenizer.ggml.bos_token_id",out.config.bos_token_id);
@@ -209,6 +216,33 @@ LoadReport parse_gguf(R& r,std::uint64_t file_size){
         if(t.byte_size==0){out.error="Tensor uses unsupported or invalid GGML type "+std::to_string(t.ggml_type)+": "+t.name;return out;}
         if(t.offset>file_size-out.tensor_data_offset || t.byte_size>file_size-out.tensor_data_offset-t.offset){
             out.error="Tensor payload exceeds GGUF file bounds: "+t.name;return out;
+        }
+    }
+    // A Prism ternary pack stores its weights in a rotated basis, so a runtime
+    // that skips prism.hadamard.* reads the file "successfully" and produces
+    // garbage with no error (upstream llama-quant now refuses to write one).
+    // Refuse the combination here instead of guessing. Likewise refuse a
+    // contract whose transform/axis/sign mode this runtime cannot apply.
+    if(!out.config.hadamard_weight_names.empty()||!out.config.hadamard_inverse_names.empty()){
+        if(out.config.hadamard_version!=0&&out.config.hadamard_version!=1&&out.config.hadamard_version!=2){
+            out.error="Unsupported prism.hadamard.version "+std::to_string(out.config.hadamard_version);return out;
+        }
+        if(!out.config.hadamard_transform.empty()&&out.config.hadamard_transform!="normalized-sylvester-walsh-hadamard"){
+            out.error="Unsupported prism.hadamard.transform: "+out.config.hadamard_transform;return out;
+        }
+        if(!out.config.hadamard_axis.empty()&&out.config.hadamard_axis!="input-last-dimension"){
+            out.error="Unsupported prism.hadamard.axis: "+out.config.hadamard_axis;return out;
+        }
+        if(!out.config.hadamard_sign_mode.empty()&&out.config.hadamard_sign_mode!="explicit"&&out.config.hadamard_sign_mode!="identity"){
+            out.error="Unsupported prism.hadamard.sign_mode: "+out.config.hadamard_sign_mode;return out;
+        }
+    }else{
+        for(const auto& t:out.tensors){
+            if(t.ggml_type==143||t.ggml_type==142){
+                out.error="Tensor "+t.name+" uses Prism ternary type "+std::to_string(t.ggml_type)+
+                          " but the file carries no prism.hadamard.* contract; its weights would be read in the wrong basis";
+                return out;
+            }
         }
     }
     out.ok=true;return out;

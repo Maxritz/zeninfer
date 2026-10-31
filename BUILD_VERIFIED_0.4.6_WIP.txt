@@ -4,9 +4,9 @@ Scope: Qwen2 dense-layout synthetic fixture and independent NumPy forward parity
 Not a release and not a claim that all remaining-work items are complete.
 
 AVX2 build: PASS
-AVX2 CTest: 8/8 PASS
+AVX2 CTest: 9/9 PASS
 Scalar build: PASS
-Scalar CTest: 8/8 PASS
+Scalar CTest: 9/9 PASS
 Windows/MSVC: NOT RUN (Linux execution environment)
 
 Independent NumPy parity:
@@ -21,3 +21,12 @@ Synthetic fixture SHA256:
 
 The fixture preserves Tiny-LLM/Llama tensor payloads and rewrites architecture
 metadata to Qwen2. It is a layout/dispatch test, not a Qwen2-trained checkpoint.
+
+qwen35-hybrid (ZI-004) addition, 2026-11-01:
+  ASan/UBSan build of zen_parity_probe: CLEAN on prefill and decode
+    (1-, 3- and 5-token prompts, folded and unfolded fixtures).
+  zen_bonsai2_hybrid_parity: PASS in smoke mode on all four builds above.
+  zen_bonsai2_hybrid_parity --numeric: FAIL (logits do not match the
+    independent NumPy reference). NOT a parity claim; tracked as open work
+    in docs/REMAINING_WORK.md ZI-004 and
+    docs/evidence/ZI-004-qwen35-hybrid-loader-and-gdn.md.

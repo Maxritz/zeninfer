@@ -55,6 +55,10 @@ private:
         std::unordered_map<std::size_t, std::vector<float>> signs; // input width -> +/-1
         std::unordered_set<std::string> folded_names;  // weight names folded at quantisation
         bool tied_output{};
+        // prism.hadamard.gdn_v_grouped: ssm_out was folded with its value heads
+        // in grouped [hd, rep, nk] order while the GDN recurrence emits tiled
+        // [hd, nk, rep]; the out-projection input is permuted first.
+        bool gdn_v_grouped{};
         // Applies signs then rotation along the last dimension (input transform).
         void transform(float* x, std::size_t width, std::vector<float>& scratch) const;
         // Rotation only, then signs (inverse-table restore order).

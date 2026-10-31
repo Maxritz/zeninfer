@@ -125,6 +125,13 @@ if(ZEN_BUILD_TESTS)
     if(ZEN_NUMPY_IMPORT_RESULT EQUAL 0)
       add_test(NAME zen_qwen2_numpy_parity COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/qwen2_numpy_parity.py $<TARGET_FILE_DIR:zen_parity_probe> ${CMAKE_CURRENT_SOURCE_DIR}/models/synthetic/qwen2-dense-tiny.gguf ${CMAKE_CURRENT_SOURCE_DIR}/scripts/numpy_reference.py)
       set_tests_properties(zen_qwen2_numpy_parity PROPERTIES LABELS "parity;independent;numpy;qwen2" TIMEOUT 180)
+      # Qwen3.5-hybrid (Bonsai 2) fixture: PTQ1_0 blocks, the prism.hadamard.*
+      # contract with folded weights, gated delta net + full attention. Two
+      # fixtures are generated on the fly (PTQ1_0 and F32 weights) and the
+      # runtime logits are diffed against the independent reference in
+      # tests/make_bonsai2_fixture.py.
+      add_test(NAME zen_bonsai2_hybrid_parity COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/bonsai2_parity.py $<TARGET_FILE_DIR:zen_parity_probe> --generator ${CMAKE_CURRENT_SOURCE_DIR}/tests/make_bonsai2_fixture.py)
+      set_tests_properties(zen_bonsai2_hybrid_parity PROPERTIES LABELS "parity;independent;numpy;qwen35;bonsai" TIMEOUT 300)
     endif()
   endif()
   add_test(NAME zen_arch_micro_models COMMAND zen_arch_microbench
