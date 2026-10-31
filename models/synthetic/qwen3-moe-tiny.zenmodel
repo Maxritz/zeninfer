@@ -1,0 +1,14 @@
+ZENMODEL 1
+name=zen-qwen3-moe-tiny
+architecture=qwen3_moe
+fixture_kind=architecture_kernel_micro_model
+hidden=64
+vocab=128
+layers=2
+experts=4
+top_k=2
+group_size=128
+seed=31031
+prefill_tokens=64
+decode_tokens=64
+expected_checksum=-41.04994414

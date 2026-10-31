@@ -1,0 +1,28 @@
+name: Windows MSVC
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure x64 MSVC
+        run: cmake -S . -B build-msvc -A x64 -DZEN_BUILD_AVX2=ON -DZEN_BUILD_TESTS=ON -DZEN_BUILD_SERVER=ON
+      - name: Build
+        run: cmake --build build-msvc --config Release --parallel
+      - name: Test
+        run: ctest --test-dir build-msvc -C Release --output-on-failure
+      - name: Verify runtime executables
+        shell: pwsh
+        run: |
+          $required = @("zen_model_inspect.exe", "zen_generate_ids.exe", "zen_tokenizer_export.exe", "zen_server.exe")
+          foreach ($name in $required) {
+            $path = Join-Path "build-msvc/Release" $name
+            if (!(Test-Path $path)) { throw "Missing Windows executable: $path" }
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zeninfer-0.4.5-msvc-x64
+          path: build-msvc/Release/*.exe

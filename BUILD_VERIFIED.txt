@@ -1,0 +1,10 @@
+ZenInfer 0.4.5-alpha
+
+Builds: GCC 14.2, Linux x86-64, Release AVX2 and scalar-only.
+CTest: 6/6 PASS in AVX2 build; 6/6 PASS in scalar-only build.
+Real fixtures: Tiny-LLM.Q4_K_M(2).gguf and tinyllama-15M-stories-Q2_K.gguf.
+Independent tokenizer parity: Google SentencePiece 0.2.1, 8/8 cases PASS for tinyllama-15M-stories-Q2_K.gguf in both builds.
+Benchmark: five-run medians for 128-token prefill and 32-token generation; prefill and decode-forward throughput reported separately.
+Windows: PowerShell smoke script added; MSVC build/runtime NOT RUN in this Linux environment.
+Production Qwen3 MoE, BitNet, Bonsai, full Jinja, JSON Schema, app-managed NVMe eviction and native FP16 arithmetic remain incomplete.
+See docs/BUILD_STATUS_0.4.5.md, docs/PERFORMANCE_0.4.5-alpha.md, docs/REMAINING_WORK.md.

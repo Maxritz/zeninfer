@@ -1,0 +1,11 @@
+/build/
+/build-*/
+/CMakeFiles/
+/CMakeCache.txt
+/Testing/
+*.user
+*.suo
+*.pdb
+*.ilk
+sherlock_trace.csv
+*.znp

@@ -1,0 +1,17 @@
+ZENMODEL 1
+name=zen-bonsai-ternary-tiny
+architecture=bonsai_ternary_qwen3
+base_architecture=qwen3_dense
+fixture_kind=architecture_kernel_micro_model
+weight_format=ggml_q2_0_ternary_groupwise
+hidden=128
+vocab=128
+layers=2
+experts=0
+top_k=0
+group_size=128
+hadamard_transform=false
+seed=31033
+prefill_tokens=64
+decode_tokens=64
+expected_checksum=21.74052589

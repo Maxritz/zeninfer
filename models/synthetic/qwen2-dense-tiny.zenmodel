@@ -1,0 +1,14 @@
+ZENMODEL 1
+name=zen-qwen2-dense-tiny
+architecture=qwen2_dense
+fixture_kind=architecture_kernel_micro_model
+hidden=64
+vocab=128
+layers=2
+experts=0
+top_k=0
+group_size=64
+weight_format=fp32
+seed=31034
+prefill_tokens=32
+decode_tokens=32

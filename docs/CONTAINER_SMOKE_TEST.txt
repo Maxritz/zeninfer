@@ -1,0 +1,15 @@
+ZenInfer 0.2.0 container smoke test
+Date: 2026-10-30
+
+Build: CMake Release, GCC 14.2.0, successful.
+Targets: zen_core, zen_avx2, zen_http, zen_bench, zen_server, zen_mock_server.
+Runtime dispatch: AVX2+FMA3 detected and selected.
+Correctness: scalar-vs-selected GEMV and GEMM comparisons PASS for all included shapes.
+Scalar-only configuration (ZEN_BUILD_AVX2=OFF): build PASS.
+API: health/models/metrics/Sherlock/Breadcrumb routes PASS; auth 401 and unloaded-model 503 behaviour PASS.
+Mock backend: Chat Completions non-streaming JSON and SSE streaming PASS.
+
+Host exposed to this container:
+Intel Xeon Platinum 8370C @ 2.80 GHz, KVM virtual machine, approximately 4-5 vCPUs, AVX2/FMA3 and AVX-512 flags exposed, 4 GiB cgroup memory limit.
+
+IMPORTANT: Timings from this environment are smoke-test data only. They are NOT Zen 3 results and must NOT be used to select Zen 3 block sizes or make performance claims. The virtualised CPU, restricted vCPU count, frequency scheduling, and AVX-512-capable host make it unsuitable as a Zen 3 reference platform. The scalar baselines are intentionally simple and are not competitive tuned kernels.

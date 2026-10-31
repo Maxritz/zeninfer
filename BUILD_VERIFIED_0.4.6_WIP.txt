@@ -1,0 +1,23 @@
+ZenInfer 0.4.6 working-copy verification
+
+Scope: Qwen2 dense-layout synthetic fixture and independent NumPy forward parity.
+Not a release and not a claim that all remaining-work items are complete.
+
+AVX2 build: PASS
+AVX2 CTest: 8/8 PASS
+Scalar build: PASS
+Scalar CTest: 8/8 PASS
+Windows/MSVC: NOT RUN (Linux execution environment)
+
+Independent NumPy parity:
+  max_abs_error = 5.7220458984375e-06
+  mean_abs_error = 7.013059548626188e-07
+  rms_error = 9.407100268923686e-07
+  argmax_match = true
+  top5_match = true
+
+Synthetic fixture SHA256:
+  314e6c9f9ee40a2f564e29ee1bc90c28e27236f8b71444e1e1b0aa8f8b59cd20
+
+The fixture preserves Tiny-LLM/Llama tensor payloads and rewrites architecture
+metadata to Qwen2. It is a layout/dispatch test, not a Qwen2-trained checkpoint.

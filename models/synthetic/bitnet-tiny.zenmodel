@@ -1,0 +1,15 @@
+ZENMODEL 1
+name=zen-bitnet-tiny
+architecture=bitnet_ternary
+fixture_kind=architecture_kernel_micro_model
+hidden=64
+vocab=128
+layers=3
+experts=0
+top_k=0
+group_size=256
+weight_format=tq2_0
+seed=31032
+prefill_tokens=64
+decode_tokens=64
+expected_checksum=4.36009153
