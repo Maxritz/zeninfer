@@ -249,21 +249,26 @@ bool DenseTransformerRuntime::layer_is_recurrent(std::uint32_t l)const noexcept{
     return (l+1)%config_.full_attention_interval!=0;
 }
 void DenseTransformerRuntime::hadamard_transform_input(float* x,std::size_t width,std::vector<float>& scratch)const{
-    // Forward input transform for folded weights W_f = W*D*H: apply signs D,
-    // then the normalized block Hadamard H (build_hadamard_input order).
+    // Forward input transform for a folded weight, in the reference order:
+    // rotate by the normalized block Hadamard FIRST, then apply the +/-1 signs.
+    // llm_graph_context::build_hadamard_input does exactly
+    //   cur = llama_mul_mat_hadamard(ctx0, cur, rot); if (signs) cur = ggml_mul(ctx0, cur, signs);
+    // Signs and the block rotation do not commute, so the order is load-bearing.
     const auto& H=hadamard_;if(!H.block_size)return;
-    const auto sit=H.signs.find(width);const float* signs=sit==H.signs.end()?nullptr:sit->second.data();
-    if(signs)for(std::size_t i=0;i<width;++i)x[i]*=signs[i];
+    if(width%H.block_size)return;           // never rotate a partial trailing block
     scratch.resize(H.block_size);
     for(std::size_t off=0;off<width;off+=H.block_size){
         float* blk=x+off;
         std::copy_n(blk,H.block_size,scratch.begin());
         swht_block(scratch.data(),blk,H.block_size);
     }
+    const auto sit=H.signs.find(width);const float* signs=sit==H.signs.end()?nullptr:sit->second.data();
+    if(signs)for(std::size_t i=0;i<width;++i)x[i]*=signs[i];
 }
 void DenseTransformerRuntime::hadamard_unrotate(float* x,std::size_t width,std::vector<float>& scratch)const{
     // Inverse-table restore (rotated embedding rows): H first, then signs.
     const auto& H=hadamard_;if(!H.block_size)return;
+    if(width%H.block_size)return;
     scratch.resize(H.block_size);
     for(std::size_t off=0;off<width;off+=H.block_size){
         float* blk=x+off;
@@ -320,8 +325,14 @@ bool DenseTransformerRuntime::load(const std::filesystem::path& path,std::string
             config_.head_dim=static_cast<std::uint32_t>(d.dimensions[1]/(2*config_.heads));break;}
     }
     if(!config_.head_dim){
-        for(const auto& d:report.tensors)if(d.name=="blk.0.attn_q.weight"&&d.dimensions.size()>=1&&d.dimensions[0]&&config_.heads){
-            config_.head_dim=static_cast<std::uint32_t>(d.dimensions[0]/config_.heads);break;}
+        // attn_q is stored ne0 = input width, ne1 = output width. The per-head
+        // width is output/heads; using ne0/heads instead only happens to be
+        // right when head_dim == embedding/heads (it is not for Qwen3-family
+        // models whose q width is heads*head_dim != embedding).
+        for(const auto& d:report.tensors)if(d.name=="blk.0.attn_q.weight"&&d.dimensions.size()>=2&&config_.heads){
+            const auto width=(d.dimensions[0]==config_.embedding)?d.dimensions[1]:d.dimensions[0];
+            if(width)config_.head_dim=static_cast<std::uint32_t>(width/config_.heads);
+            break;}
     }
     if(!config_.head_dim)config_.head_dim=config_.embedding/config_.heads;
     config_.rope_dim=meta_uint_arch(report.config,architecture_name_,"rope.dimension_count",config_.embedding/config_.heads);
@@ -341,6 +352,7 @@ bool DenseTransformerRuntime::load(const std::filesystem::path& path,std::string
     config_.ssm_dt_rank=meta_uint_arch(report.config,architecture_name_,"ssm.time_step_rank",0);
     config_.ssm_d_conv=meta_uint_arch(report.config,architecture_name_,"ssm.conv_kernel",0);
     config_.full_attention_interval=meta_uint_arch(report.config,architecture_name_,"full_attention_interval",4);
+    config_.hadamard_gdn_v_grouped=report.config.hadamard_gdn_v_grouped;
     if(!config_.full_attention_interval)config_.full_attention_interval=4;
     config_.rope_sections[0]=report.config.rope_sections[0];
     config_.rope_sections[1]=report.config.rope_sections[1];
@@ -391,14 +403,47 @@ bool DenseTransformerRuntime::load(const std::filesystem::path& path,std::string
             hadamard_.signs.emplace(std::size_t(w),std::move(sv));off+=std::size_t(w);
         }
         if(off!=report.config.hadamard_sign_values.size())return fail("prism.hadamard sign_values length mismatch");
-        for(const auto& n:report.config.hadamard_weight_names)hadamard_.folded_names.insert(n);
-        for(const auto& n:report.config.hadamard_inverse_names)hadamard_.folded_names.insert("\x01"+n); // inverse marker
+        hadamard_.gdn_v_grouped=report.config.hadamard_gdn_v_grouped;
+        hadamard_.tied_output=report.config.hadamard_tied_output;
+        const auto foldable_w=[](const std::string& n){
+            static const char* kinds[]={"attn_q","attn_k","attn_v","attn_qkv","attn_gate","attn_output",
+                "ffn_gate","ffn_up","ffn_down","ssm_out","nextn.draft_head"};
+            if(n=="output.weight")return true;
+            if(n.compare(0,4,"blk.")!=0)return false;
+            std::size_t pos=4;while(pos<n.size()&&std::isdigit(static_cast<unsigned char>(n[pos])))++pos;
+            if(pos==4||pos>=n.size()||n[pos]!='.')return false;
+            ++pos;
+            for(const char* kind:kinds)if(n.compare(pos,std::string::npos,std::string(kind)+".weight")==0)return true;
+            return false;
+        };
+        for(const auto& n:report.config.hadamard_weight_names){
+            // The reference refuses a folded weight that is not routed through a
+            // Hadamard-aware matmul; accepting it here would run that weight in the
+            // wrong basis with no error. Every builder in this file is Hadamard-aware
+            // for exactly these kinds, so the same list is the right gate.
+            if(!foldable_w(n))return fail("prism.hadamard: weight '"+n+"' is not on a Hadamard-aware matmul path");
+            if(!hadamard_.folded_names.insert(n).second)return fail("Duplicate prism.hadamard weight: "+n);
+        }
+        for(const auto& n:report.config.hadamard_inverse_names){
+            if(n!="token_embd.weight")return fail("prism.hadamard: inverse weight '"+n+"' is not an inverse-after-lookup table");
+            if(hadamard_.folded_names.count(n))return fail("prism.hadamard: weight is both folded and inverse: "+n);
+            hadamard_.folded_names.insert("\x01"+n); // inverse marker
+        }
+        // version 2 ties the LM head to the latent embedding: the head then reads the
+        // folded token table, which is only valid because the inverse is undone first.
+        if(hadamard_.tied_output&&!report.config.hadamard_tied_output)return fail("Invalid prism.hadamard.tied_output");
     }
-    for(const auto& d:report.tensors){Tensor t;t.dims=d.dimensions;t.elements=1;for(auto dim:d.dimensions)t.elements*=static_cast<std::size_t>(dim);t.raw_bytes=static_cast<std::size_t>(d.byte_size);t.format=format_for_ggfl(d.ggml_type);
+    for(const auto& d:report.tensors){Tensor t;t.dims=d.dimensions;t.elements=1;for(auto dim:d.dimensions)t.elements*=static_cast<std::size_t>(dim);t.raw_bytes=static_cast<std::size_t>(d.byte_size);t.format=format_for_ggml(d.ggml_type);
         const bool matrix=d.name.find(".bias")==std::string::npos&&(d.role==model::TensorRole::token_embedding||d.role==model::TensorRole::output||d.role==model::TensorRole::query||d.role==model::TensorRole::key||d.role==model::TensorRole::value||d.role==model::TensorRole::attention_output||d.role==model::TensorRole::ffn_gate||d.role==model::TensorRole::ffn_up||d.role==model::TensorRole::ffn_down);
-        std::fprintf(stderr,"[map] %-38s type=%u role=%d matrix=%d fmt=%s bytes=%zu\n",d.name.c_str(),d.ggml_type,int(d.role),int(matrix),t.format?t.format->name.c_str():"null",t.raw_bytes);
+        // Per-tensor map trace. Flushed per line: the point of this trace is that it
+        // survives a crash, and an abort on the next tensor discards a buffered
+        // stderr stream (which is exactly why the probe appeared to "die silently").
+        // ZEN_MAP_TRACE=0 silences it.
+        static const bool map_trace=[](){const char* v=std::getenv("ZEN_MAP_TRACE");return !(v&&v[0]=='0'&&v[1]=='\0');}();
+        if(map_trace)std::fprintf(stderr,"[map] %-38s type=%u role=%d matrix=%d fmt=%s bytes=%zu\n",d.name.c_str(),d.ggml_type,int(d.role),int(matrix),t.format?t.format->name.c_str():"null",t.raw_bytes);
         if(matrix&&t.format&&d.offset<=mapped->size()&&report.tensor_data_offset<=mapped->size()-d.offset&&t.raw_bytes<=mapped->size()-report.tensor_data_offset-d.offset){t.raw=mapped->data()+report.tensor_data_offset+d.offset;}
-        else {std::string e;std::fprintf(stderr,"[map] fallback-decode %s\n",d.name.c_str());if(!gguf::read_tensor_f32(path,report,d.name,t.values,&e))return fail("Tensor "+d.name+": "+e);}
+        else {std::string e;if(map_trace)std::fprintf(stderr,"[map] fallback-decode %s\n",d.name.c_str());if(!gguf::read_tensor_f32(path,report,d.name,t.values,&e)){std::fflush(stderr);return fail("Tensor "+d.name+": "+e);}}
+        if(map_trace)std::fflush(stderr);
         tensors_.emplace(d.name,std::move(t));
     }
     auto require=[&](const std::string& n,std::size_t count){auto* t=tensor(n);return t&&t->elements==count&&(t->raw||t->values.size()==count);};
@@ -498,7 +543,13 @@ bool DenseTransformerRuntime::forward_q35_batch(const std::vector<std::uint32_t>
     const float eps=config_.rms_epsilon;
     std::vector<float> x(T*E),norm(T*E),tmp(T*E);
     std::vector<float> qkv(T*conv_dim),z(T*value_dim),conv_out(T*conv_dim);
-    std::vector<float> q(T*QW),k(T*KW),v(T*KW),att(T*QW);
+    // q/k/v are shared by both layer kinds: the attention path needs T*QW / T*KW,
+    // the GDN path needs T*key_dim (q, k) and T*value_dim (v). With S*NV larger
+    // than kv_heads*head_dim the GDN copy below ran past the end of `v`, which is
+    // the 0xC0000005 / 0xC0000374 pair seen in the field.
+    const std::size_t q_cap=std::max<std::size_t>(QW,key_dim);
+    const std::size_t v_cap=std::max<std::size_t>(KW,value_dim);
+    std::vector<float> q(T*q_cap),k(T*q_cap),v(T*v_cap),att(T*QW);
     std::vector<float> gate(T*F),up(T*F),ffn(T*F);
     std::vector<float> beta(T*NV),alpha(T*NV),a_gate(T*NV);
     std::vector<float> h_scratch;
@@ -509,9 +560,12 @@ bool DenseTransformerRuntime::forward_q35_batch(const std::vector<std::uint32_t>
         // the embedding table is stored Hadamard-rotated: restore primal rows.
         if(hadamard_.block_size)hadamard_unrotate(x.data()+t*E,E,h_scratch);
     }
-    // Per-layer folded matmul inputs get the forward Hadamard transform.
-    auto fold=[&](const char* suffix,std::uint32_t l,float* input,std::size_t width){
-        if(hadamard_folded(suffix,l))hadamard_transform_input(input,width,h_scratch);
+    // Per-layer folded matmul inputs get the forward Hadamard transform exactly
+    // ONCE per activation. Upstream memoises the transform per (activation,
+    // rotation) and several weights share one input, so re-applying it per weight
+    // (the previous shape of this lambda) silently re-transformed the buffer.
+    auto fold_for=[&](std::uint32_t l,float* input,std::size_t width,std::initializer_list<const char*> suffixes){
+        for(const char* suffix:suffixes)if(hadamard_folded(suffix,l)){hadamard_transform_input(input,width,h_scratch);return;}
     };
     for(std::uint32_t l=0;l<config_.layers;++l){
         const std::string p="blk."+std::to_string(l)+".";
@@ -519,15 +573,25 @@ bool DenseTransformerRuntime::forward_q35_batch(const std::vector<std::uint32_t>
         for(std::size_t t=0;t<T;++t)rms_norm(x.data()+t*E,tensor(p+"attn_norm.weight")->values.data(),norm.data()+t*E,E,eps);
         if(recurrent){
             // ---- gated delta net layer ----
-            fold("attn_qkv.weight",l,norm.data(),E);fold("attn_gate.weight",l,norm.data(),E);
-            fold("ssm_beta.weight",l,norm.data(),E);fold("ssm_alpha.weight",l,norm.data(),E);
-            fold("ffn_gate.weight",l,norm.data(),E);fold("ffn_up.weight",l,norm.data(),E);
+            fold_for(l,norm.data(),E,{"attn_qkv.weight","attn_gate.weight","ssm_beta.weight","ssm_alpha.weight"});
             if(!tensor_gemm(*tensor(p+"attn_qkv.weight"),norm.data(),qkv.data(),T,conv_dim,E)||
                !tensor_gemm(*tensor(p+"attn_gate.weight"),norm.data(),z.data(),T,value_dim,E))return false;
             if(!tensor_gemm(*tensor(p+"ssm_beta.weight"),norm.data(),beta.data(),T,NV,E)||
                !tensor_gemm(*tensor(p+"ssm_alpha.weight"),norm.data(),alpha.data(),T,NV,E))return false;
             std::vector<float> gdn_out(T*value_dim);
-            // conv1d over [state_rows | qkv], per channel; state rows live in convc[l].
+            // conv state ring: [CK-1, conv_dim] at offset 0, plus one scratch
+            // window per position this batch can visit (prefill or decode).
+            if(convc[l].size()<std::size_t(CK-1+start_pos+T)*conv_dim)return false;
+            // The window has to be published BEFORE the convolution reads it;
+            // window_row() below reads these same rows for idx >= 0.
+            const float* state_ring=convc[l].data();
+            float* window_base=convc[l].data()+std::size_t(CK-1)*conv_dim;
+            std::copy_n(qkv.data(),T*conv_dim,window_base);
+            const auto window_row=[&](std::int64_t idx)->const float*{
+                if(idx<0)return state_ring+std::size_t(-idx-1)*conv_dim;
+                return window_base+std::size_t(idx)*conv_dim;
+            };
+            // conv1d over [state_rows | qkv window], per channel.
             for(std::size_t ch=0;ch<conv_dim;++ch){
                 const auto* cw=tensor(p+"ssm_conv1d.weight")->values.data()+ch*CK;
                 float* out=conv_out.data()+ch;
@@ -535,29 +599,44 @@ bool DenseTransformerRuntime::forward_q35_batch(const std::vector<std::uint32_t>
                     float sum=0.0f;
                     for(std::size_t w=0;w<CK;++w){
                         const std::int64_t idx=std::int64_t(t)+std::int64_t(w)-(std::int64_t)CK+1;
-                        const float val=idx<0?convc[l][std::size_t(-idx-1)*conv_dim+ch]:qkv[std::size_t(idx)*conv_dim+ch];
-                        sum+=cw[w]*val;
+                        sum+=cw[w]*window_row(idx)[ch];
                     }
                     out[t*conv_dim]=sum;
                 }
             }
             for(std::size_t i=0;i<T*conv_dim;++i)conv_out[i]=conv_out[i]/(1.0f+std::exp(-conv_out[i]));
-            // q/k l2-norm (joint view), v as-is
+            // q/k l2-norm. Upstream normalises the joint [S, 2*NK] view of the
+            // convolved q|k block, i.e. ONE norm per key head over its S
+            // consecutive dims of q followed by the same S of k (qwen35.cpp
+            // build_layer_attn_linear: qk_conv = ggml_l2_norm(view(head_k_dim,
+            // 2*num_k_heads, ...))). Normalising the whole 2*key_dim span at
+            // once, as the earlier scalar loop did, is a different operation.
             const std::size_t qk_span=key_dim*2;
             for(std::size_t t=0;t<T;++t){
                 float* row=conv_out.data()+t*conv_dim;
-                double ss=0.0;for(std::size_t i=0;i<qk_span;++i)ss+=double(row[i])*row[i];
-                const float inv=1.0f/std::max(std::sqrt(float(ss)),eps);
-                for(std::size_t i=0;i<qk_span;++i)row[i]*=inv;
-                std::copy_n(row+qk_span,value_dim,v.data()+t*value_dim);
-                std::copy_n(row,key_dim,q.data()+t*key_dim);
-                std::copy_n(row+key_dim,key_dim,k.data()+t*key_dim);
+                for(std::size_t h=0;h<NK;++h){
+                    float* qh=row+h*S; double ss=0.0;
+                    for(std::size_t i=0;i<S;++i)ss+=double(qh[i])*qh[i];
+                    const float inv=1.0f/std::max(std::sqrt(float(ss)),eps);
+                    for(std::size_t i=0;i<S;++i)qh[i]*=inv;
+                    float* kh2=row+key_dim+h*S; ss=0.0;
+                    for(std::size_t i=0;i<S;++i)ss+=double(kh2[i])*kh2[i];
+                    const float inv2=1.0f/std::max(std::sqrt(float(ss)),eps);
+                    for(std::size_t i=0;i<S;++i)kh2[i]*=inv2;
+                }
+                std::copy_n(row+qk_span,value_dim,v.data()+t*v_cap);
+                std::copy_n(row,key_dim,q.data()+t*q_cap);
+                std::copy_n(row+key_dim,key_dim,k.data()+t*q_cap);
             }
-            // GDN recurrence per value head, per token (scalar-gate path).
+            // GDN recurrence per value head, per token (scalar-gate path of
+            // ggml_compute_forward_gated_delta_net_one_chunk, ggml-cpu/ops.cpp).
             const std::uint32_t interval=config_.full_attention_interval;
             (void)interval;
             const std::size_t head_v_dim=S;
-            std::vector<float> state(value_dim*value_dim); // per-layer single-sequence state [NV*S, NV*S] flattened per head below
+            // Per-layer single-sequence state: NV heads of S x S. Sizing this
+            // by value_dim^2 (NV^2 times larger) cost a 300 MB allocation per
+            // recurrent layer at 27B scale for a 4.4 MB working set.
+            std::vector<float> state(std::size_t(NV)*S*S);
             // state layout mirrors ggml: per head S x S, stored transposed rows.
             // ssm cache: ssmc[l] holds NV*S*S floats.
             std::copy_n(ssmc[l].begin(),ssmc[l].size(),state.begin());
@@ -565,29 +644,30 @@ bool DenseTransformerRuntime::forward_q35_batch(const std::vector<std::uint32_t>
             // gates: beta = sigmoid(beta_proj); decay g = a * softplus(alpha + dt_bias); a = -exp(ssm_a)
             const auto* ssm_a=tensor(p+"ssm_a")->values.data();
             const auto* dt_bias=tensor(p+"ssm_dt.bias")->values.data();
+            std::vector<float> delta(S);
             for(std::size_t t=0;t<T;++t){
                 for(std::size_t h=0;h<NV;++h){
                     beta[t*NV+h]=1.0f/(1.0f+std::exp(-beta[t*NV+h]));
                     const float xx=alpha[t*NV+h]+dt_bias[h];
                     const float sp=xx>20.0f?xx:std::log(1.0f+std::exp(xx));
-                    a_gate[h]=-std::exp(ssm_a[h])*sp;
+                    // ssm_a already holds -A_log.exp() as stored in the checkpoint
+                    // (qwen35.cpp: `gate = alpha_softplus * ssm_a  // -A_log.exp() *
+                    // softplus`, and ops.cpp applies raw_a[iv1] directly). Applying
+                    // exp() and a negation again here reset the decay to a
+                    // completely different curve.
+                    a_gate[h]=ssm_a[h]*sp;
                 }
-                // q/k repeat: NK != NV -> tile key heads to value heads
-                const std::size_t rep=NV/NK;
-                for(std::size_t t2=t;;){
-                    (void)t2;break;
-                }
-                // per head update
+                // q/k are repeated over value heads in TILED order: value head h
+                // reads key head h % NK (ops.cpp: iq1 = iv1 % neq1). The previous
+                // h*key_dim/value_dim mapped [0,1,2,3] to [0,0,0,0] for NK=... .
                 for(std::size_t h=0;h<NV;++h){
-                    const std::size_t kh=(NV/NK==0)?0:h*key_dim/value_dim; // key head index (tiled)
-                    const float* qh=q.data()+t*key_dim+kh*S;
-                    const float* kh_=k.data()+t*key_dim+kh*S;
-                    const float* vh=conv_out.data()+t*conv_dim+qk_span+h*S; // value from conv (grouped order)
+                    const std::size_t kh=h%NK;
+                    const float* qh=q.data()+t*q_cap+kh*S;
+                    const float* kh_=k.data()+t*q_cap+kh*S;
+                    const float* vh=conv_out.data()+t*conv_dim+qk_span+h*S;
                     float* sh=state.data()+h*S*S;
                     const float g=std::exp(a_gate[h]);
-                    for(std::size_t i=0;i<S;++i)for(std::size_t j=0;j<S;++j)sh[i*S+j]*=g;
-                    // delta[j] = (v[j] - sum_i S[i][j]*k[i]) * beta
-                    std::vector<float> delta(S);
+                    for(std::size_t p=0;p<S*S;++p)sh[p]*=g;
                     for(std::size_t j=0;j<S;++j){
                         float sum=0.0f;for(std::size_t i=0;i<S;++i)sum+=sh[i*S+j]*kh_[i];
                         delta[j]=(vh[j]-sum)*beta[t*NV+h];
@@ -602,31 +682,62 @@ bool DenseTransformerRuntime::forward_q35_batch(const std::vector<std::uint32_t>
                 }
             }
             std::copy_n(state.begin(),ssmc[l].size(),ssmc[l].begin());
-            // conv state update: last CK-1 inputs of [state|qkv]
-            for(std::size_t ch=0;ch<conv_dim;++ch)
+            // conv state update. The ring is indexed newest-first along dim 0
+            // ([d_conv-1, channels], qwen35 build_conv_state), and the window fed
+            // to the conv above reads it as convc[-idx-1]; so row 0 gets the LAST
+            // input token and row w token T-1-w. Writing it forward (row 0 <- token
+            // T-CK+1) reversed the window and corrupted every later step.
+            // publish this batch's conv inputs at scratch rows [0, T), shift the
+            // ring by T, then take the newest CK-1 rows of [ring | scratch].
+            for(std::size_t ch=0;ch<conv_dim;++ch){
+                // a fresh sequence starts with an empty ring
+                if(start_pos==0)for(std::size_t w=0;w<CK-1;++w)convc[l][w*conv_dim+ch]=0.0f;
                 for(std::size_t w=0;w<CK-1;++w){
-                    const std::int64_t idx=std::int64_t(T)+std::int64_t(w)-(std::int64_t)(CK-1);
-                    convc[l][w*conv_dim+ch]=idx<0?convc[l][std::size_t(-idx-1)*conv_dim+ch]:qkv[std::size_t(idx)*conv_dim+ch];
+                    const std::int64_t idx=std::int64_t(T)-1-std::int64_t(w);
+                    convc[l][w*conv_dim+ch]=window_row(idx)[ch];
                 }
-            // gated norm: per-head RMS over S, then silu(z) * normalized.
+            }
+            // Gated norm: qwen35 build_norm_gated calls
+            //   ggml_swiglu_split(ctx0, gate=z, normalized)
+            // and, with two distinct sources, ggml_compute_forward_swiglu_f32 does
+            //   y = silu(src0) * src1 = silu(z) * normalized
+            // (the swapped/cat form only applies when src1 is absent). So the gate
+            // z is what gets the SiLU, and it multiplies the normalised value.
             for(std::size_t t=0;t<T;++t){
                 float* o=gdn_out.data()+t*value_dim;
                 for(std::size_t h=0;h<NV;++h)rms_norm(o+h*S,tensor(p+"ssm_norm.weight")->values.data(),o+h*S,S,eps);
                 for(std::size_t h=0;h<NV;++h)
                     for(std::size_t j=0;j<S;++j){
-                        const float gate_z=z[t*value_dim+h*S+j];
-                        o[h*S+j]*=gate_z/(1.0f+std::exp(-gate_z));
+                        const float gz=z[t*value_dim+h*S+j];
+                        o[h*S+j]*=gz/(1.0f+std::exp(-gz));
                     }
             }
-            fold("ssm_out.weight",l,gdn_out.data(),value_dim);
+            // prism.hadamard.gdn_v_grouped: the weight was folded with its value
+            // heads in GROUPED order [hd, rep, nk] while the recurrence emits
+            // TILED [hd, nk, rep]; permute to grouped before the input transform
+            // (llama_hadamard_transform::perm_* in the reference).
+            // Driven by the GGUF key itself: a checkpoint can declare the
+            // permutation without (or before) any folded weight, and the earlier
+            // condition silently tied it to hadamard_.block_size being set.
+            if(config_.hadamard_gdn_v_grouped&&NV%NK==0&&NV/NK>1){
+                const std::size_t rep=NV/NK;
+                std::vector<float> tiled(gdn_out);
+                for(std::size_t t=0;t<T;++t){
+                    const float* src=tiled.data()+t*value_dim;
+                    float* dst=gdn_out.data()+t*value_dim;
+                    for(std::size_t h=0;h<NV;++h){
+                        const std::size_t nk=h%NK, rp=h/NK;
+                        std::copy_n(src+std::size_t(h)*S,S,dst+(rp*NK+nk)*S);
+                    }
+                }
+            }
+            fold_for(l,gdn_out.data(),value_dim,{"ssm_out.weight"});
             if(!tensor_gemm(*tensor(p+"ssm_out.weight"),gdn_out.data(),tmp.data(),T,E,value_dim))return false;
         }else{
             // ---- full attention layer: fused Q|gate projection (Qwen3.5) ----
             const std::size_t QGW=2*QW;
             q.resize(T*QGW);
-            fold("attn_q.weight",l,norm.data(),E);fold("attn_k.weight",l,norm.data(),E);
-            fold("attn_v.weight",l,norm.data(),E);
-            fold("ffn_gate.weight",l,norm.data(),E);fold("ffn_up.weight",l,norm.data(),E);
+            fold_for(l,norm.data(),E,{"attn_q.weight","attn_k.weight","attn_v.weight"});
             if(!tensor_gemm(*tensor(p+"attn_q.weight"),norm.data(),q.data(),T,QGW,E)||
                !tensor_gemm(*tensor(p+"attn_k.weight"),norm.data(),k.data(),T,KW,E)||
                !tensor_gemm(*tensor(p+"attn_v.weight"),norm.data(),v.data(),T,KW,E))return false;
@@ -651,7 +762,11 @@ bool DenseTransformerRuntime::forward_q35_batch(const std::vector<std::uint32_t>
                 std::copy_n(v.data()+t*KW,KW,vc[l].data()+std::size_t(pos)*KW);
             }
             std::fill(att.begin(),att.end(),0.0f);
-            std::vector<float> scores(config_.context);
+            // positions are absolute: decode re-enters this function with
+            // start_pos != 0, so the write/read offset must use pos, not the
+            // batch-local index t.
+            if(T>0&&start_pos+T>kc[l].size()/KW)return false;
+            std::vector<float> scores(std::size_t(start_pos)+T);
             const std::uint32_t group=H/KH;const float inv_scale=1.0f/std::sqrt(float(D));
             for(std::size_t t=0;t<T;++t)for(std::uint32_t h=0;h<H;++h){
                 const auto kh=h/group;const float*qh=q.data()+t*QW+std::size_t(h)*D;
@@ -672,26 +787,30 @@ bool DenseTransformerRuntime::forward_q35_batch(const std::vector<std::uint32_t>
             }
             // sigmoid gate after attention (ggml: attn_pregate * sigmoid(gate))
             for(std::size_t t=0;t<T;++t)for(std::size_t i=0;i<QW;++i){const float g=qgate[t*QW+i];att[t*QW+i]*=g/(1.0f+std::exp(-g));}
-            fold("attn_output.weight",l,att.data(),QW);
+            fold_for(l,att.data(),QW,{"attn_output.weight"});
             if(!tensor_gemm(*tensor(p+"attn_output.weight"),att.data(),tmp.data(),T,E,QW))return false;
         }
         for(std::size_t i=0;i<T*E;++i)x[i]+=tmp[i];
         // post-attention norm then FFN (sandwich norm), residual from before it.
         std::vector<float> res_before(T*E);std::copy_n(x.data(),T*E,res_before.begin());
         for(std::size_t t=0;t<T;++t)rms_norm(x.data()+t*E,tensor(p+"post_attention_norm.weight")->values.data(),norm.data()+t*E,E,eps);
-        fold("ffn_gate.weight",l,norm.data(),E);fold("ffn_up.weight",l,norm.data(),E);
+        fold_for(l,norm.data(),E,{"ffn_gate.weight","ffn_up.weight"});
         if(!tensor_gemm(*tensor(p+"ffn_gate.weight"),norm.data(),gate.data(),T,F,E)||
            !tensor_gemm(*tensor(p+"ffn_up.weight"),norm.data(),up.data(),T,F,E))return false;
         for(std::size_t i=0;i<T*F;++i){const float g=gate[i];ffn[i]=(g/(1.0f+std::exp(-g)))*up[i];}
-        fold("ffn_down.weight",l,ffn.data(),F);
+        fold_for(l,ffn.data(),F,{"ffn_down.weight"});
         if(!tensor_gemm(*tensor(p+"ffn_down.weight"),ffn.data(),tmp.data(),T,E,F))return false;
-        for(std::size_t i=0;i<T*E;++i)x[i]+=res_before[i]+tmp[i];
+        // x here is `res + attn`; the FFN wraps that same residual, so the result is
+        // res_before + ffn_out. Adding res_before to the existing x double-counted it.
+        for(std::size_t i=0;i<T*E;++i)x[i]=res_before[i]+tmp[i];
         if(!finite_values(x.data(),x.size()))return false;
     }
     std::vector<float> norm_last(E);
     rms_norm(x.data()+(T-1)*E,tensor("output_norm.weight")->values.data(),norm_last.data(),E,eps);
-    // embedding/LM head are Hadamard-folded: transform the input.
-    if(hadamard_.block_size)hadamard_transform_input(norm_last.data(),E,h_scratch);
+    // The LM head reads a folded input only when output.weight is a folded weight
+    // (a folded tied table is handled by the version-2 tied_output path).
+    if(hadamard_.block_size&&(hadamard_.folded_names.count("output.weight")||hadamard_.tied_output))
+        hadamard_transform_input(norm_last.data(),E,h_scratch);
     std::vector<float> logits_full(config_.vocab);
     const auto* output=tensor("output.weight");
     if(!output)output=emb;
@@ -873,11 +992,20 @@ bool DenseTransformerRuntime::generate(const std::vector<std::uint32_t>& prompt,
         kv_elements*=factor;
     }
     if(kv_elements>std::numeric_limits<std::uint64_t>::max()/(2*sizeof(float)))return fail("KV cache size overflow");
-    const auto kv_bytes=kv_elements*2*sizeof(float);
     zen::ResourceGovernor governor;const auto policy=governor.current_policy();
-    if(kv_bytes>policy.transient_budget_bytes)return fail("KV cache exceeds ResourceGovernor transient-memory budget");
     if(kv_elements>std::numeric_limits<std::size_t>::max())return fail("KV cache exceeds addressable memory");
-    const auto kvsize=static_cast<std::size_t>(std::uint64_t(config_.context)*config_.kv_heads*config_.head_dim);
+    // The KV cache only has to cover the positions this call actually visits:
+    // the prompt plus one slot per generated token, never the model's full
+    // advertised context. Sizing it by config_.context reserved the whole
+    // 262144-token window up front (gigabytes, or a hard allocation failure)
+    // before a single token ran.
+    constexpr std::size_t kMaxCachePositions=1u<<17;
+    std::size_t cache_positions=static_cast<std::size_t>(prompt.size())+static_cast<std::size_t>(max_new);
+    const bool full_context_cache=cache_positions<=kMaxCachePositions;
+    if(!full_context_cache)return fail("Prompt plus requested generation exceeds the KV cache position limit");
+    std::uint64_t kv_bytes=std::uint64_t(cache_positions)*config_.layers*config_.kv_heads*config_.head_dim*2*sizeof(float);
+    if(kv_bytes>policy.transient_budget_bytes)return fail("KV cache exceeds ResourceGovernor transient-memory budget");
+    const auto kvsize=static_cast<std::size_t>(std::uint64_t(cache_positions)*config_.kv_heads*config_.head_dim);
     std::vector<std::vector<float>> kc,vc;std::vector<float> logits;bool cache_hit=false;
     // qwen35 hybrid: additional recurrent caches (conv windows + GDN states).
     const bool q35=config_.qwen35_variant;
@@ -887,7 +1015,11 @@ bool DenseTransformerRuntime::generate(const std::vector<std::uint32_t>& prompt,
     using clock=std::chrono::steady_clock;auto t0=clock::now();
     {std::lock_guard<std::mutex> lock(prefix_cache_mutex_);if(prefix_cache_&&prefix_cache_->tokens==prompt){kc=prefix_cache_->key;vc=prefix_cache_->value;logits=prefix_cache_->logits;if(q35){convc=prefix_cache_->conv;ssmc=prefix_cache_->ssm;}cache_hit=true;}}
     if(!cache_hit){kc.assign(config_.layers,std::vector<float>(kvsize));vc.assign(config_.layers,std::vector<float>(kvsize));
-        if(q35){convc.assign(config_.layers,std::vector<float>((config_.ssm_d_conv-1)*conv_dim));ssmc.assign(config_.layers,std::vector<float>(ssm_dim));}
+        if(q35){
+            // [CK-1, conv_dim] state ring + one scratch window per reachable position
+            convc.assign(config_.layers,std::vector<float>(std::size_t(config_.ssm_d_conv-1+cache_positions)*conv_dim));
+            ssmc.assign(config_.layers,std::vector<float>(ssm_dim));
+        }
         for(std::size_t i=0;i<prompt.size();++i){if(cancelled&&cancelled->load(std::memory_order_relaxed))return fail("Generation cancelled");if(prompt[i]>=config_.vocab)return fail("Prompt token ID is outside vocabulary");zen::diag::breadcrumb(401,static_cast<std::int64_t>(i),prompt[i]);}
         {zen::diag::Scope scope("transformer.prefill.batch",zen::diag::Phase::compute);
          if(q35){if(!forward_q35_batch(prompt,kc,vc,convc,ssmc,logits))return fail("Batched prefill forward pass failed");}

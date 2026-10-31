@@ -25,6 +25,11 @@ struct RuntimeConfig {
     // src/models/qwen35.cpp.
     bool qwen35_variant{};
     std::uint32_t full_attention_interval{4};
+    // prism.hadamard.gdn_v_grouped: the ssm_out weight was folded with its value
+    // heads in grouped order while the recurrence emits tiled order, so the
+    // out-projection input is permuted first. Recorded independently of whether
+    // the file also carries folded weights.
+    bool hadamard_gdn_v_grouped{};
     // GDN hyperparameters (qwen35 only).
     std::uint32_t ssm_state{};       // d_state / head_k_dim / head_v_dim
     std::uint32_t ssm_n_group{};     // key heads

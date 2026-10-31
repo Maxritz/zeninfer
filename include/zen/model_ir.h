@@ -48,6 +48,14 @@ struct ModelConfig {
     // are stored rotated and are restored with H then D.
     std::uint32_t hadamard_block_size{};
     bool hadamard_tied_output{};
+    // prism.hadamard.* contract fields (PrismML-Eng/llama.cpp llama-model.cpp
+    // load_hparams_hadamard). Version 1 is the shipped Bonsai 2 contract; the
+    // strings are validated in the GGUF parser so a file carrying an
+    // unsupported transform/axis/sign mode is rejected instead of silently run
+    // in the wrong basis.
+    std::uint32_t hadamard_version{};
+    bool hadamard_gdn_v_grouped{};
+    std::string hadamard_transform, hadamard_axis, hadamard_sign_mode;
     std::uint32_t rope_sections[4]{}; // *.rope.dimension_sections (M-RoPE)
     std::vector<std::string> hadamard_weight_names;
     std::vector<std::string> hadamard_inverse_names;

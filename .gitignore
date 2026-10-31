@@ -9,3 +9,7 @@
 *.ilk
 sherlock_trace.csv
 *.znp
+
+# Python bytecode (test harness helpers)
+__pycache__/
+*.pyc
