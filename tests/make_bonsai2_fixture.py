@@ -10,9 +10,11 @@ Qwen3.5-hybrid (gated delta net + full attention) path end to end:
     block-128 base-3 trit packing, one f16 scale per block
   * the prism.hadamard.* contract: version, block_size, transform, axis,
     explicit signs, folded weight names and one inverse-lookup table
-  * weights *actually stored in the folded basis* W_f = W*D*H with H*H = I and
-    D*D = I, so the runtime must apply H then D (or D then H -- the model can
-    tell, because signs and the rotation do not commute) to the matmul input
+  * weights *actually stored in the folded basis* W_f = W*S*H with H*H = I and
+    S*S = I, so the runtime must apply the signs to the matmul input FIRST and
+    rotate SECOND: W_f * (H*S*x) == W*x. Signs and the rotation do not commute,
+    so a runtime that rotates first computes a different model -- which is
+    exactly the mistake this fixture exists to catch.
   * ssm_out folded with prism.hadamard.gdn_v_grouped=true, i.e. its value-head
     feature axis in grouped [hd, rep, nk] order while the recurrence emits
     tiled [hd, nk, rep]
@@ -164,38 +166,60 @@ def encode_ptq1_0(a):
             levels = np.rint(blk / float(d)).astype(np.int8)
             if np.max(np.abs(levels)) > 1:
                 raise ValueError("value outside PTQ1_0's ternary range for its block scale")
-        # invert q = byte*3**n: the encoder picks byte = value * 3**(5-n) for the
-        # five trit lanes of a byte and keeps the lane where the product fits a byte.
+        # Each byte carries FIVE trits (one per lane n=0..4) and 3**5 == 243 is
+        # exactly representable in a byte, so a group of five trits maps to a
+        # unique byte. The previous encoder wrote only one lane per byte and
+        # OR-ed the five lane constants together, which corrupts every lane: the
+        # decoder reads all five, so it saw trits belonging to other positions.
         qs = bytearray(24)
-        for lane in range(5):
-            for m in range(24):
-                idx = lane * 24 + m
-                v = int(levels[idx])
-                qs[m] |= _encode_trit_lane(v, lane)
+        for m in range(24):
+            qs[m] = _pack_trits([int(levels[24 * n + m]) for n in range(5)])
         qh = bytearray(2)
-        for lane in range(4):
-            for j in range(2):
-                idx = 120 + lane * 2 + j
-                v = int(levels[idx])
-                qh[j] |= _encode_trit_lane(v, lane)
+        for j in range(2):
+            # qh holds 8 trits: lanes 0..3 of two bytes, 8 = 2 * 4 trits
+            qh[j] = _pack_trits([int(levels[120 + 2 * n + j]) for n in range(4)])
         out += bytes(qs) + bytes(qh) + np.float16(d).tobytes()
-    return bytes(out)
+    data = bytes(out)
+    # Guard the codec itself: a silently lossy encoder would make the parity
+    # harness compare two different models and report a "forward bug". The
+    # invariant is that the DECODED TRITS match the intended levels exactly --
+    # comparing against `flat` would just re-test the block scale.
+    for b in range(flat.size // 128):
+        blk = data[b * 28:(b + 1) * 28]
+        scale = float(np.max(np.abs(flat[b * 128:(b + 1) * 128])))
+        d = np.float16(scale if scale else 1.0)
+        want = (np.rint(flat[b * 128:(b + 1) * 128] / float(d)).astype(np.int8)
+                if scale else np.zeros(128, dtype=np.int8))
+        got = np.rint(decode_ptq1_0(blk) / float(d)).astype(np.int8)
+        if not np.array_equal(want, got):
+            bad = int(np.count_nonzero(want != got))
+            raise AssertionError(f"PTQ1_0 encoder round-trip mismatch in block {b}: {bad}/128 trits")
+    return data
 
 
 _LANE_BYTE = {}
 
 
-def _encode_trit_lane(value, lane):
-    """Inverse of the digit decode for one trit lane: find a byte whose base-3
-    digit `lane` is value. The decode is a truncating ladder over 8 bits, so a
-    trit 0/1/2 in lane n is produced by the byte constant below."""
+def _pack_trits(trits):
+    """Byte whose decoded lanes 0..len(trits)-1 are exactly `trits`.
+
+    The decoder recovers five trits per byte via _ptq1_0_digit, and 3**5 == 243
+    of the 256 byte values land on distinct 5-trit patterns, so this is a
+    bijection on the ternary alphabet. Lane n is worth 3**n.
+    """
     if not _LANE_BYTE:
         for byte in range(256):
-            for n in range(5):
-                digit = _ptq1_0_digit(byte, n) + 1
-                _LANE_BYTE.setdefault((n, digit), byte)
-    # a trit is encoded in one lane only: 0/1/2 -> the smallest byte carrying it
-    return _LANE_BYTE[(lane, value + 1)]
+            key = tuple(_ptq1_0_digit(byte, n) for n in range(5))
+            _LANE_BYTE.setdefault(key, byte)
+    key = tuple(trits) + (0,) * (5 - len(trits))
+    if key not in _LANE_BYTE:
+        raise ValueError(f"unrepresentable trit group {trits}")
+    return _LANE_BYTE[key]
+
+
+def _encode_trit_lane(value, lane):
+    """Kept for callers that only care about one lane; see _pack_trits."""
+    return _pack_trits([0] * lane + [value] + [0] * (4 - lane))
 
 
 # ------------------------------------------------------------------ reference
@@ -236,6 +260,9 @@ def reference_logits(p, w, prompt, trace=None, trace_layer=None):
     Hm, signs = p["hadamard_matrix"], p["sign_vector"]
     block = Hm.shape[0]
     use_hadamard = bool(p.get("hadamard", True))
+    # must mirror the order make() emits into prism.hadamard.sign_widths, since
+    # the signs are a concatenation over that list and every fold slices by offset
+    widths = list(dict.fromkeys([E, conv_dim, value_dim, F]))
 
 
     def rms(x, wgt):
@@ -244,7 +271,7 @@ def reference_logits(p, w, prompt, trace=None, trace_layer=None):
     def fold(x, width):
         if not use_hadamard:
             return np.asarray(x, dtype=np.float32)
-        return apply_fold(x, width, block, Hm, signs)
+        return apply_fold(x, width, block, Hm, signs, widths)
 
     state = {l: np.zeros((NV, S, S), dtype=np.float32) for l in range(p["L"])}
     conv = {l: np.zeros((CK - 1, conv_dim), dtype=np.float32) for l in range(p["L"])}
@@ -258,7 +285,10 @@ def reference_logits(p, w, prompt, trace=None, trace_layer=None):
     for pos, tok in enumerate(prompt):
         x = w["token_embd.weight"][tok].copy()
         if use_hadamard and p["token_embd_inverse"]:
-            x = (Hm_block(x, block, Hm) * signs[:len(x)]).astype(np.float32)
+            # the table stores S*H*e; the exact inverse is (S*H)^-1 = H*S, i.e.
+            # rotate then signs (build_embd_rows). Note this is the opposite
+            # order to apply_fold().   [npz already holds the restored rows]
+            x = (Hm_block(x, block, Hm) * sign_slice(signs, widths, len(x))).astype(np.float32)
         for l in range(p["L"]):
             rec = (l + 1) % p["interval"] != 0
             n = rms(x, w[f"blk.{l}.attn_norm.weight"])
@@ -328,6 +358,10 @@ def reference_logits(p, w, prompt, trace=None, trace_layer=None):
                     record("attn_out", attn)
             else:
                 qfull = fold(n, E) @ w[f"blk.{l}.attn_q.weight"].T
+                # the fused Q|gate projection is INTERLEAVED per head, not
+                # [all Q | all gate]: qwen35.cpp views the same buffer twice with
+                # a 2*head_dim element stride and a head_dim offset, i.e.
+                # [q0 g0 q1 g1 ...]. Reshaping to (H, 2, D) gives exactly that.
                 qg = qfull.reshape(H, 2, D)
                 q, gate = qg[:, 0, :].copy(), qg[:, 1, :].copy()
                 kk = (fold(n, E) @ w[f"blk.{l}.attn_k.weight"].T).reshape(KH, D)
@@ -368,11 +402,35 @@ def reference_logits(p, w, prompt, trace=None, trace_layer=None):
     return logits.astype(np.float32)
 
 
-def apply_fold(x, width, block, Hm, signs):
-    """H then signs: build_hadamard_input(rot, then ggml_mul(signs))."""
+def sign_slice(signs, widths, width):
+    """The signs for `width`, at their CUMULATIVE offset in the sign vector.
+
+    sign_widths is an ordered list and sign_values is their concatenation, so a
+    width's slice starts after every earlier declared width -- NOT at 0. Slicing
+    from 0 (the earlier shape of this file) gives every width except the first
+    one another width's signs, which folds the weight against a basis the
+    runtime never reconstructs.
+    """
+    off = 0
+    for w in widths:
+        if w == width:
+            return signs[off:off + width]
+        off += w
+    raise KeyError(f"width {width} is not in sign_widths {widths}")
+
+
+def apply_fold(x, width, block, Hm, signs, widths=None):
+    """x' = H * S * x  (signs, THEN rotate).
+
+    llm_graph_context::build_hadamard_input applies the sign vector before
+    llama_mul_mat_hadamard, i.e. y = W'*(H*(s*P*x)), and the permutation P is
+    applied to x before either. Signs and the rotation do not commute, so this
+    order is load-bearing.
+    """
     assert width % block == 0, (width, block)
-    y = x.reshape(-1, block) @ Hm.T
-    return (y.reshape(width) * signs[:width]).astype(np.float32)
+    sv = sign_slice(signs, widths, width) if widths else signs[:width]
+    y = (np.asarray(x, dtype=np.float32).reshape(-1) * sv).astype(np.float32)
+    return (y.reshape(-1, block) @ Hm.T).reshape(width).astype(np.float32)
 
 
 def Hm_block(x, block, Hm):
@@ -409,7 +467,17 @@ def make(path_gguf, path_npz, seed=1234, quantised=True, hadamard=True, identity
 
     # random signs per input width; identity_signs keeps the rotation but drops D,
     # which separates an unapplied rotation from a misordered one
-    widths = [E, conv_dim, value_dim, F]
+    # prism.hadamard.load_hparams_hadamard rejects a duplicate sign width, and
+    # the default dims genuinely collide (E == value_dim == 128, conv_dim == F ==
+    # 256). Collapsing duplicates is also exactly what the per-width sign slice
+    # below already assumed, so this changes no values -- it just makes the
+    # emitted contract one the reference would accept.
+    widths = list(dict.fromkeys([E, conv_dim, value_dim, F]))
+    # NOTE: `widths` drives BOTH the metadata and the sign slicing below, so every
+    # folded weight's input width must appear exactly once, in this order. The
+    # offsets are cumulative over the deduped list -- computing them against the
+    # pre-dedup list (the earlier shape here) makes every width after the first
+    # duplicate read the wrong slice of the sign vector.
     if identity_signs:
         signs = np.ones(sum(widths), dtype=np.float32)
     else:
@@ -423,28 +491,96 @@ def make(path_gguf, path_npz, seed=1234, quantised=True, hadamard=True, identity
         if cols % 128:
             return (rng.standard_normal((rows, cols)) * 0.2).astype(np.float32)
         blocks = cols // 128
-        scale = rng.uniform(0.5, 1.5, size=(rows, blocks)).astype(np.float32)
+        # the block scale must be exactly representable in f16, or the encoder's
+        # stored d differs from the scale the values were built with
+        scale = rng.uniform(0.5, 1.5, size=(rows, blocks)).astype(np.float16).astype(np.float32)
         signs_ = np.sign(rng.standard_normal((rows, cols))).astype(np.float32)
         return (signs_ * np.repeat(scale, 128, axis=1)).astype(np.float32)
 
     def folded(w, cols):
-        # W_f = W * D * H, per block of the input axis. With hadamard=False the
-        # weights stay in the primal basis (an ablation, not a valid checkpoint).
+        # W_f = (W * S) * H, per block of the input axis, so that
+        # W_f @ (H * S * x) == W @ x. Column-scaling W by the signs and THEN
+        # rotating on the right is W*S*H; rotating first would give W*H*S, which
+        # pairs with the wrong input order. With hadamard=False the weights stay
+        # in the primal basis (an ablation, not a valid checkpoint).
         if not hadamard:
             return np.asarray(w, dtype=np.float32)
-        b = w.reshape(w.shape[0], -1, p["block"])
+        b = (w * sign_slice(signs, widths, cols)).astype(np.float32).reshape(w.shape[0], -1, p["block"])
         b = b @ Hm.T
-        return (b.reshape(w.shape) * signs[:cols]).astype(np.float32)
+        return b.reshape(w.shape).astype(np.float32)
+
+    def quantise_like_file(w):
+        """Snap a weight to what the on-disk encoding can actually represent."""
+        if not quantised:
+            return np.asarray(w, dtype=np.float32)
+        flat = np.ascontiguousarray(w, dtype=np.float32).ravel()
+        out = flat.copy()
+        for b in range(flat.size // 128):
+            blk = flat[b * 128:(b + 1) * 128]
+            sc = float(np.max(np.abs(blk)))
+            dd = np.float16(sc if sc else 1.0)
+            # PTQ1_0 stores one of {-d, 0, +d} per weight
+            lv = np.rint(blk / float(dd)) if sc else np.zeros(128, dtype=np.float32)
+            out[b * 128:(b + 1) * 128] = lv * float(dd)
+        return out.reshape(w.shape).astype(np.float32)
+
+    def stored(w, cols, is_folded):
+        """Exact value the fixture writes, AFTER the on-disk encoding.
+
+        A Hadamard-folded weight is W*S*H, which is DENSE. PTQ1_0 can only carry
+        {-d, 0, +d} per group of 128, so a folded weight is quantised to the
+        nearest ternary triple: that is a real, lossy approximation of the dense
+        matrix, and it is what any consumer of the file must use.
+
+        The reference therefore has to consume these post-quantisation numbers
+        too -- otherwise the parity run compares the runtime's quantised weights
+        against the reference's exact ones and reports a forward bug. That is
+        precisely what the ptq1_0 case did (abs=1e2 while f32 passed at 4e-5).
+        Note this makes PTQ1_0 a lower-fidelity case by construction: it is
+        testing the decode path, not 4e-5-level numerical agreement.
+        """
+        basis = np.asarray(w, dtype=np.float32)
+        if is_folded and hadamard:
+            base = folded(basis, cols)
+            if quantised:
+                # PTQ1_0 cannot store W*S*H (dense). Build the primal weight so
+                # that the FOLDED result is ternary: fold a ternary matrix and
+                # keep whichever stored ternary weight reproduces the folded
+                # matrix best is out of scope here, so instead fold in the
+                # ternary domain -- the on-disk weight is dense by construction
+                # and the encoding is lossy on purpose.
+                return quantise_like_file(base)
+            return base
+        return quantise_like_file(basis)
 
     w, roles, folded_names = {}, {}, []
     folded_names.append("output.weight")
     # the table stores latent rows: rotated by H and scaled by the sign vector
     # (inverse_weight_names), restored by the runtime after the row lookup
     emb = ternary(p["vocab"], E)
-    w["token_embd.weight"] = (Hm_block(emb.reshape(-1, p["block"]), p["block"], Hm)
-                              .reshape(p["vocab"], E) * signs[:E]).astype(np.float32) \
-        if hadamard else emb
-    w["output.weight"] = folded(ternary(p["vocab"], E), E)
+    # z = S*H*e, so the runtime restores e with the exact inverse (S*H)^-1 = H*S:
+    # rotate first, then signs (build_embd_rows order -- the opposite of the
+    # folded-matmul input order above).
+    # The runtime restores with R = S*H (build_embd_rows: rotate first, then
+    # signs), so the stored table has to be R's inverse T = H*S -- signs applied
+    # to the embedding row FIRST, then the rotation. Storing R*e instead (the
+    # obvious-looking "rotate then scale" order) leaves R*T = R*R != I and the
+    # whole model is subtly wrong from the embedding up.
+    w["token_embd.weight"] = (
+        Hm_block((emb * sign_slice(signs, widths, E)).reshape(-1, p["block"]), p["block"], Hm)
+        .reshape(p["vocab"], E)).astype(np.float32) if hadamard else emb
+    # The table is stored quantised too, so the reference restores from the
+    # quantised rows rather than the pristine ones. NOTE: a rotated embedding row
+    # is dense, so under PTQ1_0 the stored row is a ternary approximation of it
+    # and the restore only approximately recovers the original embedding. That is
+    # inherent to putting a latent (folded) table in a 1.58-bit format, not a bug;
+    # it is why the ptq1_0 case is graded on ranking.
+    w["token_embd.weight"] = quantise_like_file(w["token_embd.weight"])
+    _latent_err = float(np.max(np.abs(
+        ((w["token_embd.weight"].reshape(-1, p["block"]) @ Hm.T).reshape(p["vocab"], E)
+         * sign_slice(signs, widths, E)) - emb)))
+    print(f"latent embedding restore error under this encoding: {_latent_err:.4f}")
+    w["output.weight"] = stored(ternary(p["vocab"], E), E, True)
     w["output_norm.weight"] = rng.uniform(0.5, 1.5, E).astype(np.float32)
     # explicit per-tensor spec: (name, rows, cols or 0 for a 1-D vector, folding)
     common = [("attn_norm.weight", 0, E, False), ("post_attention_norm.weight", 0, E, False),
@@ -475,7 +611,7 @@ def make(path_gguf, path_npz, seed=1234, quantised=True, hadamard=True, identity
                          "gdn" if (name.startswith("ssm_") or name.startswith("attn_qkv") or name.startswith("attn_gate")) else
                          "attn")
                 mat = np.zeros((rows, cols), dtype=np.float32) if group in zero else ternary(rows, cols)
-                w[full] = folded(mat, cols) if is_folded else mat
+                w[full] = stored(mat, cols, is_folded)
                 if is_folded:
                     folded_names.append(full)
 
@@ -539,6 +675,7 @@ def make(path_gguf, path_npz, seed=1234, quantised=True, hadamard=True, identity
         trace_layer=np.array(trace_layer),
         **{f"trace__{k}": v for k, v in trace.items()},
     )
+    print(f"sign widths = {widths}  (values: {signs.size})")
     return dict(gguf=path_gguf, npz=path_npz, tensors=len(w), folded=len(folded_names),
                 ptq1_0=t.tensors and sum(1 for x in t.tensors if x[2] == PTQ1_0_T),
                 vocab=p["vocab"], layers=p["L"], ref_argmax=int(np.argmax(ref)))

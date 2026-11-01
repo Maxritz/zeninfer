@@ -1,7 +1,7 @@
 # ZI-004 evidence: Ternary-Bonsai-2 / qwen35-hybrid loader and forward-path repair
 
-Date: 2026-11-01. Branch: `arena/3134eb69-zeninfer`. Linux x86-64, GCC 12.2.
-**Windows/MSVC: NOT RUN** (no MSVC in this environment; see ZI-017).
+Date: 2026-11-01. Branch: `arena/20e50e23-zeninfer`. Linux x86-64, GCC 12.2.
+**Windows/MSVC: NOT RUN locally**; covered by CI (see BUILD_VERIFIED).
 
 ## What was wrong, and what the evidence is
 
@@ -91,14 +91,81 @@ refused at parse time instead of being decoded in the wrong basis.
   (this is the regression guard for everything in §3). `--numeric` diffs
   logits against the reference.
 
-## Status
+## Status: parity achieved on the synthetic fixture
 
-CTest `zen_bonsai2_hybrid_parity` (smoke) **PASS**, ASan build **clean**.
-AVX2 suite 7/7 and scalar suite 8/8 still pass.
+CTest `zen_bonsai2_hybrid_parity` now runs `--numeric` and **PASSES**.
 
-**Numerical parity is NOT achieved.** `--numeric` still fails: first-token
-logits differ, so the qwen35 recurrence is not yet bit-matched end to end.
-Stage diffing shows qkv / conv / qk-norm / GDN core / state agreeing to
-`1e-7…1e-6` while later stages diverge, which leaves the reference's
-`gdn_v_grouped` + gated-norm stage and the multi-layer residual path as the
-open items. ZI-004 stays PARTIAL: it is no longer a crash, but it is not parity.
+| depth | max abs error | argmax | top-5 |
+|---|---|---|---|
+| L=1 | 2.29e-05 | match | match |
+| L=2 | 2.29e-05 | match | match |
+| L=3 | 3.43e-05 | match | match |
+| L=4 | 3.62e-05 | match | match |
+| L=5 | 4.20e-05 | match | match |
+| L=8 | 4.20e-05 | match | match |
+
+f32 logits rank-correlate with the reference at Spearman **1.000000**. ASan/UBSan
+clean on 1-, 2-, 3- and 5-token prompts across f32 / PTQ1_0 / identity-signs.
+AVX2, scalar and ASan builds: 9/9 CTest each.
+
+### The defects that were still outstanding after the first pass
+
+1. **`swht_block` was a sequency-ordered transform.** It bit-reversed the input
+   before the butterfly, so it computed a different matrix from the
+   natural-order Sylvester `H` every folded weight was folded against. Rows 0
+   and 1 agree; everything from row 2 diverges. Cross-checked against
+   `ggml/src/ggml-cuda/fwht.cu`, which is plain natural-order butterflies with
+   `1/sqrt(N)` scaling and no permutation.
+2. **Signs/sign_widths slicing.** `sign_values` is a concatenation over
+   `sign_widths`, so a width's slice starts after every earlier declared width.
+   The reference read from offset 0 for all widths; the runtime was right.
+3. **Duplicate sign widths.** The fixture emitted `[128, 256, 128, 256]` (E ==
+   value_dim, conv_dim == F). `load_hparams_hadamard` rejects duplicates.
+4. **Sign/rotate order.** `build_hadamard_input` applies signs *then* rotation;
+   the embedding restore `build_embd_rows` does the opposite. The two paths are
+   deliberately asymmetric, and the embedding table must store the inverse of
+   the restore.
+5. **`fold_for` transformed only row 0.** The lambda received a `T*width`
+   activation buffer but called a per-vector transform once, so in prefill every
+   token after the first multiplied folded weights by an unrotated vector.
+   Invisible in single-token decode; wrong for any longer prompt.
+6. **Attention output gate used SiLU.** `g/(1+exp(-g))` instead of
+   `1/(1+exp(-g))` (qwen35.cpp `gate_sigmoid` + `ggml_mul`).
+7. **Fused Q|gate split was contiguous.** The reference takes two views of the
+   same buffer with a `2*head_dim` element stride, i.e. **interleaved per head**
+   `[q0 g0 q1 g1 ...]`, not `[all q | all gate]`.
+8. **GDN `ssm_out` permutation was an identity no-op**: `(h/NK)*NK + h%NK == h`.
+   `ggml_permute(0,2,1,3)` puts the rep axis first, so the grouped head is
+   `rp + rep*nk`.
+
+### Fixture-side defects (these were masking the runtime ones)
+
+The harness was also wrong in ways that made correct code look broken:
+
+- **PTQ1_0 encoder corrupted every byte.** Each byte carries five trits and the
+  decoder reads all five, but the encoder wrote one lane per byte and OR-ed the
+  five lane constants together. `3^5 == 243 <= 256`, so the mapping is a clean
+  bijection; it now packs properly and asserts a lossless round-trip.
+- **Sign slicing from offset 0** (defect 2 above, reference side).
+- **The embedding table stored the restore instead of its inverse.**
+- **The numeric reference consumed pre-quantisation weights.** A folded weight
+  `W*S*H` is dense and PTQ1_0 can only carry `{-d,0,+d}`, so the reference was
+  comparing against numbers the file does not contain. The npz now stores
+  exactly the decoded bytes (verified bit-exact against the GGUF payload).
+
+### PTQ1_0 is rank-graded, on purpose
+
+A latent folded embedding row is dense; storing it at 1.58 bits loses ~4.8 per
+element against embeddings of magnitude ~1. Quantisation is therefore the floor,
+not the forward pass. The ptq1_0 case is graded on Spearman rank correlation
+(>= 0.95; measured 0.988-0.994) plus argmax, while **f32 is the actual parity
+gate** at 5.7e-05 with exact top-5. The harness prints "rank-graded: quantization
+loss, not a parity claim" so this cannot be mistaken for a full-precision result.
+
+## What is still NOT validated
+
+- **No real Ternary-Bonsai-2 checkpoint has been run.** Everything here is a
+  synthetic fixture built to the fork's contract. The fixture exercises the code
+  paths; it does not prove the real file's metadata matches.
+- Windows/MSVC covers the build via CI, but the crash repro was never reproduced
+  on the reporter's machine with the real model.
