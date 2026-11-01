@@ -118,12 +118,22 @@ void matvec(const float* w,const float* x,float* y,std::size_t rows,std::size_t 
 }
 // Normalized Sylvester-Walsh-Hadamard rotation of one block: out[j] =
 // (1/sqrt(B)) * sum_i (-1)^(popcount(i&j)) * in[i]. Butterfly: O(B log B).
+//
+// NATURAL order: the output index IS the frequency index, out[j] pairs with
+// in[i] through (-1)^popcount(i&j). There is deliberately no bit-reversal
+// pre-pass. A sequency-ordered variant (bit-reversing the input first, or the
+// standard "Walsh" ordering) is a *different matrix*: it agrees with Sylvester
+// on rows 0 and 1 and diverges from row 2 on. Because every folded weight was
+// folded against natural-order H, running a bit-reversed transform here leaves
+// each folded matmul reading a basis it was never folded for -- the output is
+// finite, plausible-looking and wrong, which is the worst failure mode.
+//
+// Cross-checked against PrismML-Eng/llama.cpp ggml/src/ggml-cuda/fwht.cu: the
+// kernel scales by 1/sqrt(N), applies the signs, then runs plain
+// (x, y) -> (x+y, x-y) butterflies in natural index order with no permutation,
+// and the shfl_xor path (val + val2 / val2 - val) is the same transform.
 void swht_block(const float* in,float* out,std::uint32_t B){
-    for(std::uint32_t i=0;i<B;++i){
-        std::uint32_t r=0,b=i;
-        for(std::uint32_t bit=1;bit<B;bit<<=1){r=(r<<1)|(b&1);b>>=1;}
-        out[i]=in[r];
-    }
+    std::copy_n(in,B,out);
     for(std::uint32_t len=2;len<=B;len<<=1){
         const std::uint32_t step=len>>1;
         for(std::uint32_t i=0;i<B;i+=len)
@@ -249,24 +259,36 @@ bool DenseTransformerRuntime::layer_is_recurrent(std::uint32_t l)const noexcept{
     return (l+1)%config_.full_attention_interval!=0;
 }
 void DenseTransformerRuntime::hadamard_transform_input(float* x,std::size_t width,std::vector<float>& scratch)const{
-    // Forward input transform for a folded weight, in the reference order:
-    // rotate by the normalized block Hadamard FIRST, then apply the +/-1 signs.
-    // llm_graph_context::build_hadamard_input does exactly
-    //   cur = llama_mul_mat_hadamard(ctx0, cur, rot); if (signs) cur = ggml_mul(ctx0, cur, signs);
-    // Signs and the block rotation do not commute, so the order is load-bearing.
+    // Forward input transform for a folded weight. Reference order:
+    //   permute (handled by the caller) -> signs -> rotate
+    // llm_graph_context::build_hadamard_input is
+    //   if (t.perm_rep > 1) { ...permute... }
+    //   if (t.signs)        x = ggml_mul(ctx0, x, t.signs);
+    //   x = llama_mul_mat_hadamard(ctx0, x, t.rot);
+    // i.e. x' = H * S * P * x, matching the documented y = W'*(H*(s*P*x)).
+    // Signs and the rotation do NOT commute, so a folded weight only reads the
+    // basis it was folded against when this order is exact: W_f = W*S*H must
+    // multiply H*S*x. Applying the rotation first silently folds the sign
+    // vector into the wrong basis and every Hadamard-folded weight is wrong.
     const auto& H=hadamard_;if(!H.block_size)return;
     if(width%H.block_size)return;           // never rotate a partial trailing block
+    const auto sit=H.signs.find(width);const float* signs=sit==H.signs.end()?nullptr:sit->second.data();
+    if(signs)for(std::size_t i=0;i<width;++i)x[i]*=signs[i];
     scratch.resize(H.block_size);
     for(std::size_t off=0;off<width;off+=H.block_size){
         float* blk=x+off;
         std::copy_n(blk,H.block_size,scratch.begin());
         swht_block(scratch.data(),blk,H.block_size);
     }
-    const auto sit=H.signs.find(width);const float* signs=sit==H.signs.end()?nullptr:sit->second.data();
-    if(signs)for(std::size_t i=0;i<width;++i)x[i]*=signs[i];
 }
 void DenseTransformerRuntime::hadamard_unrotate(float* x,std::size_t width,std::vector<float>& scratch)const{
-    // Inverse-table restore (rotated embedding rows): H first, then signs.
+    // Inverse-table restore, and deliberately the OPPOSITE order to the forward
+    // transform above: rotate first, then signs. The table stores z = S*H*e, so
+    // the exact inverse is (S*H)^-1 = H*S -- rotate then signs. This mirrors
+    // llm_graph_context::build_embd_rows:
+    //   cur = llama_mul_mat_hadamard(ctx0, cur, it->second.rot);
+    //   if (it->second.signs) cur = ggml_mul(ctx0, cur, it->second.signs);
+    // The two paths are not symmetric; making them identical is a bug either way.
     const auto& H=hadamard_;if(!H.block_size)return;
     if(width%H.block_size)return;
     scratch.resize(H.block_size);
@@ -564,8 +586,17 @@ bool DenseTransformerRuntime::forward_q35_batch(const std::vector<std::uint32_t>
     // ONCE per activation. Upstream memoises the transform per (activation,
     // rotation) and several weights share one input, so re-applying it per weight
     // (the previous shape of this lambda) silently re-transformed the buffer.
+    // `input` holds T consecutive rows of `width` floats. The transform is
+    // PER ROW: every token's activation is its own vector, and the reference
+    // transforms the whole [T, width] activation matrix. Calling it once on the
+    // base pointer only ever transformed row 0, so in prefill every token after
+    // the first multiplied its folded weights by an unrotated vector -- correct
+    // for a single-token decode, silently wrong for anything longer.
     auto fold_for=[&](std::uint32_t l,float* input,std::size_t width,std::initializer_list<const char*> suffixes){
-        for(const char* suffix:suffixes)if(hadamard_folded(suffix,l)){hadamard_transform_input(input,width,h_scratch);return;}
+        for(const char* suffix:suffixes)if(hadamard_folded(suffix,l)){
+            for(std::size_t t=0;t<T;++t)hadamard_transform_input(input+t*width,width,h_scratch);
+            return;
+        }
     };
     for(std::uint32_t l=0;l<config_.layers;++l){
         const std::string p="blk."+std::to_string(l)+".";
@@ -727,7 +758,11 @@ bool DenseTransformerRuntime::forward_q35_batch(const std::vector<std::uint32_t>
                     float* dst=gdn_out.data()+t*value_dim;
                     for(std::size_t h=0;h<NV;++h){
                         const std::size_t nk=h%NK, rp=h/NK;
-                        std::copy_n(src+std::size_t(h)*S,S,dst+(rp*NK+nk)*S);
+                        // ggml_permute(0,2,1,3) over the (hd, nk, rep) view puts
+                        // the rep axis first, so grouped head = rp + rep*nk.
+                        // (rp*NK+nk collapses to h and made this whole block a
+                        // no-op: the permutation was never actually applied.)
+                        std::copy_n(src+std::size_t(h)*S,S,dst+(rp+rep*nk)*S);
                     }
                 }
             }
@@ -741,11 +776,26 @@ bool DenseTransformerRuntime::forward_q35_batch(const std::vector<std::uint32_t>
             if(!tensor_gemm(*tensor(p+"attn_q.weight"),norm.data(),q.data(),T,QGW,E)||
                !tensor_gemm(*tensor(p+"attn_k.weight"),norm.data(),k.data(),T,KW,E)||
                !tensor_gemm(*tensor(p+"attn_v.weight"),norm.data(),v.data(),T,KW,E))return false;
-            // split: first QW = Q, second QW = output gate
+            // Split the fused Q|gate projection. The reference does NOT store it
+            // as [all Q | all gate]: qwen35.cpp build_layer_attn takes two 3-D
+            // views of the SAME buffer with element strides of 2*head_dim,
+            //   Qcur  = view_3d(Qcur_full, D, H, T, stride 2D, 2D*H, offset 0)
+            //   gate  = view_3d(Qcur_full, D, H, T, stride 2D, 2D*H, offset D)
+            // so the layout is INTERLEAVED per head: [q0 g0 q1 g1 ...].
+            // Splitting contiguously ([all q | all gate]) reads q0,g1,q2,... as
+            // the query and q1,g0,q3,... as the gate: every attention output is
+            // gated with a different head's values and the queries mix head
+            // halves. GDN layers never touch this path, so it only showed up
+            // once the fixture grew past the first full-attention layer.
             std::vector<float> qgate(T*QW);
             for(std::size_t t=0;t<T;++t){
-                std::copy_n(q.data()+t*QGW,QW,q.data()+t*QW);
-                std::copy_n(q.data()+t*QGW+QW,QW,qgate.data()+t*QW);
+                const float* src=q.data()+t*QGW;
+                float* qdst=q.data()+t*QW;
+                float* gdst=qgate.data()+t*QW;
+                for(std::size_t h=0;h<H;++h){
+                    std::copy_n(src+std::size_t(h)*2*D,D,qdst+std::size_t(h)*D);
+                    std::copy_n(src+std::size_t(h)*2*D+D,D,gdst+std::size_t(h)*D);
+                }
             }
             for(std::size_t t=0;t<T;++t){
                 const std::uint32_t pos=start_pos+static_cast<std::uint32_t>(t);
@@ -785,8 +835,12 @@ bool DenseTransformerRuntime::forward_q35_batch(const std::vector<std::uint32_t>
                 for(std::size_t j=first;j<=pos;++j){const float a=scores[j]/static_cast<float>(denom);
                     const float*vt=vc[l].data()+j*KW+std::size_t(kh)*D;for(std::size_t i=0;i<D;++i)out[i]+=a*vt[i];}
             }
-            // sigmoid gate after attention (ggml: attn_pregate * sigmoid(gate))
-            for(std::size_t t=0;t<T;++t)for(std::size_t i=0;i<QW;++i){const float g=qgate[t*QW+i];att[t*QW+i]*=g/(1.0f+std::exp(-g));}
+            // sigmoid gate after attention. Reference (qwen35.cpp build_layer_attn):
+            //   gate_sigmoid = ggml_sigmoid(ctx0, gate);  cur = ggml_mul(ctx0, cur, gate_sigmoid);
+            // i.e. attn_pregate * sigmoid(gate). This used to compute
+            // g/(1+exp(-g)), which is SiLU, not sigmoid -- a different function
+            // that agrees only at g=0 and biases every attention output.
+            for(std::size_t t=0;t<T;++t)for(std::size_t i=0;i<QW;++i){const float g=qgate[t*QW+i];att[t*QW+i]/=(1.0f+std::exp(-g));}
             fold_for(l,att.data(),QW,{"attn_output.weight"});
             if(!tensor_gemm(*tensor(p+"attn_output.weight"),att.data(),tmp.data(),T,E,QW))return false;
         }

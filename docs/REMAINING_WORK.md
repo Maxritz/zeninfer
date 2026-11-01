@@ -9,7 +9,7 @@ This is the release gate after 0.4.3-alpha. A feature is not complete merely bec
 | ZI-001 | Qwen3 dense adapter | **PARTIAL:** factory dispatch and optional per-head Q/K RMSNorm path added. **Real Qwen3-4B Q8_0 now loads and passes the full runtime fixture** (head_dim decoupled from embedding/heads via attention.key_length; attn_q/output validation fixed; norm-tensor role classification fixed). Independent NumPy logits parity on the real checkpoint: worst rel diff 6.4e-06, top-8 exact. Remaining: architecture-specific fixture wired into CTest | Real Qwen3 GGUF generation plus independent reference logits/token parity |
 | ZI-002 | Qwen3 MoE | **PROTOTYPE ONLY:** deterministic micro-model now exercises router scoring, top-2 selection, expert SwiGLU projections and weighted combine. Production GGUF tensor mapping, full attention/KV path and adapter integration remain | Real Qwen3 MoE fixture; router/expert unit tests and independent reference parity |
 | ZI-003 | BitNet adapter | **PARTIAL:** **Real BitNet b1.58-2B TQ1_0 GGUF now loads and passes the full runtime fixture** (bitnet.* metadata mapping, subln RMS norms after attention and inside FFN, tied lm_head — graph per ggml-org/llama.cpp src/models/bitnet.cpp and arXiv 2504.12285). Independent NumPy logits parity on the real checkpoint: worst rel diff 3.9e-06, top-8 exact. Remaining: BitLinear activation quantisation (A8) variant, fused ternary kernels | Real BitNet GGUF fixture and independent output parity |
-| ZI-004 | Bonsai adapter | **PARTIAL:** the qwen35-hybrid (Ternary-Bonsai-2) path now loads `prism.hadamard.*` + PTQ1_0 packs and executes without the crash class reported in the field: five OOB/oversized allocations fixed, GDN gate/conv/norm/Hadamard-order defects corrected against PrismML-Eng/llama.cpp. New synthetic qwen35 fixture + independent NumPy reference wired into CTest as a smoke guard (ASan clean). **Numerical parity not achieved** — `--numeric` still fails on first-token logits. See `docs/evidence/ZI-004-qwen35-hybrid-loader-and-gdn.md` | Real Bonsai-2 GGUF fixture and independent output parity |
+| ZI-004 | Bonsai adapter | **DONE for the synthetic fixture:** qwen35-hybrid forward reaches numerical parity with an independent NumPy reference (`max_abs_error` 5.7e-05, argmax/top-5 exact, Spearman 1.000000) across depths 1-8, and the `--numeric` gate now runs in CTest. Eight forward defects fixed against PrismML-Eng/llama.cpp. Still open: **no real Bonsai-2 checkpoint has been run** (fixture only), and PTQ1_0 is rank-graded because a latent folded table cannot be stored in 1.58 bits without loss. See `docs/evidence/ZI-004-qwen35-hybrid-loader-and-gdn.md` | Real Bonsai-2 GGUF fixture and independent output parity |
 
 ## P1: generic services and memory
 
@@ -41,7 +41,7 @@ This is the release gate after 0.4.3-alpha. A feature is not complete merely bec
 - ZI-001 Qwen3 dense adapter — PARTIAL
 - ZI-002 Qwen3 MoE — PROTOTYPE ONLY
 - ZI-003 BitNet adapter — PARTIAL
-- ZI-004 Bonsai adapter — PARTIAL (loads and runs; numerical parity open)
+- ZI-004 Bonsai adapter — parity on the synthetic fixture; real-checkpoint validation open
 
 **P1 — generic services:**
 - ZI-005 General Jinja templates — OPEN (no compatible interpreter yet)

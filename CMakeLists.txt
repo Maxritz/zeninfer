@@ -130,7 +130,7 @@ if(ZEN_BUILD_TESTS)
       # fixtures are generated on the fly (PTQ1_0 and F32 weights) and the
       # runtime logits are diffed against the independent reference in
       # tests/make_bonsai2_fixture.py.
-      add_test(NAME zen_bonsai2_hybrid_parity COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/bonsai2_parity.py $<TARGET_FILE_DIR:zen_parity_probe> --generator ${CMAKE_CURRENT_SOURCE_DIR}/tests/make_bonsai2_fixture.py)
+      add_test(NAME zen_bonsai2_hybrid_parity COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/bonsai2_parity.py $<TARGET_FILE_DIR:zen_parity_probe> --generator ${CMAKE_CURRENT_SOURCE_DIR}/tests/make_bonsai2_fixture.py --numeric)
       set_tests_properties(zen_bonsai2_hybrid_parity PROPERTIES LABELS "parity;independent;numpy;qwen35;bonsai" TIMEOUT 300)
     endif()
   endif()
