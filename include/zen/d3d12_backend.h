@@ -289,6 +289,32 @@ bool ffn_residual_fused(const std::uint8_t* attn_output, const std::uint8_t* gat
                         float* out, std::size_t hidden, std::size_t attn_width,
                         std::size_t ffn_rows, float epsilon) noexcept;
 
+// SiLU(gate)*up on the device, out[i] = (gate[i] / (1 + exp(-gate[i]))) * up[i]
+// over `count` floats. Mirrors rms_norm/residual_add (host in, host out, one
+// submit): used by the parity harness and by the fallback paths. The prefill
+// hot path fuses this into ffn_prefill_fused instead of paying a submit for it.
+bool silu_mul(const float* gate, const float* up, float* out, std::size_t count) noexcept;
+
+// The whole FFN half of a PREFILL layer (T > 1) in one submission:
+//   t0 = attn_output @ att;  h1 = t0 + x;  h2 = rmsnorm(h1);
+//   g  = gate @ h2;  u = up @ h2;  f = silu(g)*u;  d = down @ f;
+//   out = h1 + d
+// The GEMM (not GEMV) variant of ffn_residual_fused: same eight-dispatch
+// shape, but the four projections dispatch the prefill GEMM shader over
+// `tokens` rows, so gate/up/the SiLU result stay in VRAM between the gate/up
+// GEMMs and the down GEMM - no readback between up and down. `x` ([tokens x
+// hidden] residual base) and `attn_out` ([tokens x attn_width]) are staged to
+// the upload heaps on entry, so `out` may alias `x`. Returns false (caller
+// keeps the separate GEMM + CPU SiLU/add path) when the backend is absent,
+// the shape is not Q8_0 GEMM-eligible, DP4A is on (the fused path is fp32
+// only), or the working buffers exceed the device-resident cap.
+bool ffn_prefill_fused(const std::uint8_t* attn_output, const std::uint8_t* gate,
+                       const std::uint8_t* up, const std::uint8_t* down,
+                       const float* norm_weight, const float* x, const float* attn_out,
+                       float* out, std::size_t tokens, std::size_t hidden,
+                       std::size_t attn_width, std::size_t ffn_rows,
+                       float epsilon) noexcept;
+
 bool gemv_q8_0_ffn(const std::uint8_t* gate, const std::uint8_t* up, const std::uint8_t* down,
                    const float* x, float* y, std::size_t ffn_rows, std::size_t columns,
                    std::size_t out_rows) noexcept;

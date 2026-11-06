@@ -331,3 +331,70 @@ Sequence 1→2→3 are independent and low-risk. Evidence: `tmp_perfA_trace2.txt
 ### ACTIONS
 - [ ] Do not enable FUSEQ by default; next lever is GEMV lane-spec (item 4) / speculative draft asset, not more fusion.
 
+## [RUN-009] 2026-11-06 — MODE: HIGH — TARGET: single-submit decode pipeline default-on
+
+### BASELINE (per-layer, ZEN_D3D12_PIPELINE=0)
+- Hardware: RX 9070 XT, ReBAR=1, Agility 722; model Llama-3.2-1B-Q8_0 (16L, 2048H, 32H/8KV, 64d, vocab 128256)
+- Workload: prompt "Once upon a time" greedy 8, and oracle [12805,5304,264,892] greedy 8
+- Per-layer: 369 submits / 7 forwards (~17/token), per_submit 168us (queue 2us, fence 165us), decode 43.4ms/7 = 6.2ms/token, 161 tok/s
+- Pipeline (ZEN_D3D12_PIPELINE=1): 264 submits, per_submit 190us (queue 1us, fence 189us, single 3.3ms GPU submit), decode 33.5ms/7 = 4.8ms/token, 212 tok/s
+- Instrumentation floor: negligible vs ms-scale
+
+### FINDINGS
+- Per-layer submission latency dominates fence wait; pipeline collapses 16 submits to 1
+- LM fuse on/off is neutral (212 vs 217 tok/s); orchestration is not the bandwidth ceiling
+
+### ROOT CAUSE
+- Historical per-layer pipe_lists design recorded transitions into the wrong (closed) s.list; GPU ran with stale states and seeded runs diverged. Current backend line 4977-4982 already records every layer into the OWNING list (list = s.list.Get()) with hin staging and full UAV/NSR/COPY cycling; every arena returns to entry state per layer. Caller comment was stale. Parity gate green (below), default flipped on.
+
+### VALIDATION
+- Determinism: same seed twice identical ids both modes (11 304 264 2678)
+- Decode logits pipeline vs per-layer: max_abs 1.9e-06 rel 2.1e-07 (gate <=1e-6 PASS), top5 identical
+- Oracle [12805,5304,264,892] -> 11,220,16,13,20,3610,1274,304 identical pipeline/per-layer
+- ctest 7/7 d3d12+core green; no DRED DEVICE_REMOVED
+- Tok/s: 161 (per-layer) -> 209 (pipeline default) this run, +30%
+- Default: ON (ZEN_D3D12_PIPELINE unset/1); kill switch ZEN_D3D12_PIPELINE=0 restores per-layer. Backup backup/pipe-2026-11-06/
+### ACTIONS
+- [x] Flip ZEN_D3D12_PIPELINE default ON
+- [ ] Next: 480 tok/s needs GEMV weight-bandwidth/kernel work, not orchestration
+
+
+## [RUN-010] 2026-11-06 — MODE: HIGH — TARGET: GPU prefill batched GEMM (QKV + gate|up)
+
+### BASELINE (before batch, ZEN_D3D12_BATCH unset/0)
+- Hardware: RX 9070 XT (RDNA4, ReBAR=1, Agility 722); model Llama-3.2-1B-Q8_0 (16L, 2048H, 32H/8KV/64d)
+- Workload: zen_generate_ids, warm runs (run_1..2), prompt length T exact
+- T=128: prefill 162-183 ms (765-787 tok/s), submits=144/prefill, dispatches=113 (112 GEMM + 1 LM GEMV), wait=92-96 ms, batches=0, quant.gemm 112 ops = 94-99 ms
+- T=171: prefill 228-238 ms (718-751 tok/s), same 144 submits, wait=122-128 ms, quant.gemm 112 ops = 128-135 ms
+- Decomposition per prefill: 112 GEMM submits (7/layer x16) + 16 flash_attention + 16 kv_cache_append_batched = 144; dispatches 113
+- Instrumentation floor: 0.11 us/scope (negligible)
+
+### TRACE (per-submit overhead)
+- Total fence wait / submits: T128 92 ms/144 = 639 us; T171 126/144 = 875 us. Most fence time is GPU kernel work itself (gemm_bench T128: ffn_gate 1.50 ms, attn_q 0.47 ms, TOTAL 4.72 ms/14 GFLOP = 2.96 TFLOP/s).
+- Marginal submit overhead is the gap between kernels, not the full fence. It is ~70-200 us/submit at T128 (measured saving /48 removed submits), not 0.7-1.1 ms. At small T (verify T=4) it is larger fractionally but absolute wall saving is only ~1-3 ms.
+- Expected batch saving ceiling: 48 removed submits x ~0.2 ms = ~10 ms at T128/171, ~2-5 ms at T=4-32.
+
+### IMPLEMENTATION
+- quant::gemm_batch() (include/zen/quant.h, src/quant.cpp): tries d3d12::gemm_q8_0_batch when ZEN_D3D12_BATCH=1, q8_0, scale==1, count<=8, backend enabled, DP4A off; else loops quant::gemm() per task (GPU single + AVX2/CPU). Route counters add count per batch attempt.
+- tensor_gemm_batch() (dense_transformer_runtime.cpp anonymous namespace): T==1 -> tensor_matvec_batch; otherwise planner prefill + same-encoding check -> quant::gemm_batch, else per-tensor tensor_gemm loop (FP32 fallback preserved).
+- forward_batch wiring only: Q/K/V 3->1, gate/up 2->1; O/down stay separate (attention/SiLU dependency). T==1 decode unchanged. Default gate off preserves old path.
+- Backend guards (d3d12_backend.cpp gemm_q8_0_batch): mirror single-gemm gates - gemm_opted_in, kMinElements per task, DP4A decline (batch is fp32 only). Prevents bypassing GEMM_EXPERIMENTAL=0.
+- Parity harness (tools/d3d12_gemm_parity.cpp): added check_gemm_batch (QKV 2048/512/512 + gate/up 8192/8192, T=17) comparing batch vs single bitwise and vs double reference.
+
+### RESULTS (ZEN_D3D12_BATCH=1, warm runs)
+- Submits/prefill: 144 -> 96 (GEMM 112 -> 64, -48). Batches counter: 0 -> 32 per prefill (96 across 3 runs). Dispatches unchanged 113.
+- T=128: 162-183 ms -> 155-166 ms (-7 to -19 ms, -5 to -10%), 765-787 -> 802-821 tok/s (+5-7%). wait 92-96 -> 83-85 ms (-9 to -11 ms).
+- T=171: 228-238 ms -> 215-229 ms (-10 to -13 ms, -5%), 718-751 -> 785-792 tok/s (+5%). wait 122-128 -> 114-120 ms.
+- Small T: T=4 50.8->50.1 ms (-0.7), T=8 53.8->50.1 (-3.7), T=32 58.8->54.7 (-4.1) ms.
+- quant.gemm ops: 112 (94 ms) -> gemm_batch 32 (56 ms) + gemm 32 (29 ms)=85 ms at T128; 135 -> 77+42=120 ms at T171.
+- DP4A A/B: B0 vs B1 identical stream under DP4A=1 (11,358,574,...) because batch skips DP4A and calls single path.
+
+### VALIDATION
+- gemm_parity: single rel 9.0e-08 / 1.02e-07 / 1.64e-07 / 1.87e-07; batch_vs_single 0.000e+00 for all 5 tasks, batch rel 1.4e-07 / 1.65e-07 / 1.77e-07 / 1.64e-07 / 1.74e-07. PASS.
+- Greedy stream [12805,5304,264,892] x32: GPU B0 == GPU B1 == CPU B0 == CPU B1 == 11,220,16,13,20,3610,1274,304,279,...,19,13.
+- zen_core_tests PASS; ctest gemm_parity + core_tests PASS. zen_runtime_tests with real GGUF PASS (prefill 182ms median this run).
+- Default gate off: ZEN_D3D12_BATCH unset/0 = old loop, bit-identical. Backup: backup/gpubatch-2026-11-06/
+
+### ACTIONS
+- [x] Land batch wiring default-off; keep gate off until perf accepted (this run shows +5-10% prefill, 48 fewer submits, no numerics change)
+- [ ] Next levers for prefill (rope 27-36 ms and silu 9-13 ms are now 17% and 6%; GEMM still 57% - kernel TFLOP/s, split-K for 2048-row, and KV/flash submits remain 32/prefill) - not more orchestration.

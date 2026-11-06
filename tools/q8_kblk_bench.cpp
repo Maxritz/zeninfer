@@ -1,6 +1,9 @@
-// Q8_0 GEMM micro-benchmark (Priority 1, K-blocked vs legacy).
-// Times quant::gemm (dispatch honours ZEN_CPU_Q8_KBLK / ZEN_CPU_Q8_KC per
-// process) at real prefill shapes plus a direct-kernel comparison.
+// Q8_0 GEMM micro-benchmark (Priority 1, K-blocked vs legacy, plus the
+// sequential repack candidate (a)). Times quant::gemm (dispatch honours
+// ZEN_CPU_Q8_KBLK / ZEN_CPU_Q8_KC per process) at real prefill shapes plus
+// direct-kernel comparisons. Repack timings are measured directly through
+// quant::gemm_q8_0_kblk_repack_parallel, so they do not depend on the
+// process env gates (which only steer the model load/registry path).
 // Run twice per shape: ZEN_CPU_Q8_KBLK=0 (legacy) vs =1 (K-blocked).
 // Prints: ms, tokens/ms, GFLOP/s, max err vs double reference.
 #include "zen/quant.h"
@@ -124,6 +127,51 @@ int main(int argc, char** argv) {
         }
         std::printf("direct rows=2048 cols=8192 T=32 legacy-vs-kblk n_diff=%zu/%zu maxdiff=%.6g %s\n",
                     n_diff, o_legacy.size(), maxdiff, (n_diff == 0 ? "BIT-IDENTICAL" : "DIFFERS"));
+        // Repacked sequential variant: same packed matrix, repacked once,
+        // timed through the repacked parallel wrapper vs the double
+        // reference and the raw kblk/legacy outputs above.
+        {
+            auto repacked = zen::quant::repack_q8_0_kblk(packed.data(), rows, cols);
+            std::printf("repack rows=%zu cols=%zu bytes=%zu raw_bytes=%zu repack_bytes=%zu\n",
+                        rows, cols, repacked.size(), rows*rb, zen::quant::repacked_q8_0_kblk_bytes(rows, cols));
+            std::vector<float> o_repack(T * rows, 0.0f);
+            const bool ok = zen::quant::gemm_q8_0_kblk_repack_parallel(repacked.data(), xin.data(), o_repack.data(), T, rows, cols, 0);
+            std::size_t n_diff_r = 0; float maxdiff_r = 0;
+            for (std::size_t i = 0; i < o_legacy.size(); ++i) {
+                const float d = std::abs(o_legacy[i] - o_repack[i]);
+                if (d != 0) ++n_diff_r;
+                if (d > maxdiff_r) maxdiff_r = d;
+            }
+            std::printf("direct rows=2048 cols=8192 T=32 repack ok=%d legacy-vs-repack n_diff=%zu/%zu maxdiff=%.6g %s\n",
+                        ok ? 1 : 0, n_diff_r, o_legacy.size(), maxdiff_r, (ok && n_diff_r == 0 ? "BIT-IDENTICAL" : "DIFFERS"));
+            const double rep_us = bench_best_us([&]() { zen::quant::gemm_q8_0_kblk_repack_parallel(repacked.data(), xin.data(), o_repack.data(), T, rows, cols, 0); }, 2, reps);
+            std::printf("repack rows=%zu cols=%zu T=%zu workers=0 best=%.3f ms\n", rows, cols, T, rep_us / 1000.0);
+        }
+        // End-to-end shapes: repacked vs raw dispatch timings at the
+        // prefill lengths that exercise the K-block threshold.
+        for (const std::size_t TT : {std::size_t(128), std::size_t(171)}) {
+            for (const Shape sh : {Shape{2048, 8192}, Shape{8192, 2048}}) {
+                const std::size_t rr = sh.rows, cc = sh.cols;
+                const std::size_t rb2 = zen::quant::row_bytes(*fmt, cc);
+                std::vector<std::uint8_t> pk(rr * rb2);
+                std::uint32_t ss = 4242u + std::uint32_t(rr + cc);
+                auto rd = [&]() { ss = ss * 1664525u + 1013904223u; return static_cast<std::uint8_t>((ss >> 24) & 0xffu); };
+                for (std::size_t r = 0; r < rr; ++r)
+                    for (std::size_t blk = 0; blk < cc / 32; ++blk) {
+                        std::uint8_t* b = pk.data() + r * rb2 + blk * 34;
+                        b[0] = 0x00; b[1] = 0x3c;
+                        for (std::size_t j = 2; j < 34; ++j) b[j] = rd();
+                    }
+                auto rp = zen::quant::repack_q8_0_kblk(pk.data(), rr, cc);
+                std::vector<float> xx(TT * cc);
+                for (std::size_t i = 0; i < xx.size(); ++i) xx[i] = float(int(i % 15) - 7) * 0.017f;
+                std::vector<float> oo(TT * rr, 0.0f);
+                const double t_repack = bench_best_us([&]() { zen::quant::gemm_q8_0_kblk_repack_parallel(rp.data(), xx.data(), oo.data(), TT, rr, cc, 0); }, 2, reps) / 1000.0;
+                const double t_raw = bench_best_us([&]() { zen::quant::gemm(*fmt, pk.data(), xx.data(), oo.data(), TT, rr, cc, 1.0f, 0); }, 2, reps) / 1000.0;
+                std::printf("shape rows=%zu cols=%zu T=%zu repack=%.3f ms raw_dispatch=%.3f ms (KBLK=%s)\n",
+                            rr, cc, TT, t_repack, t_raw, std::getenv("ZEN_CPU_Q8_KBLK") ? std::getenv("ZEN_CPU_Q8_KBLK") : "unset");
+            }
+        }
 #else
         (void)fmt;
 #endif

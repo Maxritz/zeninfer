@@ -217,6 +217,11 @@ if(ZEN_BUILD_D3D12)
       add_executable(zen_d3d12_addn_parity tools/d3d12_addn_parity.cpp)
       target_link_libraries(zen_d3d12_addn_parity PRIVATE zen_core)
 
+      # Prefill elementwise GPU path (RMSNorm rows x hidden, SiLU gate * up) vs the
+      # CPU scalar references. Fractional-lane shapes exercise the group guards.
+      add_executable(zen_d3d12_rms_silu_parity tools/d3d12_rms_silu_parity.cpp)
+      target_link_libraries(zen_d3d12_rms_silu_parity PRIVATE zen_core)
+
       # Task 5: the RoPE kernel was written but never wired, so nothing proved it ran
       # or that it matched the CPU rotation. This harness does both.
       add_executable(zen_d3d12_rope_parity tools/d3d12_rope_parity.cpp)
@@ -314,6 +319,12 @@ if(ZEN_BUILD_D3D12)
         add_test(NAME zen_d3d12_flash_parity COMMAND zen_d3d12_flash_parity)
         set_tests_properties(zen_d3d12_flash_parity PROPERTIES
           LABELS "d3d12;attention" TIMEOUT 180
+          ENVIRONMENT "ZEN_BACKEND=d3d12"
+          SKIP_RETURN_CODE 77)
+
+        add_test(NAME zen_d3d12_rms_silu_parity COMMAND zen_d3d12_rms_silu_parity)
+        set_tests_properties(zen_d3d12_rms_silu_parity PROPERTIES
+          LABELS "d3d12;elementwise" TIMEOUT 120
           ENVIRONMENT "ZEN_BACKEND=d3d12"
           SKIP_RETURN_CODE 77)
       endif()
@@ -426,6 +437,17 @@ if(ZEN_BUILD_BENCH)
   endif()
 endif()
 
+add_executable(zen_rms_bench tools/rms_bench.cpp)
+target_link_libraries(zen_rms_bench PRIVATE zen_core)
+if(ZEN_BUILD_AVX2)
+  target_link_libraries(zen_rms_bench PRIVATE zen_avx2)
+endif()
+if(MSVC)
+  target_compile_options(zen_rms_bench PRIVATE /O2 /W4 /permissive- /EHsc)
+else()
+  target_compile_options(zen_rms_bench PRIVATE -O3 -Wall -Wextra -Wpedantic)
+endif()
+
 add_executable(zen_q8_kblk_bench tools/q8_kblk_bench.cpp)
 target_link_libraries(zen_q8_kblk_bench PRIVATE zen_core)
 if(ZEN_BUILD_AVX2)
@@ -448,6 +470,17 @@ else()
   target_compile_options(zen_q8_shapes_bench PRIVATE -O3 -Wall -Wextra -Wpedantic)
 endif()
 
+add_executable(zen_nonq8_fast_bench tools/nonq8_fast_bench.cpp)
+target_link_libraries(zen_nonq8_fast_bench PRIVATE zen_core)
+if(ZEN_BUILD_AVX2)
+  target_link_libraries(zen_nonq8_fast_bench PRIVATE zen_avx2)
+endif()
+if(MSVC)
+  target_compile_options(zen_nonq8_fast_bench PRIVATE /O2 /W4 /permissive- /EHsc)
+else()
+  target_compile_options(zen_nonq8_fast_bench PRIVATE -O3 -Wall -Wextra -Wpedantic)
+endif()
+
 add_executable(zen_model_inspect tools/model_inspect.cpp)
 target_link_libraries(zen_model_inspect PRIVATE zen_core)
 add_executable(zen_mxfp4_probe tools/mxfp4_probe.cpp)
@@ -468,6 +501,8 @@ add_executable(zen_parity_export tools/parity_export.cpp)
 target_link_libraries(zen_parity_export PRIVATE zen_core)
 add_executable(zen_parity_probe tools/parity_probe.cpp)
 target_link_libraries(zen_parity_probe PRIVATE zen_model_adapters)
+add_executable(zen_decode_parity_dump tools/decode_parity_dump.cpp)
+target_link_libraries(zen_decode_parity_dump PRIVATE zen_model_adapters)
 
 # Deterministic architecture-kernel micro-models. These are not production GGUF runtimes.
 add_executable(zen_arch_microbench tools/architecture_microbench.cpp)

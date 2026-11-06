@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <chrono>
 #include <limits>
@@ -98,7 +99,20 @@ bool meta_bool_arch(const zen::model::ModelConfig& c,const std::string& arch,con
     if(i==c.metadata.end())return fallback;
     return i->second=="1"||i->second=="true"||i->second=="TRUE";
 }
+// RMSNorm AVX2 gate: ZEN_CPU_RMS_AVX2=0 forces the scalar loop below
+// (default on when AVX2/FMA is present). The AVX2 kernel is in
+// kernels/avx2.cpp; its double-precision ss reduction reorders the sum
+// vs this sequential scalar loop, so results can differ by ~1 ulp of
+// float -- see the note on rms_norm_avx2.
+inline bool rms_avx2_enabled() noexcept {
+    static const bool enabled=[](){const char* e=std::getenv("ZEN_CPU_RMS_AVX2");return !(e&&e[0]=='0');}();
+    return enabled;
+}
 void rms_norm(const float* x,const float* weight,float* y,std::size_t n,float eps){
+#ifdef ZEN_HAS_AVX2_KERNELS
+    static const bool avx2=zen::cpu_has_avx2_fma();
+    if(avx2&&rms_avx2_enabled()){zen::rms_norm_avx2(x,weight,y,n,eps);return;}
+#endif
     double ss=0.0;for(std::size_t i=0;i<n;++i)ss+=double(x[i])*x[i];
     const float inv=1.0f/std::sqrt(static_cast<float>(ss/n)+eps);
     for(std::size_t i=0;i<n;++i)y[i]=x[i]*inv*weight[i];
@@ -485,6 +499,37 @@ bool tensor_gemm(const DenseTransformerRuntime::Tensor& t,const float* input,flo
         double sum=0;for(std::size_t c=0;c<cols;++c)sum+=double(w[c])*input[token*cols+c];output[token*rows+r]=static_cast<float>(sum);
     }}return true;
 }
+// Batched prefill GEMM wrapper for the projections that share one input:
+// the Q|K|V projections and the gate|up projections of a transformer
+// prefill. Each group has its own tensor count and row widths but the same
+// input matrix and column count, so they can share one activation upload and
+// one fence wait. Single-submit path is gated by ZEN_D3D12_BATCH=1 inside
+// quant::gemm_batch (default off); with the gate unset this wrapper loops
+// over tensor_gemm(), which is exactly the old per-projection path, so
+// default behaviour is unchanged.
+bool tensor_gemm_batch(const DenseTransformerRuntime::Tensor* const* ts,const float* input,
+                       float* const* outputs,const std::size_t* rows,std::size_t count,
+                       std::size_t tokens,std::size_t cols){
+    if(!ts||!input||!outputs||!rows||!count||!tokens||!cols)return false;
+    if(tokens==1)return tensor_matvec_batch(ts,input,outputs,rows,count,cols);
+    bool all_quant=true;
+    for(std::size_t i=0;i<count;++i)if(!ts[i]||!ts[i]->raw||!ts[i]->format){all_quant=false;break;}
+    if(all_quant&&count<=8){
+        const planner::ExecutionPlanner planner;
+        const auto plan=planner.select(planner::Phase::prefill,true,tokens,rows[0],cols);
+        if(plan.kernel==planner::Kernel::quantized_gemm){
+            bool same_format=true;
+            const std::uint8_t* w[8];float* o[8];std::size_t r[8];
+            for(std::size_t i=0;i<count;++i){
+                w[i]=ts[i]->raw;o[i]=outputs[i];r[i]=rows[i];
+                if(ts[i]->format->encoding!=ts[0]->format->encoding)same_format=false;
+            }
+            if(same_format&&quant::gemm_batch(*ts[0]->format,w,input,o,r,tokens,cols,count,1.0f,plan.workers))return true;
+        }
+    }
+    for(std::size_t i=0;i<count;++i)if(!tensor_gemm(*ts[i],input,outputs[i],tokens,rows[i],cols))return false;
+    return true;
+}
 }
 const DenseTransformerRuntime::Tensor* DenseTransformerRuntime::tensor(const std::string& n)const noexcept{
     auto i=tensors_.find(n);return i==tensors_.end()?nullptr:&i->second;
@@ -823,6 +868,39 @@ bool DenseTransformerRuntime::load(const std::filesystem::path& path,std::string
         if(qnorm&&(qnorm->elements!=head_dim||knorm->elements!=head_dim||qnorm->values.size()!=head_dim||knorm->values.size()!=head_dim))
             return fail("Malformed Q/K normalisation tensors: "+p+" (head_dim="+std::to_string(head_dim)+" q_elements="+std::to_string(qnorm->elements)+" q_values="+std::to_string(qnorm->values.size())+")");
         if(qwen3_arch&&(!qnorm||!knorm))return fail("Qwen3 requires per-head Q/K RMS normalisation tensors: "+p);
+    }
+    // Sequential K-block repack at load (candidate (a)): when
+    // ZEN_CPU_Q8_REPACK_KBLK=1, transpose every Q8 GEMM weight that the
+    // K-blocked kernel would stream into the panel-major layout so the
+    // K-panel reads are sequential. Qwen3.5 fused tensors have a different
+    // row count per name, so they are not registered (they keep falling
+    // back to the raw K-blocked path when KBLK=1). The output head uses
+    // GEMV in decode and a single tail token in prefill, so its repack
+    // would pay hundreds of MB for one small GEMM: skipped.
+    // Repack without KBLK would never be consumed (the repacked kernel is
+    // the K-blocked kernel), so both gates must be on to build the buffers.
+    if(!qwen35_arch&&quant::q8_repack_enabled()&&quant::q8_kblk_enabled()){
+        auto register_repack=[&](const std::string& name,std::size_t rows,std::size_t cols){
+            const auto* t=tensor(name);
+            if(!t||!t->raw||!t->format||t->format->encoding!=zen::quant::Encoding::q8_0)return;
+            if(!rows||!cols||cols%32)return;
+            if(t->elements!=rows*cols){std::fprintf(stderr,"[repack] skip %s: elements=%zu rows*cols=%zu\n",name.c_str(),t->elements,rows*cols);return;}
+            auto packed=quant::repack_q8_0_kblk(t->raw,rows,cols);
+            if(packed.empty()){std::fprintf(stderr,"[repack] skip %s: repack failed\n",name.c_str());return;}
+            std::fprintf(stderr,"[repack] %-38s rows=%zu cols=%zu repack_bytes=%zu raw_bytes=%zu\n",name.c_str(),rows,cols,packed.size(),t->raw_bytes);
+            quant::register_q8_repack(t->raw,rows,cols,std::move(packed));
+        };
+        const std::size_t QW=std::size_t(config_.heads)*head_dim, KW=std::size_t(config_.kv_heads)*head_dim;
+        for(std::uint32_t l=0;l<config_.layers;++l){
+            const std::string p="blk."+std::to_string(l)+".";
+            register_repack(p+"attn_q.weight",QW,config_.embedding);
+            register_repack(p+"attn_k.weight",KW,config_.embedding);
+            register_repack(p+"attn_v.weight",KW,config_.embedding);
+            register_repack(p+"attn_output.weight",QW,config_.embedding);
+            register_repack(p+"ffn_gate.weight",config_.ffn,config_.embedding);
+            register_repack(p+"ffn_up.weight",config_.ffn,config_.embedding);
+            register_repack(p+"ffn_down.weight",config_.embedding,config_.ffn);
+        }
     }
     loaded_=true;if(error)error->clear();
     return true;
@@ -1200,12 +1278,32 @@ bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& to
     static const bool rope_prefill_gpu_on = []{const char* e=std::getenv("ZEN_D3D12_ROPE_PREFILL");return e&&e[0]=='1';}();
     static const bool rope_cpu_disallowed = []{const char* e=std::getenv("ZEN_CPU_ROPE");return e&&e[0]=='0';}();
     static const std::size_t rope_prefill_min_t = []{const char* e=std::getenv("ZEN_D3D12_ROPE_PREFILL_MIN_T");if(e){int v=std::atoi(e);if(v>=1)return static_cast<std::size_t>(v);}return std::size_t(4);}();
+    // Prefill elementwise on the GPU (RMSNorm, SiLU, residuals, device-resident
+    // FFN). Default OFF: the CPU path below is unchanged when unset.
+    //   ZEN_D3D12_PREFILL_GPU=1   opt in: attn/output RMSNorm via
+    //                             zen::d3d12::rms_norm, the whole FFN half
+    //                             (attn_output GEMM, both residuals, FFN norm,
+    //                             gate|up, SiLU, down) via the device-resident
+    //                             zen::d3d12::ffn_prefill_fused in ONE submit
+    //                             per layer instead of 4 GEMM submits plus a
+    //                             CPU SiLU and two CPU adds.
+    // T<16 stays on the host path: speculative verify batches (T=4..8) and
+    // short prompts keep the bit-identical single-GEMM route, and the fused
+    // working buffers only amortise over multi-token prefills.
+    // Any GPU failure (backend absent, non-Q8 weights, BitNet subln, shape
+    // guards) falls back to the host path below per layer, never fails.
+    static const bool prefill_gpu_on = []{const char* e=std::getenv("ZEN_D3D12_PREFILL_GPU");return e&&e[0]=='1';}();
+    const bool use_prefill_gpu = prefill_gpu_on&&T>=16;
     std::vector<float> prefill_cos,prefill_sin;
     std::size_t prefill_pairs=0;
     bool prefill_tables_built=false;
     std::future<void> prefetch;
     for(std::uint32_t l=0;l<config_.layers;++l){if(prefetch.valid())prefetch.get();if(l+1<config_.layers&&prefetch_enabled_)prefetch=std::async(std::launch::async,[this,l]{prefetch_layer(l+1);});const std::string p="blk."+std::to_string(l)+".";
-        for(std::size_t t=0;t<T;++t)rms_norm(x.data()+t*E,tensor(p+"attn_norm.weight")->values.data(),norm.data()+t*E,E,config_.rms_epsilon);
+        bool attn_norm_gpu=false;
+#if defined(ZEN_HAS_D3D12)
+        if(use_prefill_gpu)attn_norm_gpu=zen::d3d12::rms_norm(x.data(),tensor(p+"attn_norm.weight")->values.data(),norm.data(),T,E,config_.rms_epsilon);
+#endif
+        if(!attn_norm_gpu)for(std::size_t t=0;t<T;++t)rms_norm(x.data()+t*E,tensor(p+"attn_norm.weight")->values.data(),norm.data()+t*E,E,config_.rms_epsilon);
         if(!finite_values(norm.data(),norm.size()))return false;
         if(T==1){
             // Decode: Q, K and V share the normed input, so submitting them as one
@@ -1214,9 +1312,16 @@ bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& to
             float* const qkv_y[3]={q.data(),k.data(),v.data()};
             const std::size_t qkv_r[3]={QW,KW,KW};
             if(!tensor_matvec_batch(qkv_t,norm.data(),qkv_y,qkv_r,3,E))return false;
-        }else if(!tensor_gemm(*tensor(p+"attn_q.weight"),norm.data(),q.data(),T,QW,E)||
-           !tensor_gemm(*tensor(p+"attn_k.weight"),norm.data(),k.data(),T,KW,E)||
-           !tensor_gemm(*tensor(p+"attn_v.weight"),norm.data(),v.data(),T,KW,E))return false;
+        }else{
+            // Prefill Q|K|V share the normed input: submit as one batched GEMM
+            // when ZEN_D3D12_BATCH=1, otherwise tensor_gemm_batch loops the
+            // single path. Attn O and FFN down stay separate (attention / SiLU
+            // in between).
+            const DenseTransformerRuntime::Tensor* const qkv_t[3]={tensor(p+"attn_q.weight"),tensor(p+"attn_k.weight"),tensor(p+"attn_v.weight")};
+            float* const qkv_y[3]={q.data(),k.data(),v.data()};
+            const std::size_t qkv_r[3]={QW,KW,KW};
+            if(!tensor_gemm_batch(qkv_t,norm.data(),qkv_y,qkv_r,3,T,E))return false;
+        }
         if(!finite_values(q.data(),q.size())||!finite_values(k.data(),k.size())||!finite_values(v.data(),v.size()))return false;
         for(const auto& item:std::array<std::pair<const char*,std::vector<float>*>,3>{{{"attn_q.bias",&q},{"attn_k.bias",&k},{"attn_v.bias",&v}}})if(const auto*bias=tensor(p+item.first)){const std::size_t width=item.first[5]=='q'?QW:KW;if(bias->values.size()!=width)return false;for(std::size_t t=0;t<T;++t)for(std::size_t i=0;i<width;++i)(*item.second)[t*width+i]+=bias->values[i];}
         const auto* qnorm=tensor(p+"attn_q_norm.weight");const auto* knorm=tensor(p+"attn_k_norm.weight");
@@ -1372,13 +1477,96 @@ bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& to
         if (!flash_ok) {
             {zen::diag::Scope scope_attn("transformer.prefill.attention",zen::diag::Phase::compute);
         std::fill(att.begin(),att.end(),0.0f);const std::uint32_t group=H/KH;const float inv_scale=1.0f/std::sqrt(float(D));
+        std::atomic<bool> attn_ok{true};
+        zen::ResourceGovernor attn_gov;
+        const unsigned attn_workers=attn_gov.current_policy().worker_threads;
+        // Tiled CPU attention (llama path only; Q35 stays scalar). Env gate
+        // ZEN_CPU_ATTN_TILED=1, default off. Query-block tiling with online
+        // softmax: (block,head) tasks stream KV tiles once across the query
+        // block (K/V row loaded once per (tile,j), reused for QB queries from
+        // L1/L2), instead of the baseline which rescans all KV per query and
+        // buffers a scores[context] row in three passes. KV layout unchanged
+        // (kc[l]+j*KW). Causal + sliding-window + ALiBi mask identically:
+        // for each j the valid query range is [j-start-q0, +sw-1] clamped,
+        // scores for valid pairs only, same finite checks, double denom,
+        // float exp/scores/intermediate as baseline (online rescale differs
+        // only in summation order, well within tolerance).
+        // QB/KB default 32/32 (env ZEN_CPU_ATTN_QB/KB override, 1..128).
+        static const bool attn_tiled=[](){const char*e=std::getenv("ZEN_CPU_ATTN_TILED");return e&&e[0]=='1';}();
+        static const std::size_t attn_qb=[](){const char*e=std::getenv("ZEN_CPU_ATTN_QB");if(e){int v=std::atoi(e);if(v>=1&&v<=128)return static_cast<std::size_t>(v);}return std::size_t(32);}();
+        static const std::size_t attn_kb=[](){const char*e=std::getenv("ZEN_CPU_ATTN_KB");if(e){int v=std::atoi(e);if(v>=1&&v<=128)return static_cast<std::size_t>(v);}return std::size_t(32);}();
+        const std::size_t QB=attn_qb,KB=attn_kb;
+        if(attn_tiled){
+            const std::size_t num_blocks=(T+QB-1)/QB;
+            const std::size_t tiled_tasks=num_blocks*static_cast<std::size_t>(H);
+            auto tiled_block=[&](std::size_t block,std::uint32_t h,std::vector<float>& m,std::vector<double>& denom,std::vector<float>& acc,std::vector<std::size_t>& firsts){
+                const std::size_t q0=block*QB,qn=std::min(QB,T-q0);
+                const std::uint32_t kh=h/group;
+                const std::uint32_t pos0=start_pos+static_cast<std::uint32_t>(q0);
+                const std::size_t first_min=config_.sliding_window&&pos0+1>config_.sliding_window?pos0+1-config_.sliding_window:0;
+                const std::size_t pos_max=static_cast<std::size_t>(start_pos+static_cast<std::uint32_t>(q0+qn-1));
+                for(std::size_t qi=0;qi<qn;++qi){const std::uint32_t pos=start_pos+static_cast<std::uint32_t>(q0+qi);firsts[qi]=config_.sliding_window&&pos+1>config_.sliding_window?pos+1-config_.sliding_window:0;m[qi]=-std::numeric_limits<float>::infinity();denom[qi]=0.0;}
+                std::fill(acc.begin(),acc.begin()+qn*D,0.0f);
+                for(std::size_t j0=first_min;j0<=pos_max&&attn_ok.load(std::memory_order_relaxed);){
+                    const std::size_t j1=std::min(j0+KB,pos_max+1);
+                    for(std::size_t j=j0;j<j1;++j){
+                        const std::int64_t low=(std::int64_t)j-(std::int64_t)start_pos-(std::int64_t)q0;
+                        std::size_t qi_lo=low<0?0:(std::size_t)low;if(qi_lo>=qn)continue;
+                        std::size_t qi_hi=qn-1;
+                        if(config_.sliding_window){const std::int64_t high=(std::int64_t)j+(std::int64_t)config_.sliding_window-1-(std::int64_t)start_pos-(std::int64_t)q0;if(high<(std::int64_t)qi_lo)continue;if(high<(std::int64_t)qi_hi)qi_hi=(std::size_t)high;}
+                        if(qi_lo>qi_hi)continue;
+                        const float*kt=kc[l].data()+j*KW+std::size_t(kh)*D;
+                        const float*vt=vc[l].data()+j*KW+std::size_t(kh)*D;
+                        for(std::size_t qi=qi_lo;qi<=qi_hi;++qi){
+                            const std::uint32_t pos=start_pos+static_cast<std::uint32_t>(q0+qi);
+                            if(j>pos||j<firsts[qi])continue;
+                            const float*qh=q.data()+(q0+qi)*QW+std::size_t(h)*D;
+                            float s=dot_f32(qh,kt,D)*inv_scale;
+                            if(config_.use_alibi)s+=zen::attention::alibi_bias(h,H,pos,static_cast<std::uint32_t>(j));
+                            if(!std::isfinite(s)){attn_ok.store(false,std::memory_order_relaxed);return;}
+                            float& mq=m[qi];double& lq=denom[qi];float* aq=acc.data()+qi*D;
+                            if(s>mq){
+                                if(mq!=-std::numeric_limits<float>::infinity()){
+                                    const float scale=std::exp(mq-s);
+                                    for(std::size_t i=0;i<D;++i)aq[i]*=scale;
+                                    lq*=(double)scale;
+                                }
+                                mq=s;lq+=1.0;
+                                axpy_f32(1.0f,vt,aq,D);
+                            }else{
+                                const float w=std::exp(s-mq);
+                                lq+=(double)w;
+                                axpy_f32(w,vt,aq,D);
+                            }
+                        }
+                    }
+                    j0+=KB;
+                }
+                for(std::size_t qi=0;qi<qn;++qi){
+                    const double lq=denom[qi];
+                    if(!(lq>0.0)||!std::isfinite(lq)){attn_ok.store(false,std::memory_order_relaxed);return;}
+                    const float inv=1.0f/static_cast<float>(lq);
+                    float*out=att.data()+(q0+qi)*QW+std::size_t(h)*D;
+                    const float* aq=acc.data()+qi*D;
+                    for(std::size_t i=0;i<D;++i)out[i]=aq[i]*inv;
+                }
+            };
+            if(attn_workers>1&&tiled_tasks>1){
+                zen::ComputePool::instance().parallel_for(tiled_tasks,attn_workers,[&](std::size_t begin,std::size_t end){
+                    std::vector<float> m(QB),acc(QB*D);std::vector<double> denom(QB);std::vector<std::size_t> firsts(QB);
+                    for(std::size_t idx=begin;idx<end&&attn_ok.load(std::memory_order_relaxed);++idx)
+                        tiled_block(idx/static_cast<std::size_t>(H),static_cast<std::uint32_t>(idx%static_cast<std::size_t>(H)),m,denom,acc,firsts);
+                });
+            }else{
+                std::vector<float> m(QB),acc(QB*D);std::vector<double> denom(QB);std::vector<std::size_t> firsts(QB);
+                for(std::size_t block=0;block<num_blocks&&attn_ok.load(std::memory_order_relaxed);++block)
+                    for(std::uint32_t h=0;h<H;++h)tiled_block(block,h,m,denom,acc,firsts);
+            }
+        }else{
         // ZI-P6: every (token, head) score row is independent, so the causal
         // attention of a prefill batch runs across the pool instead of on one
         // thread. This was the last serial O(T^2) block in the batch path.
         const std::size_t attn_tasks=T*static_cast<std::size_t>(H);
-        std::atomic<bool> attn_ok{true};
-        zen::ResourceGovernor attn_gov;
-        const unsigned attn_workers=attn_gov.current_policy().worker_threads;
         auto attn_row=[&](std::size_t t,std::uint32_t h,std::vector<float>& scores){
             const std::uint32_t kh=h/group;const float*qh=q.data()+t*QW+std::size_t(h)*D;
             float max_score=-std::numeric_limits<float>::infinity();
@@ -1412,9 +1600,31 @@ bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& to
             for(std::size_t t=0;t<T&&attn_ok.load(std::memory_order_relaxed);++t)
                 for(std::uint32_t h=0;h<H;++h)attn_row(t,h,scores);
         }
+        }
         if(!attn_ok.load())return false;
         }
         }
+        // FFN half: the whole block (attn_output GEMM, residual, FFN norm,
+        // gate|up GEMMs, SiLU, down GEMM, residual) in one device-resident
+        // submission when the prefill GPU gate is on; otherwise the separate
+        // host ops below. BitNet subln skips the fused path (its norms are
+        // CPU), as do non-quantised or differently-shaped weights.
+        bool ffn_gpu=false;
+        if(use_prefill_gpu&&!config_.bitnet_variant){
+            const auto* lo=tensor(p+"attn_output.weight");const auto* lg=tensor(p+"ffn_gate.weight");
+            const auto* lu=tensor(p+"ffn_up.weight");const auto* ldw=tensor(p+"ffn_down.weight");
+            const auto* lfn=tensor(p+"ffn_norm.weight");
+            if(lo&&lg&&lu&&ldw&&lfn&&lo->raw&&lg->raw&&lu->raw&&ldw->raw&&
+               tensor(p+"attn_q.bias")==nullptr&&tensor(p+"attn_k.bias")==nullptr&&tensor(p+"attn_v.bias")==nullptr){
+#if defined(ZEN_HAS_D3D12)
+                ffn_gpu=zen::d3d12::ffn_prefill_fused(lo->raw,lg->raw,lu->raw,ldw->raw,
+                    lfn->values.data(),x.data(),att.data(),x.data(),T,E,QW,F,config_.rms_epsilon);
+#endif
+            }
+        }
+        if(ffn_gpu){
+            if(!finite_values(x.data(),x.size()))return false;
+        }else{
         // BitNet subln: RMS-normalise each token's attention output before
         // the wo projection.
         if(config_.bitnet_variant)for(std::size_t t=0;t<T;++t)rms_norm(att.data()+t*QW,tensor(p+"attn_sub_norm.weight")->values.data(),att.data()+t*QW,QW,config_.rms_epsilon);
@@ -1427,7 +1637,15 @@ bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& to
             float* const fu_y[2]={gate.data(),up.data()};
             const std::size_t fu_r[2]={F,F};
             if(!tensor_matvec_batch(fu_t,norm.data(),fu_y,fu_r,2,E))return false;
-        }else if(!tensor_gemm(*tensor(p+"ffn_gate.weight"),norm.data(),gate.data(),T,F,E)||!tensor_gemm(*tensor(p+"ffn_up.weight"),norm.data(),up.data(),T,F,E))return false;
+        }else{
+            // Prefill gate|up share the normed input: one batched GEMM when
+            // ZEN_D3D12_BATCH=1, otherwise the single path. FFN down stays
+            // separate (SiLU in between).
+            const DenseTransformerRuntime::Tensor* const fu_t[2]={tensor(p+"ffn_gate.weight"),tensor(p+"ffn_up.weight")};
+            float* const fu_y[2]={gate.data(),up.data()};
+            const std::size_t fu_r[2]={F,F};
+            if(!tensor_gemm_batch(fu_t,norm.data(),fu_y,fu_r,2,T,E))return false;
+        }
         {zen::diag::Scope scope_silu("transformer.prefill.silu",zen::diag::Phase::compute);
         silu_mul(gate.data(),up.data(),ffn.data(),T*F);}
         // BitNet subln: RMS-normalise the FFN hidden activation before ffn_down.
@@ -1435,10 +1653,17 @@ bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& to
         if(!tensor_gemm(*tensor(p+"ffn_down.weight"),ffn.data(),tmp.data(),T,E,F))return false;
         for(std::size_t i=0;i<T*E;++i)x[i]+=tmp[i];
         if(!finite_values(x.data(),x.size()))return false;
+        }
     }
     const auto* norm_weight=tensor("output_norm.weight");if(!norm_weight||norm_weight->values.size()!=E)return false;
     const std::size_t first_tail=T-tail_count;std::vector<float> norm_tail(tail_count*E),logits_tail(tail_count*config_.vocab);
-    for(std::size_t t=0;t<tail_count;++t)rms_norm(x.data()+(first_tail+t)*E,norm_weight->values.data(),norm_tail.data()+t*E,E,config_.rms_epsilon);
+    // Output-norm tail on the GPU when the prefill gate is on (one dispatch,
+    // fallback to the CPU loop when the call declines).
+    bool out_norm_gpu=false;
+#if defined(ZEN_HAS_D3D12)
+    if(use_prefill_gpu)out_norm_gpu=zen::d3d12::rms_norm(x.data()+(first_tail)*E,norm_weight->values.data(),norm_tail.data(),tail_count,E,config_.rms_epsilon);
+#endif
+    if(!out_norm_gpu)for(std::size_t t=0;t<tail_count;++t)rms_norm(x.data()+(first_tail+t)*E,norm_weight->values.data(),norm_tail.data()+t*E,E,config_.rms_epsilon);
     if(!finite_values(norm_tail.data(),norm_tail.size()))return false;
     const auto* output=tensor("output.weight");if(!output)output=emb;
     if(!tensor_gemm(*output,norm_tail.data(),logits_tail.data(),tail_count,config_.vocab,E))return false;
@@ -1528,17 +1753,17 @@ bool DenseTransformerRuntime::forward(std::uint32_t token,std::uint32_t pos,
     }
 
     // If all layers qualify, run the entire model through the GPU pipeline
-    //
-    // Gated off by default. This path records its resource transitions into the
-    // wrong command list (they land on the closed s.list instead of the per-layer
-    // list that is actually submitted) and it assumes the scratch buffers start
-    // in states that the preceding LM-head GEMM does not leave them in. The
-    // result is that its output depends on leftover resource state, which makes
-    // two identically seeded generations diverge. Opt in to measure it; the
-    // per-layer path below is the correct one.
+    // (single submit+wait for all layers). Default ON: the backend records every
+    // layer into the OWNING list (s.list, the one submitted) with a per-layer
+    // hin staging buffer, and every arena is returned to its entry state
+    // (ybuf/fbuf/hbuf UAV, datt COMMON, caches UAV, hin NSR) so the next layer
+    // and the next token start from known states. Seeded determinism verified
+    // (same seed twice -> identical ids + logits max_abs < 2e-6, rel < 1e-6) and
+    // pipeline-vs-per-layer parity holds on the oracle prompt. Kill switch:
+    // ZEN_D3D12_PIPELINE=0 restores the per-layer path.
     static const bool pipeline_enabled = [] {
         const char* e = std::getenv("ZEN_D3D12_PIPELINE");
-        return e && e[0] == '1';
+        return !(e && e[0] == '0');
     }();
     double setup_us = 0.0, pipeline_us = 0.0;
     // Fused LM head plumbing: the pipeline may record final-rmsnorm + vocab GEMV +

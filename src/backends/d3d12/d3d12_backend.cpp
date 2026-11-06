@@ -2611,8 +2611,24 @@ bool gemm_q8_0_batch(const float* x, const GemmTask* tasks, std::size_t count,
     if (columns % kElemsPerBlock != 0) {
         return false;
     }
+    // Mirror the single-gemm entry gates so the batch path cannot bypass a
+    // size, experimental, or DP4A decision the single path honours. The batch
+    // kernel is the fp32 variant only: with DP4A on, the single path would run
+    // int8-activation math and the batch would silently differ.
+    if (!gemm_opted_in()) {
+        return false;
+    }
+    if (dp4a_enabled()) {
+        return false;
+    }
+    if (tokens == 0) {
+        return false;
+    }
     for (std::size_t i = 0; i < count; ++i) {
         if (!tasks[i].weights || !tasks[i].y || !tasks[i].rows) {
+            return false;
+        }
+        if (tokens * tasks[i].rows * columns < kMinElements) {
             return false;
         }
     }
@@ -6392,6 +6408,424 @@ bool residual_add(const float* a, const float* b, float* out, std::size_t count)
         return false;
     }
     if (!addn_locked(s, a, b, out, count)) {
+        ++s.stats.fallbacks;
+        return false;
+    }
+    return true;
+}
+
+// SiLU(gate)*up for prefill, host in / host out (mirrors rms_norm_locked /
+// addn_locked). One submit. The prefill hot path fuses this into
+// ffn_prefill_fused instead of paying a submit for it; this entry exists so
+// the SiLU kernel has a standalone parity surface and a fallback when the
+// fused path declines.
+bool silu_mul_locked(State& s, const float* gate, const float* up, float* out,
+                     std::size_t count) {
+    if (!count || count > 0xFFFFFFFFu) {
+        return false;
+    }
+    const std::size_t bytes = count * sizeof(float);
+    if (!reserve_scratch(s, bytes, bytes)) {
+        return false;
+    }
+    std::memcpy(s.x_cpu, gate, bytes);
+
+    if (!ensure_upload(s.wbuf, s.w_cpu, s.w_cap, s.device.Get(), bytes)) {
+        return false;
+    }
+    std::memcpy(s.w_cpu, up, bytes);
+
+    // Slot 3072 is clear of the batch range (512..2560), the addn slots
+    // (768, 2560/2816), rope (1024/1536), attention (1280) and the pipeline
+    // range (4096+), so no in-flight shape aliases this submission's params.
+    constexpr std::uint64_t kSiluParamOffset = 3072;
+    auto* params =
+        reinterpret_cast<SiluParams*>(static_cast<std::uint8_t*>(s.params_cpu) + kSiluParamOffset);
+    params->count = static_cast<std::uint32_t>(count);
+    params->pad0 = params->pad1 = params->pad2 = 0;
+
+    const UINT groups = static_cast<UINT>((count + 255) / 256);
+
+    s.current_comp = Comp::Residual;
+    s.allocator->Reset();
+    s.list->Reset(s.allocator.Get(), s.pso_silu.Get());
+    s.list->SetComputeRootSignature(s.root.Get());
+    s.list->SetComputeRootConstantBufferView(0, s.params->GetGPUVirtualAddress() + kSiluParamOffset);
+    s.list->SetComputeRootShaderResourceView(1, s.xbuf->GetGPUVirtualAddress());
+    s.list->SetComputeRootShaderResourceView(2, s.wbuf->GetGPUVirtualAddress());
+    s.list->SetComputeRootUnorderedAccessView(5, s.ybuf->GetGPUVirtualAddress());
+    s.list->Dispatch(groups, 1, 1);
+
+    transition(s, s.ybuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               D3D12_RESOURCE_STATE_COPY_SOURCE);
+    s.list->CopyBufferRegion(s.yread.Get(), 0, s.ybuf.Get(), 0, bytes);
+    transition(s, s.ybuf.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    s.list->Close();
+
+    if (!execute_and_wait(s)) {
+        return false;
+    }
+
+    void* mapped = nullptr;
+    const D3D12_RANGE read_range{0, bytes};
+    if (FAILED(s.yread->Map(0, &read_range, &mapped))) {
+        return false;
+    }
+    std::memcpy(out, mapped, bytes);
+    const D3D12_RANGE written{0, 0};
+    s.yread->Unmap(0, &written);
+    ++s.stats.dispatches;
+    return true;
+}
+
+bool silu_mul(const float* gate, const float* up, float* out, std::size_t count) noexcept {
+    if (!gate || !up || !out || !count) {
+        return false;
+    }
+    State& s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (!init_locked(s)) {
+        return false;
+    }
+    if (!silu_mul_locked(s, gate, up, out, count)) {
+        ++s.stats.fallbacks;
+        return false;
+    }
+    return true;
+}
+
+// Prefill GEMM variant of ffn_residual_fused_locked: eight dispatches
+// (attn_out GEMM, residual add, RMS, gate GEMM, up GEMM, SiLU, down GEMM,
+// residual add) in one command list, so gate/up/the SiLU result stay in VRAM
+// between the gate/up GEMMs and the down GEMM. Two buffers (ybuf = A,
+// fbuf = B) alternate reader/writer roles so no dispatch both reads and
+// writes the same resource; every swap is an explicit full-resource
+// transition, same pattern as the decode fused path.
+bool ffn_prefill_fused_locked(State& s, const std::uint8_t* attn_out_w, const std::uint8_t* gate_w,
+                               const std::uint8_t* up_w, const std::uint8_t* down_w,
+                               const float* norm_weight, const float* x, const float* attn_out,
+                               float* out, std::size_t tokens, std::size_t hidden,
+                               std::size_t attn_width, std::size_t ffn_rows, float epsilon) {
+    // The fused path is fp32-only: with DP4A on the single-GEMM path runs
+    // int8-activation math while the fused input never passes through the
+    // host quantizer. Mirror the single-gemm gate (gemm_opted_in) so
+    // ZEN_D3D12_GEMM_EXPERIMENTAL=0 still disables every GPU GEMM.
+    if (dp4a_enabled() || !gemm_opted_in()) {
+        return false;
+    }
+    if (!tokens || !hidden || !attn_width || !ffn_rows) {
+        return false;
+    }
+    if (hidden % kElemsPerBlock || attn_width % kElemsPerBlock || ffn_rows % kElemsPerBlock) {
+        return false;
+    }
+    // 32-bit count fields (RMS rows/count, addn count, SiLU count) and the
+    // persistent scratch bound the token range; larger prefills stay on the
+    // host path instead of growing hundreds of MB of scratch.
+    if (tokens > 8192 || hidden > 0xFFFFFFFFu || attn_width > 0xFFFFFFFFu ||
+        ffn_rows > 0xFFFFFFFFu) {
+        return false;
+    }
+    const std::uint64_t th = static_cast<std::uint64_t>(tokens) * hidden;
+    const std::uint64_t tf = static_cast<std::uint64_t>(tokens) * ffn_rows;
+    if (th > 0xFFFFFFFFu || tf > 0xFFFFFFFFu) {
+        return false;
+    }
+    // Same minimum-work gate the single GEMM honours, applied per projection.
+    if (tokens * hidden * attn_width < kMinElements ||
+        tokens * ffn_rows * hidden < kMinElements ||
+        tokens * hidden * ffn_rows < kMinElements) {
+        return false;
+    }
+
+    // Resolve every tensor first so a residency eviction cannot invalidate a
+    // buffer that an already-recorded dispatch is still reading.
+    ComPtr<ID3D12Resource> ao_q, g_q, u_q, d_q;
+    std::uint64_t ao_s = 0, g_s = 0, u_s = 0, d_s = 0;
+    if (WeightEntry* e = lookup_weights(s, attn_out_w, hidden, attn_width)) {
+        ao_q = e->quants;
+        ao_s = e->scales_va;
+    } else {
+        return false;
+    }
+    if (WeightEntry* e = lookup_weights(s, gate_w, ffn_rows, hidden)) {
+        g_q = e->quants;
+        g_s = e->scales_va;
+    } else {
+        return false;
+    }
+    if (WeightEntry* e = lookup_weights(s, up_w, ffn_rows, hidden)) {
+        u_q = e->quants;
+        u_s = e->scales_va;
+    } else {
+        return false;
+    }
+    if (WeightEntry* e = lookup_weights(s, down_w, hidden, ffn_rows)) {
+        d_q = e->quants;
+        d_s = e->scales_va;
+    } else {
+        return false;
+    }
+
+    constexpr std::uint64_t kAlign = 256u;
+    auto span = [](std::uint64_t bytes) { return (bytes + kAlign - 1) & ~(kAlign - 1); };
+    const std::uint64_t hidden_span = span(th * sizeof(float));
+    const std::uint64_t ffn_span = span(tf * sizeof(float));
+
+    // A (ybuf): attn projection, normed activation, SiLU result, final output.
+    const std::uint64_t a_t0 = 0;
+    const std::uint64_t a_h2 = hidden_span;
+    const std::uint64_t a_f = a_h2 + hidden_span;
+    const std::uint64_t a_fin = a_f + ffn_span;
+    const std::uint64_t a_total = a_fin + hidden_span;
+
+    // B (fbuf): residual base, gate, up, down projection.
+    const std::uint64_t b_h1 = 0;
+    const std::uint64_t b_g = hidden_span;
+    const std::uint64_t b_u = b_g + ffn_span;
+    const std::uint64_t b_d = b_u + ffn_span;
+    const std::uint64_t b_total = b_d + hidden_span;
+
+    constexpr std::uint64_t kCap = 256ull * 1024 * 1024;
+    if (a_total > kCap || b_total > kCap) {
+        return false;
+    }
+
+    if (!reserve_scratch(s, tokens * attn_width * sizeof(float),
+                         static_cast<std::size_t>(a_total))) {
+        return false;
+    }
+    if (!s.fbuf || b_total > s.f_cap) {
+        s.fbuf.Reset();
+        s.fbuf = create_buffer(s.device.Get(), static_cast<std::size_t>(b_total),
+                               D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                               D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        if (!s.fbuf) {
+            s.f_cap = 0;
+            return false;
+        }
+        s.f_cap = static_cast<std::size_t>(b_total);
+    }
+
+    const std::size_t x_bytes = tokens * hidden * sizeof(float);
+    if (!ensure_upload(s.wbuf, s.w_cpu, s.w_cap, s.device.Get(), x_bytes) ||
+        !ensure_upload(s.nbuf, s.n_cpu, s.n_cap, s.device.Get(), hidden * sizeof(float))) {
+        return false;
+    }
+    std::memcpy(s.x_cpu, attn_out, tokens * attn_width * sizeof(float));
+    std::memcpy(s.w_cpu, x, x_bytes);
+    std::memcpy(s.n_cpu, norm_weight, hidden * sizeof(float));
+
+    // Distinct 256B param slots per dispatch (upload-heap CBVs are read at
+    // execution, so a shared slot would make every dispatch use the last
+    // written values): GEMMs 1024+256*i, RMS 256 (single-rms slot), SiLU
+    // 3072, adds 2560/2816. No rope/attention dispatch shares this list, so
+    // the gemm-batch slot convention is safe here.
+    constexpr std::uint64_t kGemmBase = 1024;
+    constexpr std::uint64_t kRmsSlot = 256;
+    constexpr std::uint64_t kSiluSlot = 3072;
+    constexpr std::uint64_t kAddn0 = 2560;
+    constexpr std::uint64_t kAddn1 = 2816;
+    auto* base = static_cast<std::uint8_t*>(s.params_cpu);
+    // Tiling mirrors gemm_batch_locked (v3 > v2 > v1, all bit-identical fp32).
+    const bool use_v3 = gemm_v3_enabled() && s.pso_gemm_v3 != nullptr;
+    const bool use_v2 = !use_v3 && gemm_v2_enabled() && s.pso_gemm_v2 != nullptr;
+    const std::uint32_t tile = use_v3 ? kTokensPerTileV3
+                                      : (use_v2 ? kTokensPerTileV2 : kTokensPerTile);
+    const std::uint32_t rpg = use_v3 ? kGemmRowsPerGroupV3
+                                     : (use_v2 ? kGemmRowsPerGroupV2 : kGemmRowsPerGroup);
+    ID3D12PipelineState* gemm_pso = use_v3 ? s.pso_gemm_v3.Get()
+                                           : (use_v2 ? s.pso_gemm_v2.Get() : s.pso_gemm.Get());
+    auto fill_gemm = [&](std::uint64_t slot, std::size_t rows, std::size_t cols) {
+        auto* params = reinterpret_cast<GemmParams*>(base + slot);
+        params->rows = static_cast<std::uint32_t>(rows);
+        params->blocks_per_row = static_cast<std::uint32_t>(cols / kElemsPerBlock);
+        params->token_count = static_cast<std::uint32_t>(tokens);
+        params->tokens_per_tile = tile;
+    };
+    fill_gemm(kGemmBase, hidden, attn_width);
+    fill_gemm(kGemmBase + 256, ffn_rows, hidden);
+    fill_gemm(kGemmBase + 512, ffn_rows, hidden);
+    fill_gemm(kGemmBase + 768, hidden, ffn_rows);
+    auto write_addn = [&](std::uint64_t slot, std::uint64_t count) {
+        auto* params = reinterpret_cast<AddnParams*>(base + slot);
+        params->count = static_cast<std::uint32_t>(count);
+        params->pad0 = params->pad1 = params->pad2 = 0;
+    };
+    write_addn(kAddn0, th);
+    write_addn(kAddn1, th);
+    auto* rms = reinterpret_cast<RmsParams*>(base + kRmsSlot);
+    rms->count = static_cast<std::uint32_t>(hidden);
+    rms->rows = static_cast<std::uint32_t>(tokens);
+    rms->epsilon = epsilon;
+    rms->pad = 0;
+    auto* silu = reinterpret_cast<SiluParams*>(base + kSiluSlot);
+    silu->count = static_cast<std::uint32_t>(tf);
+    silu->pad0 = silu->pad1 = silu->pad2 = 0;
+
+    const std::uint64_t params_base = s.params->GetGPUVirtualAddress();
+    const std::uint64_t a_base = s.ybuf->GetGPUVirtualAddress();
+    const std::uint64_t b_base = s.fbuf->GetGPUVirtualAddress();
+
+    const UINT attn_groups = static_cast<UINT>((hidden + rpg - 1) / rpg);
+    const UINT ffn_groups = static_cast<UINT>((ffn_rows + rpg - 1) / rpg);
+    const UINT down_groups = static_cast<UINT>((hidden + rpg - 1) / rpg);
+    const UINT addn_groups = static_cast<UINT>((th + 255u) / 256u);
+    const UINT silu_groups = static_cast<UINT>((tf + 255u) / 256u);
+
+    s.allocator->Reset();
+    s.list->Reset(s.allocator.Get(), gemm_pso);
+    s.list->SetComputeRootSignature(s.root.Get());
+    if (s.trace) {
+        s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+    }
+
+    // 1. attn_output GEMM: A.t0 = W_attn @ att  (input staged on xbuf).
+    s.list->SetComputeRootConstantBufferView(0, params_base + kGemmBase);
+    s.list->SetComputeRootShaderResourceView(1, ao_q->GetGPUVirtualAddress());
+    s.list->SetComputeRootShaderResourceView(2, ao_s);
+    s.list->SetComputeRootShaderResourceView(3, s.xbuf->GetGPUVirtualAddress());
+    s.list->SetComputeRootShaderResourceView(4, s.xbuf->GetGPUVirtualAddress());
+    s.list->SetComputeRootUnorderedAccessView(5, a_base + a_t0);
+    s.list->Dispatch(attn_groups, 1, 1);
+
+    // 2. residual: B.h1 = A.t0 + x  (addn reads A.t0, so A becomes an SRV).
+    transition(s, s.ybuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    s.list->SetPipelineState(s.pso_addn.Get());
+    s.list->SetComputeRootConstantBufferView(0, params_base + kAddn0);
+    s.list->SetComputeRootShaderResourceView(1, a_base + a_t0);
+    s.list->SetComputeRootShaderResourceView(2, s.wbuf->GetGPUVirtualAddress());
+    s.list->SetComputeRootUnorderedAccessView(5, b_base + b_h1);
+    s.list->Dispatch(addn_groups, 1, 1);
+
+    // 3. FFN norm over T rows: A.h2 = rmsnorm(B.h1)  (B becomes the SRV).
+    transition(s, s.fbuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    transition(s, s.ybuf.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    s.list->SetPipelineState(s.pso_rms.Get());
+    s.list->SetComputeRootConstantBufferView(0, params_base + kRmsSlot);
+    s.list->SetComputeRootShaderResourceView(1, b_base + b_h1);
+    s.list->SetComputeRootShaderResourceView(2, s.nbuf->GetGPUVirtualAddress());
+    s.list->SetComputeRootUnorderedAccessView(5, a_base + a_h2);
+    s.list->Dispatch(static_cast<UINT>(tokens), 1, 1);
+
+    // 4/5. gate and up GEMMs from the normed rows into B (no state change
+    // between them: both read the same A.h2 and write the same B resource).
+    transition(s, s.ybuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    transition(s, s.fbuf.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    s.list->SetPipelineState(gemm_pso);
+    s.list->SetComputeRootConstantBufferView(0, params_base + kGemmBase + 256);
+    s.list->SetComputeRootShaderResourceView(1, g_q->GetGPUVirtualAddress());
+    s.list->SetComputeRootShaderResourceView(2, g_s);
+    s.list->SetComputeRootShaderResourceView(3, a_base + a_h2);
+    s.list->SetComputeRootShaderResourceView(4, a_base + a_h2);
+    s.list->SetComputeRootUnorderedAccessView(5, b_base + b_g);
+    s.list->Dispatch(ffn_groups, 1, 1);
+
+    s.list->SetComputeRootConstantBufferView(0, params_base + kGemmBase + 512);
+    s.list->SetComputeRootShaderResourceView(1, u_q->GetGPUVirtualAddress());
+    s.list->SetComputeRootShaderResourceView(2, u_s);
+    s.list->SetComputeRootShaderResourceView(3, a_base + a_h2);
+    s.list->SetComputeRootShaderResourceView(4, a_base + a_h2);
+    s.list->SetComputeRootUnorderedAccessView(5, b_base + b_u);
+    s.list->Dispatch(ffn_groups, 1, 1);
+
+    // 6. SiLU(gate)*up into A.f  (B becomes the SRV again).
+    transition(s, s.fbuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    transition(s, s.ybuf.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    s.list->SetPipelineState(s.pso_silu.Get());
+    s.list->SetComputeRootConstantBufferView(0, params_base + kSiluSlot);
+    s.list->SetComputeRootShaderResourceView(1, b_base + b_g);
+    s.list->SetComputeRootShaderResourceView(2, b_base + b_u);
+    s.list->SetComputeRootUnorderedAccessView(5, a_base + a_f);
+    s.list->Dispatch(silu_groups, 1, 1);
+
+    // 7. down GEMM: B.d = W_down @ A.f
+    transition(s, s.ybuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    transition(s, s.fbuf.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    s.list->SetPipelineState(gemm_pso);
+    s.list->SetComputeRootConstantBufferView(0, params_base + kGemmBase + 768);
+    s.list->SetComputeRootShaderResourceView(1, d_q->GetGPUVirtualAddress());
+    s.list->SetComputeRootShaderResourceView(2, d_s);
+    s.list->SetComputeRootShaderResourceView(3, a_base + a_f);
+    s.list->SetComputeRootShaderResourceView(4, a_base + a_f);
+    s.list->SetComputeRootUnorderedAccessView(5, b_base + b_d);
+    s.list->Dispatch(down_groups, 1, 1);
+
+    // 8. final residual: A.fin = B.h1 + B.d
+    transition(s, s.fbuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    transition(s, s.ybuf.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    s.list->SetPipelineState(s.pso_addn.Get());
+    s.list->SetComputeRootConstantBufferView(0, params_base + kAddn1);
+    s.current_comp = Comp::FfnFused;
+    s.list->SetComputeRootShaderResourceView(1, b_base + b_d);
+    s.list->SetComputeRootShaderResourceView(2, b_base + b_h1);
+    s.list->SetComputeRootUnorderedAccessView(5, a_base + a_fin);
+    s.list->Dispatch(addn_groups, 1, 1);
+
+    if (s.trace) {
+        s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+    }
+    transition(s, s.ybuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               D3D12_RESOURCE_STATE_COPY_SOURCE);
+    s.list->CopyBufferRegion(s.yread.Get(), 0, s.ybuf.Get(), a_fin, x_bytes);
+    transition(s, s.ybuf.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (s.trace) {
+        s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2);
+        s.list->ResolveQueryData(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 3,
+                                 s.ts_read.Get(), 0);
+    }
+    s.list->Close();
+
+    if (!execute_and_wait(s)) {
+        return false;
+    }
+
+    void* mapped = nullptr;
+    const D3D12_RANGE read_range{0, x_bytes};
+    if (FAILED(s.yread->Map(0, &read_range, &mapped))) {
+        return false;
+    }
+    {
+        std::uint64_t dev = 0;
+        accumulate_gpu_us(s, dev, 0, 1);
+        note_dev(s, Comp::FfnFused, dev);
+    }
+    std::memcpy(out, mapped, x_bytes);
+    const D3D12_RANGE written{0, 0};
+    s.yread->Unmap(0, &written);
+    s.stats.dispatches += 8;
+    ++s.stats.batches;
+    return true;
+}
+
+bool ffn_prefill_fused(const std::uint8_t* attn_out_w, const std::uint8_t* gate_w,
+                       const std::uint8_t* up_w, const std::uint8_t* down_w,
+                       const float* norm_weight, const float* x, const float* attn_out,
+                       float* out, std::size_t tokens, std::size_t hidden,
+                       std::size_t attn_width, std::size_t ffn_rows, float epsilon) noexcept {
+    if (!attn_out_w || !gate_w || !up_w || !down_w || !norm_weight || !x || !attn_out || !out) {
+        return false;
+    }
+    State& s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (!init_locked(s)) {
+        return false;
+    }
+    if (!ffn_prefill_fused_locked(s, attn_out_w, gate_w, up_w, down_w, norm_weight, x, attn_out,
+                                  out, tokens, hidden, attn_width, ffn_rows, epsilon)) {
         ++s.stats.fallbacks;
         return false;
     }

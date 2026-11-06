@@ -193,6 +193,108 @@ bool check_gemm(const Shape& shape, bool verbose) {
     return ok;
 }
 
+
+bool check_gemm_batch() {
+    // Batched prefill: Q|K|V shapes (2048, 512, 512 rows, 2048 cols) and
+    // gate|up shapes (8192, 8192 rows, 2048 cols) share one [tokens x cols]
+    // input. The batch must be bit-identical to three/two single submissions
+    // (same PSO/params, only the wrapper differs) and within 1e-5 of the
+    // double-precision reference.
+    struct TaskShape { std::size_t rows; std::size_t cols; };
+    const std::size_t tokens = 17;
+    const std::size_t cols = 2048;
+    constexpr std::size_t raw_block_bytes = 34;
+    const std::size_t blocks_per_row = cols / 32;
+    const std::size_t row_bytes = blocks_per_row * raw_block_bytes;
+
+    auto run_group = [&](const std::vector<TaskShape>& group, const char* label, std::uint32_t base_seed) -> bool {
+        std::mt19937 x_rng(base_seed ^ 0x9E3779B9u);
+        std::uniform_real_distribution<float> x_dist(-1.0f, 1.0f);
+        std::vector<float> input(tokens * cols);
+        for (float& v : input) v = x_dist(x_rng);
+
+        struct TaskData {
+            std::vector<std::uint8_t> weights;
+            std::vector<float> reference;
+            std::vector<float> single;
+            std::vector<float> batched;
+        };
+        std::vector<TaskData> tasks(group.size());
+        for (std::size_t ti = 0; ti < group.size(); ++ti) {
+            const std::size_t rows = group[ti].rows;
+            std::mt19937 w_rng(base_seed + static_cast<std::uint32_t>(ti * 1315423911u));
+            std::uniform_int_distribution<int> quant_dist(-127, 127);
+            TaskData& td = tasks[ti];
+            td.weights.assign(rows * row_bytes, 0);
+            for (std::size_t r = 0; r < rows; ++r) {
+                std::uint8_t* row = td.weights.data() + r * row_bytes;
+                for (std::size_t b = 0; b < blocks_per_row; ++b) {
+                    std::uint8_t* block = row + b * raw_block_bytes;
+                    const float scale = static_cast<float>(1 + (b % 8)) / 256.0f;
+                    const std::uint16_t half = float_to_half(scale);
+                    block[0] = static_cast<std::uint8_t>(half & 0xFFu);
+                    block[1] = static_cast<std::uint8_t>(half >> 8);
+                    for (std::size_t k = 0; k < 32; ++k)
+                        block[2 + k] = static_cast<std::uint8_t>(static_cast<std::int8_t>(quant_dist(w_rng)));
+                }
+            }
+            td.reference.assign(tokens * rows, 0.0f);
+            for (std::size_t t = 0; t < tokens; ++t) {
+                const float* x = input.data() + t * cols;
+                for (std::size_t r = 0; r < rows; ++r) {
+                    const std::uint8_t* row = td.weights.data() + r * row_bytes;
+                    double acc = 0.0;
+                    for (std::size_t b = 0; b < blocks_per_row; ++b) {
+                        const std::uint8_t* block = row + b * raw_block_bytes;
+                        const float scale = half_to_float(static_cast<std::uint16_t>(block[0] | (block[1] << 8)));
+                        double block_dot = 0.0;
+                        for (std::size_t k = 0; k < 32; ++k) {
+                            const auto q = static_cast<std::int8_t>(block[2 + k]);
+                            block_dot += static_cast<double>(q) * static_cast<double>(x[b * 32 + k]);
+                        }
+                        acc += static_cast<double>(scale) * block_dot;
+                    }
+                    td.reference[t * rows + r] = static_cast<float>(acc);
+                }
+            }
+            td.single.assign(tokens * rows, 0.0f);
+            td.batched.assign(tokens * rows, 0.0f);
+            if (!zen::d3d12::gemm_q8_0(td.weights.data(), input.data(), td.single.data(), tokens, rows, cols)) {
+                std::printf("gemm_batch %s task %zu: ERROR (single declined)\n", label, ti);
+                return false;
+            }
+        }
+        zen::d3d12::GemmTask batch_tasks[8];
+        for (std::size_t ti = 0; ti < group.size(); ++ti)
+            batch_tasks[ti] = {tasks[ti].weights.data(), tasks[ti].batched.data(), group[ti].rows};
+        if (!zen::d3d12::gemm_q8_0_batch(input.data(), batch_tasks, group.size(), tokens, cols)) {
+            std::printf("gemm_batch %s: ERROR (batch declined)\n", label);
+            return false;
+        }
+        bool ok = true;
+        for (std::size_t ti = 0; ti < group.size(); ++ti) {
+            const TaskData& td = tasks[ti];
+            const double batch_vs_single = max_error(td.batched, td.single);
+            double max_abs = 0.0; double max_ref = 0.0;
+            for (std::size_t i = 0; i < td.reference.size(); ++i) {
+                max_abs = std::max(max_abs, std::fabs(double(td.batched[i]) - double(td.reference[i])));
+                max_ref = std::max(max_ref, std::fabs(double(td.reference[i])));
+            }
+            const double rel = max_ref > 0.0 ? max_abs / max_ref : max_abs;
+            const bool task_ok = (batch_vs_single == 0.0) && (rel <= 1e-5);
+            ok = task_ok && ok;
+            std::printf("gemm_batch %s task %zu rows=%zu cols=%zu tokens=%zu: batch_vs_single=%.3e relative_err=%.3e %s\n",
+                        label, ti, group[ti].rows, cols, tokens, batch_vs_single, rel, task_ok ? "ok" : "MISMATCH");
+        }
+        return ok;
+    };
+
+    bool ok = true;
+    ok = run_group({{2048, cols}, {512, cols}, {512, cols}}, "QKV", 20261106u) && ok;
+    ok = run_group({{8192, cols}, {8192, cols}}, "gate_up", 20261107u) && ok;
+    return ok;
+}
+
 bool check_rms_norm() {
     const std::size_t rows = 7;
     const std::size_t cols = 1024;
@@ -262,6 +364,7 @@ int main() {
             break;
         }
     }
+    ok = check_gemm_batch() && ok;
     ok = check_rms_norm() && ok;
 
     std::printf(ok ? "PASS\n" : "FAIL\n");

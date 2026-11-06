@@ -415,7 +415,168 @@ int main(){
         }
         }
     }
+    // Sequential K-block repack (candidate (a)): repack_q8_0_kblk +
+    // gemm_q8_0_kblk_repack_avx2 / gemm_q8_0_kblk_repack_parallel vs the
+    // double-precision naive reference, plus bit-identity vs the raw kblk
+    // kernel on the main block. Gate is the double dot (same tolerance as
+    // the KBLK sweep); bit-identity is checked exactly because the repack
+    // is a pure byte transpose (same dequantised weights, same c=0,8,...
+    // FMA order, same single hsum). Odd T (3,5,171) and odd rows (1,3)
+    // hit the tails; the parallel wrapper is exercised at workers 1 and 4
+    // (slices that do not start on an RB boundary are covered implicitly
+    // by rows=100 and by the 4-worker split).
+    {
+        for(const std::size_t cols:{std::size_t(96),std::size_t(2048),std::size_t(8192)}){
+        for(const std::size_t rows:{std::size_t(1),std::size_t(2),std::size_t(3),std::size_t(100),std::size_t(2048)}){
+            const std::size_t rb=quant::row_bytes(*q8fmt,cols);CHECK(rb==(cols/32)*34);
+            std::vector<std::uint8_t> packed(rows*rb);
+            std::uint32_t s=12345u+std::uint32_t(rows*1000003u+cols);
+            auto rndb=[&](){s=s*1664525u+1013904223u;return static_cast<std::uint8_t>((s>>24)&0xffu);};
+            for(std::size_t r=0;r<rows;++r)for(std::size_t blk=0;blk<cols/32;++blk){std::uint8_t*b=packed.data()+r*rb+blk*34;b[0]=0x00;b[1]=0x3c;for(std::size_t j=2;j<34;++j)b[j]=rndb();}
+            std::vector<float> ref(rows*cols);
+            CHECK(quant::dequantize(*q8fmt,packed.data(),rows*cols,ref.data()));
+            auto repacked=quant::repack_q8_0_kblk(packed.data(),rows,cols);
+            CHECK(!repacked.empty());
+            CHECK(repacked.size()==quant::repacked_q8_0_kblk_bytes(rows,cols));
+            for(const std::size_t T:{std::size_t(2),std::size_t(3),std::size_t(4),std::size_t(5),std::size_t(8),std::size_t(12),std::size_t(32),std::size_t(171)}){
+                std::vector<float> xin(T*cols);
+                for(std::size_t t=0;t<T;++t)for(std::size_t c=0;c<cols;++c)xin[t*cols+c]=float(int((t*7+c)%15)-7)*0.017f+float(int((t*13+c*3)%7)-3)*0.001f;
+                std::vector<double> expect(T*rows);
+                for(std::size_t t=0;t<T;++t)for(std::size_t r=0;r<rows;++r){double sum=0;for(std::size_t c=0;c<cols;++c)sum+=double(ref[r*cols+c])*xin[t*cols+c];expect[t*rows+r]=sum;}
+                for(const unsigned workers:{1u,4u}){
+                    std::vector<float> out(T*rows,0.0f);
+                    CHECK(quant::gemm_q8_0_kblk_repack_parallel(repacked.data(),xin.data(),out.data(),T,rows,cols,workers));
+                    double maxerr=0;std::size_t wt=0,wr=0;
+                    for(std::size_t t=0;t<T;++t)for(std::size_t r=0;r<rows;++r){double e=std::abs(double(out[t*rows+r])-expect[t*rows+r]);if(e>maxerr){maxerr=e;wt=t;wr=r;}}
+                    const double tol=1.5e-3*std::max(1.0,std::abs(expect[wt*rows+wr]));
+                    if(maxerr>tol){std::cerr<<"FAIL repack sweep cols="<<cols<<" rows="<<rows<<" T="<<T<<" workers="<<workers<<" maxerr="<<maxerr<<" tol="<<tol<<" worst(t="<<wt<<",r="<<wr<<")\n";++failures;}
+                }
+#ifdef ZEN_HAS_AVX2_KERNELS
+                if(zen::cpu_has_avx2_fma()){
+                    std::vector<float> outr(T*rows,0.0f), outk(T*rows,0.0f);
+                    CHECK(zen::gemm_q8_0_kblk_repack_avx2(repacked.data(),0,xin.data(),outr.data(),T,rows,cols,rows));
+                    CHECK(zen::gemm_q8_0_kblk_avx2(packed.data(),xin.data(),outk.data(),T,rows,cols,rows));
+                    std::size_t ndiff=0;
+                    for(std::size_t i=0;i<outr.size();++i)if(outr[i]!=outk[i])++ndiff;
+                    if(ndiff){std::cerr<<"FAIL repack bit-identity cols="<<cols<<" rows="<<rows<<" T="<<T<<" ndiff="<<ndiff<<"/"<<outr.size()<<"\n";++failures;}
+                }
+#else
+                (void)repacked;
+#endif
+            }
+        }
+        }
+    }
+    // Non-Q8 K-blocked batched GEMM (F16, Q4_K): direct kernel + quant::gemm
+    // (process default = plain path; ZEN_CPU_FAST_*=1 steers quant::gemm onto
+    // the kernels, and running this binary with the flags covers that route)
+    // vs double-precision naive reference. Rows 1/3 hit the dot tails, odd T
+    // hits the 4x1 token edge; F16 packs zeros/subnormals, Q4_K packs
+    // d/dmin=1 with small scales. Gate is the double dot, like Priority 1.
+#ifdef ZEN_HAS_AVX2_KERNELS
+    if(zen::cpu_has_avx2_fma()){
+        for(const std::size_t cols:{std::size_t(96),std::size_t(2048)}){
+        for(const std::size_t rows:{std::size_t(1),std::size_t(3),std::size_t(100)}){
+            std::vector<std::uint8_t> packed(rows*cols*2);
+            for(std::size_t e=0;e<rows*cols;++e){
+                const float v=float(int((e*7)%17)-8)*0.031f+float(int(e%5)-2)*0.003f;
+                std::uint16_t h=0;CHECK(quant::encode_fp16(&v,&h,1));
+                packed[2*e]=std::uint8_t(h&0xff);packed[2*e+1]=std::uint8_t(h>>8);
+            }
+            packed[0]=0x00;packed[1]=0x00; // +0
+            packed[2]=0x00;packed[3]=0x80; // -0
+            packed[4]=0x01;packed[5]=0x00; // smallest subnormal
+            packed[6]=0xff;packed[7]=0x7b; // max finite
+            const auto* f16fmt=quant::find("F16");
+            std::vector<float> ref(rows*cols);
+            CHECK(quant::dequantize(*f16fmt,packed.data(),rows*cols,ref.data()));
+            for(const std::size_t T:{std::size_t(1),std::size_t(2),std::size_t(3),std::size_t(5),std::size_t(8),std::size_t(32)}){
+                std::vector<float> xin(T*cols);
+                for(std::size_t t=0;t<T;++t)for(std::size_t c=0;c<cols;++c)xin[t*cols+c]=float(int((t*7+c)%15)-7)*0.017f+float(int((t*13+c*3)%7)-3)*0.001f;
+                std::vector<double> expect(T*rows);
+                for(std::size_t t=0;t<T;++t)for(std::size_t r=0;r<rows;++r){double sum=0;for(std::size_t c=0;c<cols;++c)sum+=double(ref[r*cols+c])*xin[t*cols+c];expect[t*rows+r]=sum;}
+                std::vector<float> outk(T*rows,0.0f);
+                CHECK(zen::gemm_f16_kblk_avx2(packed.data(),xin.data(),outk.data(),T,rows,cols,rows));
+                double maxerr=0;std::size_t wt=0,wr=0;
+                for(std::size_t t=0;t<T;++t)for(std::size_t r=0;r<rows;++r){double e=std::abs(double(outk[t*rows+r])-expect[t*rows+r]);if(e>maxerr){maxerr=e;wt=t;wr=r;}}
+                const double tol=1.5e-3*std::max(1.0,std::abs(expect[wt*rows+wr]));
+                if(maxerr>tol){std::cerr<<"FAIL f16kblk cols="<<cols<<" rows="<<rows<<" T="<<T<<" maxerr="<<maxerr<<" tol="<<tol<<" worst(t="<<wt<<",r="<<wr<<")\n";++failures;}
+                for(const unsigned workers:{1u,4u}){
+                    std::vector<float> out(T*rows,0.0f);
+                    CHECK(quant::gemm(*f16fmt,packed.data(),xin.data(),out.data(),T,rows,cols,1.0f,workers));
+                    double m2=0;std::size_t t2=0,r2=0;
+                    for(std::size_t t=0;t<T;++t)for(std::size_t r=0;r<rows;++r){double e=std::abs(double(out[t*rows+r])-expect[t*rows+r]);if(e>m2){m2=e;t2=t;r2=r;}}
+                    const double tol2=1.5e-3*std::max(1.0,std::abs(expect[t2*rows+r2]));
+                    if(m2>tol2){std::cerr<<"FAIL f16gemm cols="<<cols<<" rows="<<rows<<" T="<<T<<" workers="<<workers<<" maxerr="<<m2<<" tol="<<tol2<<" worst(t="<<t2<<",r="<<r2<<")\n";++failures;}
+                }
+            }
+        }
+        }
+        for(const std::size_t cols:{std::size_t(256),std::size_t(2048)}){
+        for(const std::size_t rows:{std::size_t(1),std::size_t(3),std::size_t(100)}){
+            const std::size_t rb=quant::row_bytes(*quant::find("Q4_K"),cols);
+            CHECK(rb==(cols/256)*144);
+            std::vector<std::uint8_t> packed(rows*rb);
+            std::uint32_t s=54321u+std::uint32_t(rows*1000003u+cols);
+            auto rnd=[&](){s=s*1664525u+1013904223u;return static_cast<std::uint8_t>((s>>24)&0xffu);};
+            for(std::size_t i=0;i<packed.size();++i)packed[i]=rnd();
+            for(std::size_t r=0;r<rows;++r)for(std::size_t blk=0;blk<cols/256;++blk){std::uint8_t*b=packed.data()+(r*rb)+blk*144;b[0]=0x00;b[1]=0x3c;b[2]=0x00;b[3]=0x3c;for(std::size_t j=0;j<12;++j)b[4+j]=std::uint8_t(rnd()%8);} // d/dmin=1, small scales
+            const auto* q4kfmt=quant::find("Q4_K");
+            std::vector<float> ref(rows*cols);
+            CHECK(quant::dequantize(*q4kfmt,packed.data(),rows*cols,ref.data()));
+            for(const std::size_t T:{std::size_t(1),std::size_t(2),std::size_t(3),std::size_t(5),std::size_t(8),std::size_t(32)}){
+                std::vector<float> xin(T*cols);
+                for(std::size_t t=0;t<T;++t)for(std::size_t c=0;c<cols;++c)xin[t*cols+c]=float(int((t*7+c)%15)-7)*0.017f+float(int((t*13+c*3)%7)-3)*0.001f;
+                std::vector<double> expect(T*rows);
+                for(std::size_t t=0;t<T;++t)for(std::size_t r=0;r<rows;++r){double sum=0;for(std::size_t c=0;c<cols;++c)sum+=double(ref[r*cols+c])*xin[t*cols+c];expect[t*rows+r]=sum;}
+                std::vector<float> outk(T*rows,0.0f);
+                CHECK(zen::gemm_q4k_kblk_avx2(packed.data(),xin.data(),outk.data(),T,rows,cols,rows));
+                double maxerr=0;std::size_t wt=0,wr=0;
+                for(std::size_t t=0;t<T;++t)for(std::size_t r=0;r<rows;++r){double e=std::abs(double(outk[t*rows+r])-expect[t*rows+r]);if(e>maxerr){maxerr=e;wt=t;wr=r;}}
+                const double tol=1.5e-3*std::max(1.0,std::abs(expect[wt*rows+wr]));
+                if(maxerr>tol){std::cerr<<"FAIL q4kkblk cols="<<cols<<" rows="<<rows<<" T="<<T<<" maxerr="<<maxerr<<" tol="<<tol<<" worst(t="<<wt<<",r="<<wr<<")\n";++failures;}
+                for(const unsigned workers:{1u,4u}){
+                    std::vector<float> out(T*rows,0.0f);
+                    CHECK(quant::gemm(*q4kfmt,packed.data(),xin.data(),out.data(),T,rows,cols,1.0f,workers));
+                    double m2=0;std::size_t t2=0,r2=0;
+                    for(std::size_t t=0;t<T;++t)for(std::size_t r=0;r<rows;++r){double e=std::abs(double(out[t*rows+r])-expect[t*rows+r]);if(e>m2){m2=e;t2=t;r2=r;}}
+                    const double tol2=1.5e-3*std::max(1.0,std::abs(expect[t2*rows+r2]));
+                    if(m2>tol2){std::cerr<<"FAIL q4kgemm cols="<<cols<<" rows="<<rows<<" T="<<T<<" workers="<<workers<<" maxerr="<<m2<<" tol="<<tol2<<" worst(t="<<t2<<",r="<<r2<<")\n";++failures;}
+                }
+            }
+        }
+        }
+    }
+#endif
 
+
+    // RMSNorm AVX2 (kernels/avx2.cpp) vs the sequential scalar reference
+    // (double ss loop, float inv). The AVX2 double reduction reorders the
+    // ss sum across its four __m256d accumulators, so equality is NOT
+    // expected; the gate is maxerr <= 1e-5 * max(1,|ref|) -- the measured
+    // maxerr on this machine is ~1e-7 (about 1 ulp of float), printed by
+    // the rms micro-bench. Small n covers the scalar tails (n<8, n%16).
+#ifdef ZEN_HAS_AVX2_KERNELS
+    if(zen::cpu_has_avx2_fma()){
+        for(const std::size_t n:{std::size_t(1),std::size_t(3),std::size_t(7),std::size_t(8),std::size_t(15),std::size_t(16),std::size_t(17),std::size_t(31),std::size_t(64),std::size_t(128),std::size_t(256),std::size_t(2048),std::size_t(8192)}){
+            std::vector<float> x(n),w(n),ref(n),out(n);
+            std::uint32_t s=987654321u+std::uint32_t(n);for(std::size_t i=0;i<n;++i){s=s*1664525u+1013904223u;x[i]=float(int((s>>16)%2000)-1000)*0.002f;w[i]=1.0f+float(int(i%5))*0.01f;}
+            const float eps=1e-5f;
+            double ss=0.0;for(std::size_t i=0;i<n;++i)ss+=double(x[i])*x[i];
+            const float inv=1.0f/std::sqrt(static_cast<float>(ss/double(n))+eps);
+            for(std::size_t i=0;i<n;++i)ref[i]=x[i]*inv*w[i];
+            zen::rms_norm_avx2(x.data(),w.data(),out.data(),n,eps);
+            double maxerr=0;std::size_t wi=0;
+            for(std::size_t i=0;i<n;++i){double e=std::abs(double(out[i])-double(ref[i]));if(e>maxerr){maxerr=e;wi=i;}}
+            const double tol=1e-5*std::max(1.0,std::abs(double(ref[wi])));
+            if(maxerr>tol){std::cerr<<"FAIL rms_norm_avx2 n="<<n<<" maxerr="<<maxerr<<" tol="<<tol<<" worst(i="<<wi<<")\n";++failures;}
+            // In-place aliasing (x==y), used by qk_rms_norm.
+            std::vector<float> inplace=x;
+            zen::rms_norm_avx2(inplace.data(),w.data(),inplace.data(),n,eps);
+            for(std::size_t i=0;i<n;++i)CHECK(std::abs(double(inplace[i])-double(ref[i]))<=tol);
+        }
+    }
+#endif
 
     // SentencePiece byte-level BPE: merges are selected by token score and decode reversibly.
     model::ModelConfig tc;tc.metadata["tokenizer.ggml.model"]="llama";tc.bos_token_id=1;tc.eos_token_id=2;tc.unknown_token_id=0;tc.add_space_prefix=true;

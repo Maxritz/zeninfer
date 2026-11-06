@@ -260,6 +260,58 @@ void axpy_f32_avx2(float a, const float* x, float* y, std::size_t n) noexcept {
     for(;i<n;++i) y[i]+=a*x[i];
 }
 
+// RMSNorm AVX2. Scalar reference (dense_transformer_runtime.cpp):
+//   double ss=0; for i: ss+=double(x[i])*x[i];
+//   float inv=1.0f/sqrt(float(ss/n)+eps); for i: y[i]=x[i]*inv*weight[i];
+// The ss reduction here is NOT bit-identical to that scalar loop: the four
+// __m256d accumulators accumulate disjoint 4-element chunks in parallel and
+// are combined once at the end, so the double-precision partial sums are
+// added in a different associativity order (scalar: strictly sequential).
+// In double precision the reordering error is ~1e-13 relative on the ss for
+// the hidden sizes used here (2048/8192), i.e. at most ~1 ulp of float on
+// the final y after the float cast of ss/n -- well inside the core_tests
+// tolerance for this kernel. inv is computed in float exactly as scalar
+// (1.0f/sqrt(float(ss/n)+eps)); the apply loop is vectorised float
+// x*inv*weight, one multiply chain identical to the scalar expression.
+// Aliasing x==y is safe: each output element is read before it is written.
+void rms_norm_avx2(const float* x, const float* weight, float* y, std::size_t n, float eps) {
+    if(!x||!weight||!y||!n) return;
+    __m256d s0=_mm256_setzero_pd(),s1=_mm256_setzero_pd();
+    __m256d s2=_mm256_setzero_pd(),s3=_mm256_setzero_pd();
+    std::size_t i=0;
+    for(;i+15<n;i+=16){
+        const __m256 v0=_mm256_loadu_ps(x+i);
+        const __m256 v1=_mm256_loadu_ps(x+i+8);
+        const __m256d d0=_mm256_cvtps_pd(_mm256_castps256_ps128(v0));
+        const __m256d d1=_mm256_cvtps_pd(_mm256_extractf128_ps(v0,1));
+        const __m256d d2=_mm256_cvtps_pd(_mm256_castps256_ps128(v1));
+        const __m256d d3=_mm256_cvtps_pd(_mm256_extractf128_ps(v1,1));
+        s0=_mm256_fmadd_pd(d0,d0,s0);
+        s1=_mm256_fmadd_pd(d1,d1,s1);
+        s2=_mm256_fmadd_pd(d2,d2,s2);
+        s3=_mm256_fmadd_pd(d3,d3,s3);
+    }
+    if(i+7<n){
+        const __m256 v=_mm256_loadu_ps(x+i);
+        const __m256d d0=_mm256_cvtps_pd(_mm256_castps256_ps128(v));
+        const __m256d d1=_mm256_cvtps_pd(_mm256_extractf128_ps(v,1));
+        s0=_mm256_fmadd_pd(d0,d0,s0);
+        s1=_mm256_fmadd_pd(d1,d1,s1);
+        i+=8;
+    }
+    __m256d total_pd=_mm256_add_pd(_mm256_add_pd(s0,s1),_mm256_add_pd(s2,s3));
+    alignas(32) double lanes[4];
+    _mm256_store_pd(lanes,total_pd);
+    double ss=lanes[0]+lanes[1]+lanes[2]+lanes[3];
+    for(;i<n;++i) ss+=double(x[i])*x[i];
+    const float inv=1.0f/std::sqrt(static_cast<float>(ss/double(n))+eps);
+    const __m256 vinv=_mm256_set1_ps(inv);
+    for(std::size_t j=0;j+7<n;j+=8)
+        _mm256_storeu_ps(y+j,_mm256_mul_ps(_mm256_mul_ps(_mm256_loadu_ps(x+j),vinv),
+                                           _mm256_loadu_ps(weight+j)));
+    for(std::size_t j=n&~(std::size_t)7;j<n;++j) y[j]=x[j]*inv*weight[j];
+}
+
 bool gemm_q8_0_avx2(const std::uint8_t* weights, const float* input, float* output,
                     std::size_t tokens, std::size_t rows, std::size_t columns,
                     std::size_t output_row_stride) {
@@ -362,6 +414,10 @@ bool gemm_q8_0_avx2(const std::uint8_t* weights, const float* input, float* outp
 // Loop nest per RB block is r0 { k0 { rl { t { k } } } }, i.e. rows are
 // blocked outer and K panels inner, so partials for one RB stay in L2
 // across panels instead of streaming a full-slice partial matrix.
+// The weight-panel dequant reads inside k0 are strided across rows
+// (consecutive rows are row_bytes apart in RAM); a software prefetch of
+// the next row-tile's panel is issued while the current tile's token
+// FMAs run (see the prefetch site in the rl loop).
 bool gemm_q8_0_kblk_avx2(const std::uint8_t* weights, const float* input, float* output,
                      std::size_t tokens, std::size_t rows, std::size_t columns,
                      std::size_t output_row_stride) {
@@ -416,6 +472,214 @@ bool gemm_q8_0_kblk_avx2(const std::uint8_t* weights, const float* input, float*
                 // across every token block below (L1-resident: 4*512*4=8KB max).
                 for(std::size_t dr=0;dr<kMR;++dr){
                     const std::uint8_t* src=weights+(r+dr)*row_bytes+panel_blk*kBlockBytes;
+                    float* dst=wpanel.data()+dr*kKc;
+                    const std::size_t nblk=kc/kBlockElements;
+                    for(std::size_t blk=0;blk<nblk;++blk){
+                        const std::uint8_t* p=src+blk*kBlockBytes;
+                        const float d=half_to_float_local(std::uint16_t(p[0])|(std::uint16_t(p[1])<<8));
+                        float* dst_row=dst+blk*kBlockElements;
+                        for(std::size_t j=0;j<kBlockElements;j+=8){
+                            const __m128i b8=_mm_loadl_epi64(reinterpret_cast<const __m128i*>(p+2+j));
+                            const __m256i i32=_mm256_cvtepi8_epi32(b8);
+                            _mm256_storeu_ps(dst_row+j,_mm256_mul_ps(_mm256_cvtepi32_ps(i32),_mm256_set1_ps(d)));
+                        }
+                    }
+                }
+                // Software prefetch (KBLK prefetch fix, one site): the weight
+                // panel reads above are strided -- each row's kc panel sits
+                // row_bytes (~8.7KB for K=8192) after the previous row's, so
+                // the hardware prefetcher sees up to RB/kMR concurrent
+                // strided streams and does not run ahead. Issue prefetches
+                // for the NEXT row-tile's panel (same k0 panel, rows
+                // r+kMR..r+2*kMR-1) now, while the token FMA loop below
+                // (the long compute between this dequant and the next one)
+                // runs, so those lines are in L2/L3 when the next dequant
+                // reads them. Two lines per row (panel start and +256B,
+                // the prefetch-distance point of a 544B Kc=512 panel)
+                // keeps the instruction cost at 8 prefetches per tile.
+                // Prefetch is read-only and non-faulting, so it cannot
+                // change results (bit-identity is preserved).
+                // Measured (see src/quant.cpp): this does NOT recover
+                // the model-level KBLK regression -- the activation
+                // panel evicts the prefetched lines before the next
+                // dequant, so KBLK stays opt-in (default off).
+                if(rl+kMR<RBc){
+                    for(std::size_t dr=0;dr<kMR;++dr){
+                        const std::uint8_t* nxt=weights+(r+kMR+dr)*row_bytes+panel_blk*kBlockBytes;
+                        _mm_prefetch(reinterpret_cast<const char*>(nxt),_MM_HINT_T0);
+                        _mm_prefetch(reinterpret_cast<const char*>(nxt+256),_MM_HINT_T0);
+                    }
+                }
+                for(std::size_t t=0;t<tokens;t+=kNR){
+                    const float* in0=input+(t+0)*columns+k0;
+                    if(t+1<tokens){
+                        const float* in1=input+(t+1)*columns+k0;
+                        __m256 a00,a01,a10,a11,a20,a21,a30,a31;
+                        __m256* p;
+                        if(first_panel){
+                            a00=_mm256_setzero_ps();a01=_mm256_setzero_ps();
+                            a10=_mm256_setzero_ps();a11=_mm256_setzero_ps();
+                            a20=_mm256_setzero_ps();a21=_mm256_setzero_ps();
+                            a30=_mm256_setzero_ps();a31=_mm256_setzero_ps();
+                        }else{
+                            p=&partial[t*RBc+rl];
+                            a00=_mm256_loadu_ps(reinterpret_cast<const float*>(p+0*RBc));
+                            a01=_mm256_loadu_ps(reinterpret_cast<const float*>(p+1*RBc));
+                            a10=_mm256_loadu_ps(reinterpret_cast<const float*>(p+0*RBc+1));
+                            a11=_mm256_loadu_ps(reinterpret_cast<const float*>(p+1*RBc+1));
+                            a20=_mm256_loadu_ps(reinterpret_cast<const float*>(p+0*RBc+2));
+                            a21=_mm256_loadu_ps(reinterpret_cast<const float*>(p+1*RBc+2));
+                            a30=_mm256_loadu_ps(reinterpret_cast<const float*>(p+0*RBc+3));
+                            a31=_mm256_loadu_ps(reinterpret_cast<const float*>(p+1*RBc+3));
+                        }
+                        const float* w=wpanel.data();
+                        for(std::size_t s=0;s<kc;s+=8){
+                            const __m256 x0=_mm256_loadu_ps(in0+s);
+                            const __m256 x1=_mm256_loadu_ps(in1+s);
+                            const __m256 v0=_mm256_loadu_ps(w+0*kKc+s);
+                            const __m256 v1=_mm256_loadu_ps(w+1*kKc+s);
+                            const __m256 v2=_mm256_loadu_ps(w+2*kKc+s);
+                            const __m256 v3=_mm256_loadu_ps(w+3*kKc+s);
+                            a00=_mm256_fmadd_ps(v0,x0,a00);a01=_mm256_fmadd_ps(v0,x1,a01);
+                            a10=_mm256_fmadd_ps(v1,x0,a10);a11=_mm256_fmadd_ps(v1,x1,a11);
+                            a20=_mm256_fmadd_ps(v2,x0,a20);a21=_mm256_fmadd_ps(v2,x1,a21);
+                            a30=_mm256_fmadd_ps(v3,x0,a30);a31=_mm256_fmadd_ps(v3,x1,a31);
+                        }
+                        p=&partial[t*RBc+rl];
+                        _mm256_storeu_ps(reinterpret_cast<float*>(p+0*RBc),a00);
+                        _mm256_storeu_ps(reinterpret_cast<float*>(p+1*RBc),a01);
+                        _mm256_storeu_ps(reinterpret_cast<float*>(p+0*RBc+1),a10);
+                        _mm256_storeu_ps(reinterpret_cast<float*>(p+1*RBc+1),a11);
+                        _mm256_storeu_ps(reinterpret_cast<float*>(p+0*RBc+2),a20);
+                        _mm256_storeu_ps(reinterpret_cast<float*>(p+1*RBc+2),a21);
+                        _mm256_storeu_ps(reinterpret_cast<float*>(p+0*RBc+3),a30);
+                        _mm256_storeu_ps(reinterpret_cast<float*>(p+1*RBc+3),a31);
+                    }else{
+                        __m256 a0,a1,a2,a3;
+                        __m256* p;
+                        if(first_panel){
+                            a0=_mm256_setzero_ps();a1=_mm256_setzero_ps();
+                            a2=_mm256_setzero_ps();a3=_mm256_setzero_ps();
+                        }else{
+                            p=&partial[t*RBc+rl];
+                            a0=_mm256_loadu_ps(reinterpret_cast<const float*>(p+0));
+                            a1=_mm256_loadu_ps(reinterpret_cast<const float*>(p+1));
+                            a2=_mm256_loadu_ps(reinterpret_cast<const float*>(p+2));
+                            a3=_mm256_loadu_ps(reinterpret_cast<const float*>(p+3));
+                        }
+                        const float* w=wpanel.data();
+                        for(std::size_t s=0;s<kc;s+=8){
+                            const __m256 x0=_mm256_loadu_ps(in0+s);
+                            const __m256 v0=_mm256_loadu_ps(w+0*kKc+s);
+                            const __m256 v1=_mm256_loadu_ps(w+1*kKc+s);
+                            const __m256 v2=_mm256_loadu_ps(w+2*kKc+s);
+                            const __m256 v3=_mm256_loadu_ps(w+3*kKc+s);
+                            a0=_mm256_fmadd_ps(v0,x0,a0);
+                            a1=_mm256_fmadd_ps(v1,x0,a1);
+                            a2=_mm256_fmadd_ps(v2,x0,a2);
+                            a3=_mm256_fmadd_ps(v3,x0,a3);
+                        }
+                        p=&partial[t*RBc+rl];
+                        _mm256_storeu_ps(reinterpret_cast<float*>(p+0),a0);
+                        _mm256_storeu_ps(reinterpret_cast<float*>(p+1),a1);
+                        _mm256_storeu_ps(reinterpret_cast<float*>(p+2),a2);
+                        _mm256_storeu_ps(reinterpret_cast<float*>(p+3),a3);
+                    }
+                }
+            }
+        }
+        for(std::size_t t=0;t<tokens;++t){
+            const __m256* prow=&partial[t*RBc];
+            for(std::size_t rl=0;rl<RBc;++rl){
+                _mm256_store_ps(lane,prow[rl]);
+                output[t*output_row_stride+r0+rl]=lane[0]+lane[1]+lane[2]+lane[3]+lane[4]+lane[5]+lane[6]+lane[7];
+            }
+        }
+        }
+    }
+    if(rows==rows_main) return true;
+    std::vector<float> b0(columns);
+    for(std::size_t r=rows_main;r<rows;++r){
+        dequant_full_row(weights+r*row_bytes,b0.data());
+        for(std::size_t t=0;t<tokens;++t)
+            output[t*output_row_stride+r]=dot_f32_avx2(b0.data(),input+t*columns,columns);
+    }
+    return true;
+}
+
+// Repacked sequential variant of the kernel above. Same MR=4 x NR=2
+// micro-tile, same __m256 partials and single hsum, same c=0,..., FMA order,
+// so the main block is bit-identical to gemm_q8_0_kblk_avx2. The only
+// difference is the weight-panel source: instead of weights+(r)*row_bytes+
+// panel_blk*34 (row_bytes apart), each (global row, kpanel) panel is read
+// from the panel-major buffer built by quant::repack_q8_0_kblk at
+//   ((r/64)*n_kpanels + kpanel)*64*544 + (r%64)*544
+// with Kc=512, RB=64 pinned (not env-driven) so the buffer built at load
+// always matches the reader. The 4-row panel tile is one contiguous
+// 2176 B chunk and successive row tiles within one (rblock,kpanel) tile are
+// contiguous, so the hardware prefetcher streams the repack sequentially;
+// no _mm_prefetch is issued (the activation-panel eviction that defeated
+// the raw kernel's next-tile prefetch cannot happen when the next tile's
+// lines are the next lines in RAM). row_offset is the global row of the
+// first row in this slice: the offset is computed per row from the global
+// index, so parallel slices that do not start on an RB boundary are
+// correct (tiles that straddle an rblock boundary read both halves via
+// their per-row offsets). Padded rows/blocks past the last rblock/kpanel
+// are never read (kc and RBc are clamped to the slice).
+bool gemm_q8_0_kblk_repack_avx2(const std::uint8_t* repacked, std::size_t row_offset,
+                    const float* input, float* output,
+                    std::size_t tokens, std::size_t slice_rows,
+                    std::size_t columns, std::size_t output_row_stride) {
+    constexpr std::size_t kBlockElements=32, kBlockBytes=34;
+    constexpr std::size_t kMR=4, kNR=2;
+    constexpr std::size_t kKc=512, kRB=64;
+    constexpr std::size_t kBlocksPerPanel=kKc/kBlockElements; // 16
+    constexpr std::size_t kPanelBytes=kBlocksPerPanel*kBlockBytes; // 544
+    if(!repacked||!input||!output||!tokens||!slice_rows||!columns) return false;
+    if(columns%kBlockElements) return false;
+    if(columns&7) return false;
+    const std::size_t blocks_per_row=columns/kBlockElements;
+    const std::size_t n_kpanels=(blocks_per_row+kBlocksPerPanel-1)/kBlocksPerPanel;
+    const std::size_t rows_main=(slice_rows/kMR)*kMR;
+    auto panel_ptr=[&](std::size_t global_row, std::size_t kpanel){
+        const std::size_t rblock=global_row/kRB;
+        const std::size_t row_in=global_row%kRB;
+        return repacked+((rblock*n_kpanels+kpanel)*kRB+row_in)*kPanelBytes;
+    };
+    auto dequant_full_row_repacked=[&](std::size_t global_row,float* dst){
+        for(std::size_t kp=0;kp<n_kpanels;++kp){
+            const std::uint8_t* src=panel_ptr(global_row,kp);
+            const std::size_t base_blk=kp*kBlocksPerPanel;
+            const std::size_t nblk=std::min(kBlocksPerPanel,blocks_per_row-base_blk);
+            for(std::size_t blk=0;blk<nblk;++blk){
+                const std::uint8_t* p=src+blk*kBlockBytes;
+                const float d=half_to_float_local(std::uint16_t(p[0])|(std::uint16_t(p[1])<<8));
+                float* dst_row=dst+(base_blk+blk)*kBlockElements;
+                for(std::size_t j=0;j<kBlockElements;j+=8){
+                    const __m128i b8=_mm_loadl_epi64(reinterpret_cast<const __m128i*>(p+2+j));
+                    const __m256i i32=_mm256_cvtepi8_epi32(b8);
+                    _mm256_storeu_ps(dst_row+j,_mm256_mul_ps(_mm256_cvtepi32_ps(i32),_mm256_set1_ps(d)));
+                }
+            }
+        }
+    };
+    if(rows_main>0){
+        std::vector<__m256> partial(std::size_t(tokens)*kRB);
+        std::vector<float> wpanel(kMR*kKc);
+        alignas(32) float lane[8];
+        for(std::size_t r0=0;r0<rows_main;r0+=kRB){
+            const std::size_t RBc=(kRB<rows_main-r0)?kRB:(rows_main-r0);
+            for(std::size_t k0=0;k0<columns;k0+=kKc){
+                const std::size_t kc=std::size_t((kKc<columns-k0)?kKc:(columns-k0));
+                const std::size_t kpanel=k0/kKc;
+                const bool first_panel=(k0==0);
+                for(std::size_t rl=0;rl<RBc;rl+=kMR){
+                    const std::size_t r=r0+rl;
+                    const std::size_t gr=row_offset+r;
+                // Dequantise the 4-row x kc weight panel once (L1-resident:
+                // 4*512*4=8KB max), reused across every token below.
+                for(std::size_t dr=0;dr<kMR;++dr){
+                    const std::uint8_t* src=panel_ptr(gr+dr,kpanel);
                     float* dst=wpanel.data()+dr*kKc;
                     const std::size_t nblk=kc/kBlockElements;
                     for(std::size_t blk=0;blk<nblk;++blk){
@@ -516,13 +780,261 @@ bool gemm_q8_0_kblk_avx2(const std::uint8_t* weights, const float* input, float*
         }
         }
     }
-    if(rows==rows_main) return true;
+    if(slice_rows==rows_main) return true;
     std::vector<float> b0(columns);
-    for(std::size_t r=rows_main;r<rows;++r){
-        dequant_full_row(weights+r*row_bytes,b0.data());
+    for(std::size_t r=rows_main;r<slice_rows;++r){
+        dequant_full_row_repacked(row_offset+r,b0.data());
         for(std::size_t t=0;t<tokens;++t)
             output[t*output_row_stride+r]=dot_f32_avx2(b0.data(),input+t*columns,columns);
     }
     return true;
 }
-} // namespace zen
+
+// -----------------------------------------------------------------------------
+// Non-Q8 K-blocked batched GEMM (F16, Q4_K). Loop order per 4-row block is
+// K-panel outer, token-pairs inner, so the fp32 weight panel [4, Kc] is
+// dequantised once per panel and reused across every token from L1
+// (4*128*4 = 2 KB at the default Kc=128). Partials are carried as __m256 in
+// memory across K-panels and reduced with a single horizontal sum at the
+// end, same hsum lane order (lane[0]+...+lane[7]) as gemm_q8_0_kblk_avx2;
+// per-element FMA order is c = 0,8,16,... The dequantised weights are
+// bit-identical to the scalar dequantize() in quant.cpp (F16: exact integer
+// half->float with a scalar patch for exp 0/31 lanes; Q4_K: mul+sub, not
+// FMA), so only the dot-product accumulation grouping differs from the plain
+// path (FP reassociation; the plain gemm path is fp32 lanes too, via
+// gemv_avx2, not a double accumulator). Kc is taken from ZEN_CPU_F16_KC /
+// ZEN_CPU_Q4K_KC (64/128/256, default 128). Rows that do not fill a 4-row
+// tile use the plain tail (full-row dequant + dot_f32_avx2).
+namespace {
+inline std::uint16_t read16_local(const std::uint8_t* p) noexcept {
+    return std::uint16_t(p[0]) | (std::uint16_t(p[1]) << 8);
+}
+// Copy of k_scale_min in src/quant.cpp (packed 6-bit scale/min pairs).
+inline void k_scale_min_local(unsigned j, const std::uint8_t* q,
+                              std::uint8_t& scale, std::uint8_t& min) noexcept {
+    if (j < 4) {
+        scale = std::uint8_t(q[j] & 63u);
+        min = std::uint8_t(q[j + 4] & 63u);
+    } else {
+        scale = std::uint8_t((q[j + 4] & 0x0fu) | ((q[j - 4] >> 6) << 4));
+        min = std::uint8_t((q[j + 4] >> 4) | ((q[j] >> 6) << 4));
+    }
+}
+
+// Convert 8 fp16 values to 8 fp32 values. The vector fast path is the
+// integer bit rewrite for normals (sign | (exp+112)<<23 | mant<<13); lanes
+// with exp==0 (zero/subnormal) or exp==31 (inf/nan) are patched with the
+// exact scalar converter, so the result is bit-identical to
+// half_to_float_local for every input.
+inline void f16x8_to_f32(const std::uint8_t* src, float* dst) {
+    const __m128i hv = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src));
+    const __m256i h = _mm256_cvtepu16_epi32(hv);
+    const __m256i sign = _mm256_slli_epi32(_mm256_and_si256(h, _mm256_set1_epi32(0x8000)), 16);
+    const __m256i expv = _mm256_and_si256(_mm256_srli_epi32(h, 10), _mm256_set1_epi32(0x1F));
+    const __m256i mant = _mm256_and_si256(h, _mm256_set1_epi32(0x3FF));
+    const __m256i bits = _mm256_or_si256(sign, _mm256_or_si256(
+        _mm256_slli_epi32(_mm256_add_epi32(expv, _mm256_set1_epi32(112)), 23),
+        _mm256_slli_epi32(mant, 13)));
+    const __m256i is_special = _mm256_or_si256(
+        _mm256_cmpeq_epi32(expv, _mm256_setzero_si256()),
+        _mm256_cmpeq_epi32(expv, _mm256_set1_epi32(31)));
+    if (_mm256_movemask_epi8(is_special) == 0) {
+        _mm256_storeu_ps(dst, _mm256_castsi256_ps(bits));
+        return;
+    }
+    alignas(32) float lanes[8];
+    alignas(32) std::uint32_t hs[8];
+    alignas(32) std::uint32_t ex[8];
+    _mm256_store_ps(lanes, _mm256_castsi256_ps(bits));
+    _mm256_store_si256(reinterpret_cast<__m256i*>(hs), h);
+    _mm256_store_si256(reinterpret_cast<__m256i*>(ex), expv);
+    for (unsigned i = 0; i < 8; ++i)
+        if (ex[i] == 0 || ex[i] == 31)
+            lanes[i] = half_to_float_local(static_cast<std::uint16_t>(hs[i]));
+    _mm256_storeu_ps(dst, _mm256_load_ps(lanes));
+}
+
+inline void dequant_f16_panel(const std::uint8_t* wrow, std::size_t k0,
+                              std::size_t kc, float* dst) {
+    const std::uint8_t* srcp = wrow + k0 * 2;
+    std::size_t i = 0;
+    for (; i + 8 <= kc; i += 8) f16x8_to_f32(srcp + 2 * i, dst + i);
+    for (; i < kc; ++i) dst[i] = half_to_float_local(read16_local(srcp + 2 * i));
+}
+
+// Dequantise one 64-element Q4_K sub-block (32 packed bytes) into 64 floats
+// with two scale/min pairs. Low nibbles fill dst[0..31], high nibbles
+// dst[32..63]. Uses mul+sub (not FMA) so each weight is bit-identical to
+// the scalar dequantize() branch in quant.cpp.
+inline void dequant_q4k_subblock(const std::uint8_t* q,
+                                 float d1, float m1, float d2, float m2,
+                                 float* dst) {
+    const __m256 dv1 = _mm256_set1_ps(d1);
+    const __m256 dv2 = _mm256_set1_ps(d2);
+    const __m256 mv1 = _mm256_set1_ps(m1);
+    const __m256 mv2 = _mm256_set1_ps(m2);
+    const __m256i mask = _mm256_set1_epi32(0xF);
+    for (unsigned chunk = 0; chunk < 4; ++chunk) {
+        const __m128i b8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(q + chunk * 8));
+        const __m256i qu = _mm256_cvtepu8_epi32(b8);
+        const __m256 qf = _mm256_cvtepi32_ps(_mm256_and_si256(qu, mask));
+        const __m256 qh = _mm256_cvtepi32_ps(_mm256_srli_epi32(qu, 4));
+        _mm256_storeu_ps(dst + chunk * 8, _mm256_sub_ps(_mm256_mul_ps(qf, dv1), mv1));
+        _mm256_storeu_ps(dst + 32 + chunk * 8, _mm256_sub_ps(_mm256_mul_ps(qh, dv2), mv2));
+    }
+}
+
+inline void dequant_q4k_panel(const std::uint8_t* wrow, std::size_t k0,
+                              std::size_t kc, float* dst) {
+    std::size_t done = 0;
+    const std::size_t nsub = kc / 64;
+    for (std::size_t s = 0; s < nsub; ++s) {
+        const std::size_t col = k0 + s * 64;
+        const std::uint8_t* block = wrow + (col / 256) * 144;
+        const float d = half_to_float_local(read16_local(block));
+        const float dmin = half_to_float_local(read16_local(block + 2));
+        const std::uint8_t* scales = block + 4;
+        const unsigned within = static_cast<unsigned>((col % 256) / 64);
+        const unsigned is = within * 2;
+        const std::uint8_t* q = block + 16 + within * 32;
+        std::uint8_t sc{}, m{};
+        k_scale_min_local(is + 0, scales, sc, m);
+        const float d1 = d * float(sc), m1 = dmin * float(m);
+        k_scale_min_local(is + 1, scales, sc, m);
+        const float d2 = d * float(sc), m2 = dmin * float(m);
+        dequant_q4k_subblock(q, d1, m1, d2, m2, dst + s * 64);
+        done += 64;
+    }
+    // Defensive scalar tail (unreachable when columns%256==0 and Kc is a
+    // divisor of 256, but kept exact for odd shapes).
+    for (std::size_t i = done; i < kc; ++i) {
+        const std::size_t col = k0 + i;
+        const std::uint8_t* block = wrow + (col / 256) * 144;
+        const float d = half_to_float_local(read16_local(block));
+        const float dmin = half_to_float_local(read16_local(block + 2));
+        const std::uint8_t* scales = block + 4;
+        const unsigned within = static_cast<unsigned>((col % 256) / 64);
+        const unsigned is = within * 2, e = static_cast<unsigned>(col % 64);
+        std::uint8_t sc{}, m{};
+        k_scale_min_local(is + (e >= 32 ? 1 : 0), scales, sc, m);
+        const float ds = d * float(sc), ms = dmin * float(m);
+        const std::uint8_t byte = block[16 + within * 32 + (e % 32)];
+        const float qf = float(e < 32 ? (byte & 15u) : (byte >> 4));
+        dst[i] = ds * qf - ms;
+    }
+}
+
+using DequantPanelFn = void (*)(const std::uint8_t*, std::size_t, std::size_t, float*);
+
+bool gemm_kblk_impl(const std::uint8_t* weights, const float* input, float* output,
+                   std::size_t tokens, std::size_t rows, std::size_t columns,
+                   std::size_t output_row_stride, std::size_t row_bytes,
+                   std::size_t kKc, DequantPanelFn dequant_panel) {
+    constexpr std::size_t kMR = 4, kNR = 2;
+    if (!weights || !input || !output || !tokens || !rows || !columns) return false;
+    const std::size_t rows_main = (rows / kMR) * kMR;
+    std::vector<__m256> partial(std::size_t(tokens) * kMR);
+    std::vector<float> wpanel(std::size_t(kMR) * kKc);
+    alignas(32) float lane[8];
+    for (std::size_t r0 = 0; r0 < rows_main; r0 += kMR) {
+        for (auto& p : partial) p = _mm256_setzero_ps();
+        for (std::size_t k0 = 0; k0 < columns; k0 += kKc) {
+            const std::size_t kc = std::size_t((kKc < columns - k0) ? kKc : (columns - k0));
+            for (std::size_t dr = 0; dr < kMR; ++dr)
+                dequant_panel(weights + (r0 + dr) * row_bytes, k0, kc, wpanel.data() + dr * kKc);
+            for (std::size_t t = 0; t < tokens; t += kNR) {
+                const float* in0 = input + t * columns + k0;
+                __m256* base = &partial[t * kMR];
+                if (t + 1 < tokens) {
+                    const float* in1 = input + (t + 1) * columns + k0;
+                    __m256* base1 = &partial[(t + 1) * kMR];
+                    __m256 b0t = base[0], b1t = base[1], b2t = base[2], b3t = base[3];
+                    __m256 b0u = base1[0], b1u = base1[1], b2u = base1[2], b3u = base1[3];
+                    const float* w = wpanel.data();
+                    for (std::size_t s = 0; s < kc; s += 8) {
+                        const __m256 x0 = _mm256_loadu_ps(in0 + s);
+                        const __m256 x1 = _mm256_loadu_ps(in1 + s);
+                        const __m256 v0 = _mm256_loadu_ps(w + 0 * kKc + s);
+                        const __m256 v1 = _mm256_loadu_ps(w + 1 * kKc + s);
+                        const __m256 v2 = _mm256_loadu_ps(w + 2 * kKc + s);
+                        const __m256 v3 = _mm256_loadu_ps(w + 3 * kKc + s);
+                        b0t = _mm256_fmadd_ps(v0, x0, b0t); b0u = _mm256_fmadd_ps(v0, x1, b0u);
+                        b1t = _mm256_fmadd_ps(v1, x0, b1t); b1u = _mm256_fmadd_ps(v1, x1, b1u);
+                        b2t = _mm256_fmadd_ps(v2, x0, b2t); b2u = _mm256_fmadd_ps(v2, x1, b2u);
+                        b3t = _mm256_fmadd_ps(v3, x0, b3t); b3u = _mm256_fmadd_ps(v3, x1, b3u);
+                    }
+                    base[0] = b0t; base[1] = b1t; base[2] = b2t; base[3] = b3t;
+                    base1[0] = b0u; base1[1] = b1u; base1[2] = b2u; base1[3] = b3u;
+                } else {
+                    __m256 b0 = base[0], b1 = base[1], b2 = base[2], b3 = base[3];
+                    const float* w = wpanel.data();
+                    for (std::size_t s = 0; s < kc; s += 8) {
+                        const __m256 x0 = _mm256_loadu_ps(in0 + s);
+                        const __m256 v0 = _mm256_loadu_ps(w + 0 * kKc + s);
+                        const __m256 v1 = _mm256_loadu_ps(w + 1 * kKc + s);
+                        const __m256 v2 = _mm256_loadu_ps(w + 2 * kKc + s);
+                        const __m256 v3 = _mm256_loadu_ps(w + 3 * kKc + s);
+                        b0 = _mm256_fmadd_ps(v0, x0, b0);
+                        b1 = _mm256_fmadd_ps(v1, x0, b1);
+                        b2 = _mm256_fmadd_ps(v2, x0, b2);
+                        b3 = _mm256_fmadd_ps(v3, x0, b3);
+                    }
+                    base[0] = b0; base[1] = b1; base[2] = b2; base[3] = b3;
+                }
+            }
+        }
+        for (std::size_t t = 0; t < tokens; ++t) {
+            const __m256* prow = &partial[t * kMR];
+            for (std::size_t dr = 0; dr < kMR; ++dr) {
+                _mm256_store_ps(lane, prow[dr]);
+                output[t * output_row_stride + r0 + dr] =
+                    lane[0] + lane[1] + lane[2] + lane[3] + lane[4] + lane[5] + lane[6] + lane[7];
+            }
+        }
+    }
+    if (rows > rows_main) {
+        std::vector<float> brow(columns);
+        for (std::size_t r = rows_main; r < rows; ++r) {
+            dequant_panel(weights + r * row_bytes, 0, columns, brow.data());
+            for (std::size_t t = 0; t < tokens; ++t)
+                output[t * output_row_stride + r] = dot_f32_avx2(brow.data(), input + t * columns, columns);
+        }
+    }
+    return true;
+}
+}  // namespace
+
+bool gemm_f16_kblk_avx2(const std::uint8_t* weights, const float* input, float* output,
+                        std::size_t tokens, std::size_t rows, std::size_t columns,
+                        std::size_t output_row_stride) {
+    if (!weights || !input || !output || !tokens || !rows || !columns) return false;
+    if (columns % 32) return false;
+    static const std::size_t kKc = []() {
+        const char* e = std::getenv("ZEN_CPU_F16_KC");
+        if (e) {
+            const long v = std::atol(e);
+            if (v == 64 || v == 128 || v == 256) return static_cast<std::size_t>(v);
+        }
+        return static_cast<std::size_t>(128);
+    }();
+    return gemm_kblk_impl(weights, input, output, tokens, rows, columns,
+                         output_row_stride, columns * 2, kKc, &dequant_f16_panel);
+}
+
+bool gemm_q4k_kblk_avx2(const std::uint8_t* weights, const float* input, float* output,
+                        std::size_t tokens, std::size_t rows, std::size_t columns,
+                        std::size_t output_row_stride) {
+    if (!weights || !input || !output || !tokens || !rows || !columns) return false;
+    if (columns % 256) return false;
+    static const std::size_t kKc = []() {
+        const char* e = std::getenv("ZEN_CPU_Q4K_KC");
+        if (e) {
+            const long v = std::atol(e);
+            if (v == 64 || v == 128 || v == 256) return static_cast<std::size_t>(v);
+        }
+        return static_cast<std::size_t>(128);
+    }();
+    return gemm_kblk_impl(weights, input, output, tokens, rows, columns,
+                         output_row_stride, (columns / 256) * 144, kKc, &dequant_q4k_panel);
+}
+}  // namespace zen

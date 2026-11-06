@@ -12,6 +12,9 @@
 #include "iq_tables.h"
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <thread>
 #include <atomic>
 #include <cmath>
@@ -867,6 +870,110 @@ bool gemv(const Format& f,const std::uint8_t*w,const float*x,float*y,
     zen::ComputePool::instance().parallel_for(rows,count,work);
     return ok.load();
 }
+// ---------------------------------------------------------------------------
+// Sequential K-block repack (Q8_0, candidate (a)). Env gates, panel-major
+// layout, registry and row-parallel repacked dispatch live outside the
+// AVX2 guard so they link in every build; the repacked kernel itself is
+// AVX2-only and the parallel wrapper returns false without it (callers
+// then fall back to the raw path). Layout constants (Kc=512, RB=64) are
+// pinned and shared with kernels/avx2.cpp gemm_q8_0_kblk_repack_avx2 and
+// the repack builder below, so a buffer built at load always matches the
+// kernel that reads it regardless of ZEN_CPU_Q8_KC/RB sweeps of the raw
+// K-blocked kernel.
+bool q8_kblk_enabled() noexcept {
+    static const bool v=[](){
+        const char* e=std::getenv("ZEN_CPU_Q8_KBLK");
+        return (e&&e[0]=='1');
+    }();
+    return v;
+}
+bool q8_repack_enabled() noexcept {
+    static const bool v=[](){
+        const char* e=std::getenv("ZEN_CPU_Q8_REPACK_KBLK");
+        return (e&&e[0]=='1');
+    }();
+    return v;
+}
+bool q8_use_kblk(std::size_t tokens,std::size_t cols) noexcept {
+    if(!q8_kblk_enabled())return false;
+    if(tokens>std::numeric_limits<std::size_t>::max()/cols)return true;
+    return (tokens*cols)>=131072;
+}
+namespace {
+constexpr std::size_t kRepackKc=512, kRepackRB=64;
+constexpr std::size_t kRepackBlocksPerPanel=kRepackKc/32; // 16
+constexpr std::size_t kRepackPanelBytes=kRepackBlocksPerPanel*34; // 544
+} // namespace
+std::size_t repacked_q8_0_kblk_bytes(std::size_t rows,std::size_t columns) noexcept {
+    if(!rows||!columns||columns%32)return 0;
+    const std::size_t blocks_per_row=columns/32;
+    const std::size_t n_kpanels=(blocks_per_row+kRepackBlocksPerPanel-1)/kRepackBlocksPerPanel;
+    if(n_kpanels>std::numeric_limits<std::size_t>::max()/kRepackRB/kRepackBlocksPerPanel)return 0;
+    const std::size_t num_rblocks=(rows+kRepackRB-1)/kRepackRB;
+    if(num_rblocks>std::numeric_limits<std::size_t>::max()/n_kpanels/kRepackRB/kRepackBlocksPerPanel)return 0;
+    const std::size_t total_blocks=num_rblocks*n_kpanels*kRepackRB*kRepackBlocksPerPanel;
+    if(total_blocks>std::numeric_limits<std::size_t>::max()/34)return 0;
+    return total_blocks*34;
+}
+std::vector<std::uint8_t> repack_q8_0_kblk(const std::uint8_t* weights,
+                                            std::size_t rows, std::size_t columns) {
+    std::vector<std::uint8_t> out;
+    if(!weights||!rows||!columns||columns%32)return out;
+    const std::size_t bytes=repacked_q8_0_kblk_bytes(rows,columns);
+    if(!bytes)return out;
+    out.assign(bytes,0);
+    const std::size_t blocks_per_row=columns/32;
+    const std::size_t n_kpanels=(blocks_per_row+kRepackBlocksPerPanel-1)/kRepackBlocksPerPanel;
+    const std::size_t row_bytes=blocks_per_row*34;
+    for(std::size_t r=0;r<rows;++r){
+        const std::size_t rblock=r/kRepackRB;
+        const std::size_t row_in=r%kRepackRB;
+        const std::uint8_t* src_row=weights+r*row_bytes;
+        for(std::size_t cblk=0;cblk<blocks_per_row;++cblk){
+            const std::size_t kpanel=cblk/kRepackBlocksPerPanel;
+            const std::size_t blk_in=cblk%kRepackBlocksPerPanel;
+            const std::size_t dst_block=((rblock*n_kpanels+kpanel)*kRepackRB+row_in)*kRepackBlocksPerPanel+blk_in;
+            std::memcpy(out.data()+dst_block*34,src_row+cblk*34,34);
+        }
+    }
+    return out;
+}
+namespace {
+struct RepackEntry {
+    std::shared_ptr<std::vector<std::uint8_t>> buf;
+    std::size_t rows=0, cols=0;
+};
+std::mutex g_repack_mutex;
+std::unordered_map<const std::uint8_t*,RepackEntry> g_repack_registry;
+} // namespace
+void register_q8_repack(const std::uint8_t* raw, std::size_t rows, std::size_t cols,
+                        std::vector<std::uint8_t> packed) {
+    if(!raw||!rows||!cols||packed.empty())return;
+    auto entry=std::make_shared<std::vector<std::uint8_t>>(std::move(packed));
+    std::lock_guard<std::mutex> lock(g_repack_mutex);
+    g_repack_registry[raw]=RepackEntry{std::move(entry),rows,cols};
+}
+bool gemm_q8_0_kblk_repack_parallel(const std::uint8_t* repacked, const float* input,
+                                    float* output, std::size_t tokens, std::size_t rows,
+                                    std::size_t cols, unsigned requested_workers) {
+    if(!repacked||!input||!output||!tokens||!rows||!cols||cols%32)return false;
+#ifdef ZEN_HAS_AVX2_KERNELS
+    if(!zen::cpu_has_avx2_fma())return false;
+    zen::ResourceGovernor governor;
+    const unsigned workers=requested_workers?requested_workers:governor.current_policy().worker_threads;
+    const unsigned count=(rows>=32&&workers>1)?std::min<unsigned>(workers,static_cast<unsigned>(rows)):1;
+    if(count<=1)return zen::gemm_q8_0_kblk_repack_avx2(repacked,0,input,output,tokens,rows,cols,rows);
+    std::atomic<bool> success{true};
+    zen::ComputePool::instance().parallel_for(rows,count,[&](std::size_t first,std::size_t last){
+        if(!zen::gemm_q8_0_kblk_repack_avx2(repacked,first,input,output+first,tokens,last-first,cols,rows))
+            success.store(false,std::memory_order_relaxed);
+    });
+    return success.load();
+#else
+    (void)requested_workers;
+    return false;
+#endif
+}
 #ifdef ZEN_HAS_AVX2_KERNELS
 // Priority 1: K-blocked Q8_0 GEMM switch (opt-in, default off).
 // ZEN_CPU_Q8_KBLK=1 enables the K-blocked kernel; any other value
@@ -892,17 +999,27 @@ bool gemv(const Format& f,const std::uint8_t*w,const float*x,float*y,
 // weights are resident (e.g. repeated same-shape GEMMs) without
 // regressing end-to-end prefill. A sequential weight-packing variant is
 // the follow-up if this is revisited.
-static bool q8_kblk_enabled() {
-    static const bool v=[](){
-        const char* e=std::getenv("ZEN_CPU_Q8_KBLK");
-        return (e&&e[0]=='1');
-    }();
-    return v;
-}
-static bool q8_use_kblk(std::size_t tokens,std::size_t cols) {
-    if(!q8_kblk_enabled())return false;
-    return (tokens*cols)>=131072;
-}
+// Software-prefetch follow-up (tried, did not recover): gemm_q8_0_kblk_avx2
+// now issues _mm_prefetch for the next row-tile's weight panel while the
+// current tile's token FMAs run (one site, kernels/avx2.cpp). Interleaved
+// model A/B (Llama-3.2-1B, RMS AVX2 on in both arms, best-of runs):
+// T=128 legacy 620 ms/207 tok/s vs KBLK+prefetch 662 ms/193 tok/s;
+// T=171 legacy 840 ms/203 tok/s vs KBLK+prefetch 897 ms/191 tok/s --
+// i.e. KBLK still ~7% slower than legacy end-to-end (micro stays a win:
+// down T=171 10.6 ms vs legacy 11.6 ms, bit-identical). The prefetch
+// distance is one full row-tile of token compute, during which the
+// [tokens, Kc] activation panel (256 KiB at T=128) streams through L2
+// and evicts the prefetched weight lines, so the lines are re-fetched
+// on demand from RAM anyway. Root cause remains the strided weight
+// pattern: consecutive row panels are row_bytes apart (8.7 KiB at
+// K=8192) vs legacy sequential rows, and only a sequential packing
+// (or a short-distance prefetch inside the dequant loop itself) fixes
+// that. KBLK therefore stays opt-in (default off); the prefetch is kept
+// inside the opt-in kernel only, where it is ~neutral on resident
+// weights, and is not a reason to enable KBLK by default.
+// (duplicate static q8_kblk_enabled/q8_use_kblk removed: the header declares
+// these as zen::quant::q8_kblk_enabled/q8_use_kblk noexcept and the correct
+// definitions live near line 883; the static copies here caused C2382.)
 // ZI-P5: route batched Q8_0 prefill through the register-blocked GEMM kernel
 // (one weight vector feeds eight token accumulators) over a row-parallel split.
 static bool gemm_q8_0_parallel(const std::uint8_t* w,const float* input,float* output,
@@ -924,6 +1041,40 @@ static bool gemm_q8_0_parallel(const std::uint8_t* w,const float* input,float* o
     std::atomic<bool> success{true};
     zen::ComputePool::instance().parallel_for(rows,count,[&](std::size_t first,std::size_t last){
         if(!zen::gemm_q8_0_avx2(w+first*rb,input,output+first,tokens,last-first,cols,rows))
+            success.store(false,std::memory_order_relaxed);
+    });
+    return success.load();
+}
+// Non-Q8 K-blocked batched GEMM (opt-in, default off). Same row-parallel
+// shape as the Q8 path; counted under cpu_avx2 because cpu_kblk tracks the
+// Q8 K-blocked kernel specifically (see RouteCounters). ZEN_CPU_FAST_F16=1
+// enables F16, ZEN_CPU_FAST_Q4K=1 enables Q4_K; Q6_K/IQ stay on the generic
+// path below.
+static bool f16_fast_enabled() {
+    static const bool v=[](){
+        const char* e=std::getenv("ZEN_CPU_FAST_F16");
+        return (e&&e[0]=='1');
+    }();
+    return v;
+}
+static bool q4k_fast_enabled() {
+    static const bool v=[](){
+        const char* e=std::getenv("ZEN_CPU_FAST_Q4K");
+        return (e&&e[0]=='1');
+    }();
+    return v;
+}
+static bool gemm_fast_parallel(bool (*fn)(const std::uint8_t*,const float*,float*,std::size_t,std::size_t,std::size_t,std::size_t),
+                               const std::uint8_t* w,const float* input,float* output,
+                               std::size_t tokens,std::size_t rows,std::size_t cols,
+                               std::size_t rb,unsigned requested_workers){
+    zen::ResourceGovernor governor;
+    const unsigned workers=requested_workers?requested_workers:governor.current_policy().worker_threads;
+    const unsigned count=(rows>=32&&workers>1)?std::min<unsigned>(workers,static_cast<unsigned>(rows)):1;
+    if(count<=1)return fn(w,input,output,tokens,rows,cols,rows);
+    std::atomic<bool> success{true};
+    zen::ComputePool::instance().parallel_for(rows,count,[&](std::size_t first,std::size_t last){
+        if(!fn(w+first*rb,input,output+first,tokens,last-first,cols,rows))
             success.store(false,std::memory_order_relaxed);
     });
     return success.load();
@@ -959,6 +1110,57 @@ bool gemv_batch(const Format& format,const std::uint8_t* const* weights,const fl
 #endif
     for(std::size_t i=0;i<count;++i)
         if(!gemv(format,weights[i],input,outputs[i],rows[i],columns,scale,workers))return false;
+    return true;
+}
+// ZEN_D3D12_BATCH=1 opts in to the batched prefill GEMM submission. The single
+// gemm path is the parity default, and the batch path is only bit-identical
+// when the same fp32 kernels run: the batch backend has no DP4A variant, so
+// with ZEN_D3D12_DP4A=1 the batch attempt is skipped and the caller falls
+// back to the single path (which does honour DP4A). V2/V3 tiling is shared
+// between the single and batch paths, so those gates remain bit-identical.
+static bool d3d12_batch_enabled() {
+    static const bool v=[](){
+        const char* e=std::getenv("ZEN_D3D12_BATCH");
+        return (e&&e[0]=='1');
+    }();
+    return v;
+}
+static bool dp4a_enabled_for_batch() {
+    const char* e=std::getenv("ZEN_D3D12_DP4A");
+    return (e&&e[0]=='1');
+}
+bool gemm_batch(const Format& format,const std::uint8_t* const* weights,const float* input,
+                float* const* outputs,const std::size_t* rows,std::size_t tokens,
+                std::size_t columns,std::size_t count,float scale,unsigned workers){
+    zen::diag::Scope trace("quant.gemm_batch",zen::diag::Phase::compute);
+    zen::diag::breadcrumb(301,static_cast<std::int64_t>(tokens*columns),static_cast<std::int64_t>(count));
+    if(!weights||!input||!outputs||!rows||!count||!tokens||!columns)return false;
+    #ifdef ZEN_HAS_D3D12
+    if(d3d12_batch_enabled()&&!dp4a_enabled_for_batch()&&
+       format.encoding==Encoding::q8_0&&scale==1.0f&&count>1&&count<=zen::d3d12::kMaxBatch&&
+       zen::d3d12::enabled()){
+        zen::d3d12::GemmTask tasks[zen::d3d12::kMaxBatch];
+        bool ready=true;
+        for(std::size_t i=0;i<count;++i){
+            if(!weights[i]||!outputs[i]||!rows[i]){ready=false;break;}
+            tasks[i]={weights[i],outputs[i],rows[i]};
+        }
+        if(ready){
+            g_gemm_routes.gpu_try.fetch_add(count,std::memory_order_relaxed);
+            if(zen::d3d12::gemm_q8_0_batch(input,tasks,count,tokens,columns)){
+                g_gemm_routes.gpu_ok.fetch_add(count,std::memory_order_relaxed);
+                return true;
+            }
+        }
+    }
+    #endif
+    // No GPU batch (gate off, HIP-only build, non-Q8_0, DP4A, or backend
+    // declined): run the ordinary single-gemm path, which itself tries the
+    // GPU single submission and then the AVX2/generic CPU kernels. Same
+    // kernels, only the wrapper differs, so results are unchanged.
+    (void)workers;
+    for(std::size_t i=0;i<count;++i)
+        if(!gemm(format,weights[i],input,outputs[i],tokens,rows[i],columns,scale,workers))return false;
     return true;
 }
 bool ffn_gemv(const Format& gate_format,const std::uint8_t* gate_weights,
@@ -1039,9 +1241,41 @@ bool gemm(const Format& f,const std::uint8_t*w,const float*input,float*output,
 #endif
 #ifdef ZEN_HAS_AVX2_KERNELS
     if(f.encoding==Encoding::q8_0&&scale==1.0f&&tokens>=2&&zen::cpu_has_avx2_fma()){
+        // Sequential repack: when ZEN_CPU_Q8_REPACK_KBLK=1 and the K-block
+        // threshold is met, a load-time repack registered for this raw
+        // pointer takes the K-blocked GEMM instead of the strided raw one.
+        // GPU paths above are tried first, so a repacked CPU buffer can
+        // never preempt a working GPU dispatch.
+        if(q8_repack_enabled()&&q8_use_kblk(tokens,cols)){
+            std::shared_ptr<std::vector<std::uint8_t>> rp;
+            {
+                std::lock_guard<std::mutex> lock(g_repack_mutex);
+                auto it=g_repack_registry.find(w);
+                if(it!=g_repack_registry.end()&&it->second.rows==rows&&it->second.cols==cols)
+                    rp=it->second.buf;
+            }
+            if(rp&&!rp->empty()){
+                g_gemm_routes.cpu_kblk.fetch_add(1,std::memory_order_relaxed);
+                if(gemm_q8_0_kblk_repack_parallel(rp->data(),input,output,tokens,rows,cols,requested_workers))
+                    return true;
+            }
+        }
         if(q8_use_kblk(tokens,cols)) g_gemm_routes.cpu_kblk.fetch_add(1,std::memory_order_relaxed);
         else g_gemm_routes.cpu_avx2.fetch_add(1,std::memory_order_relaxed);
         if(gemm_q8_0_parallel(w,input,output,tokens,rows,cols,rb,requested_workers))return true;
+    }
+    // Non-Q8 fast path (F16 first, then Q4_K). Env-gated, default off;
+    // falls back to the generic path below whenever the gate, the shape,
+    // or the kernel itself fails. Q6_K/IQ deliberately have no gate here.
+    if(tokens>=2&&zen::cpu_has_avx2_fma()&&cols%32==0){
+        if(f.encoding==Encoding::fp16&&f16_fast_enabled()){
+            g_gemm_routes.cpu_avx2.fetch_add(1,std::memory_order_relaxed);
+            if(gemm_fast_parallel(zen::gemm_f16_kblk_avx2,w,input,output,tokens,rows,cols,rb,requested_workers))return true;
+        }
+        if(f.encoding==Encoding::q4_k&&q4k_fast_enabled()&&cols%256==0){
+            g_gemm_routes.cpu_avx2.fetch_add(1,std::memory_order_relaxed);
+            if(gemm_fast_parallel(zen::gemm_q4k_kblk_avx2,w,input,output,tokens,rows,cols,rb,requested_workers))return true;
+        }
     }
 #endif
     g_gemm_routes.cpu_plain.fetch_add(1,std::memory_order_relaxed);
