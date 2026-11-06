@@ -398,3 +398,96 @@ Sequence 1→2→3 are independent and low-risk. Evidence: `tmp_perfA_trace2.txt
 ### ACTIONS
 - [x] Land batch wiring default-off; keep gate off until perf accepted (this run shows +5-10% prefill, 48 fewer submits, no numerics change)
 - [ ] Next levers for prefill (rope 27-36 ms and silu 9-13 ms are now 17% and 6%; GEMM still 57% - kernel TFLOP/s, split-K for 2048-row, and KV/flash submits remain 32/prefill) - not more orchestration.
+
+
+## [RUN-011] 2026-11-06 — RMS AVX2 default-ON correctness vs scalar reference
+
+### QUESTION
+User review: "RMS AVX2 default-ON changes the accumulation from double to float. Confirm greedy output against the scalar reference on at least two models, or document the drift."
+
+### CODE FACT (no code change)
+`kernels/avx2.cpp:rms_norm_avx2` accumulates `ss` in `__m256d` (double) lanes (`s0..s3`), combines once, then tails in double; `inv = 1.0f/sqrt(float(ss/n)+eps)` exactly as scalar. So accumulation is NOT float — it stays double. The only difference vs `dense_transformer_runtime.cpp:rms_norm` scalar loop is associativity of the double partial sums (4 parallel 4-wide chunks + 4-lane horizontal vs strictly sequential). The predicted drift is <= ~1 ulp of float on `y` (documented in the kernel comment), not an accumulation-precision change.
+
+### METHOD
+- CPU path only (ZEN_BACKEND unset; ZEN_D3D12 unset). ZEN_CPU_RMS_AVX2=0 (scalar) vs =1 (AVX2 default), same model/prompt/greedy.
+- Tool: `zen_generate_ids` (greedy generated_ids, 32 new tokens) and `zen_decode_parity_dump` (last_logits max_abs over full vocab).
+- Prompt: "The quick brown fox" (text) for generated_ids; ids [12805,5304,264] for logits dump (max_new=8).
+
+### EVIDENCE
+| Model | Arch | Prompt | max_new | generated_ids RMS=0 vs 1 | last_logits max_abs_diff | Match |
+|---|---|---|---|---|---|---|
+| Llama-3.2-1B-Instruct-Q8_0 (H:/OLLAMA-Models/GGUF) | llama | "The quick brown fox" | 32 | identical (32 ids) | 0.0 (vocab 128256) | yes |
+| Qwen3-4B-Q8_0 (G:/More-models) | qwen3 | "The quick brown fox" | 32 | identical (32 ids) | 0.0 (vocab 151936) | yes |
+| Qwen2.5-Coder-7B-Instruct-Q5_K_M (G:/More-models) | qwen2 | "The quick brown fox" | 32 | identical (32 ids) | 0.0 (vocab 152064) | yes |
+
+Additional: `tools/rms_bench` (pseudo-random rows, hidden 64/2048/8192, T up to 1024) reports maxerr 0.0 PASS at 1e-5 tolerance; speedup 2.5-4.8x.
+
+### FINDINGS
+- Greedy generated_ids are byte-identical across 32 tokens on 3 models spanning llama/qwen2/qwen3, at T up to 32 (8..32 covered).
+- last_logits max_abs_diff = 0.0 on all three (full vocab), i.e. no measurable drift in end-to-end logits despite the associativity difference.
+- The predicted <=1-ulp float drift does not materialise as a distinct float value in these runs; rounding lands on the same float.
+
+### RECOMMENDATION
+Keep ZEN_CPU_RMS_AVX2 default ON. No tolerance gate or kill-switch change needed. The user's premise that the AVX2 path "changes accumulation from double to float" is incorrect: it accumulates in double (`__m256d`), and the only difference is lane-order of the double sum, which measured 0.0 max_abs on real models. If a future model/activation distribution ever shows nonzero drift, it is bounded to ~1 ulp float on `y` and is already inside `core_tests` tolerance; gate by `ZEN_CPU_RMS_AVX2=0` only if bit-exact reproducibility is required.
+
+
+## [RUN-011] 2026-11-06 — RMS AVX2 default-ON correctness vs scalar reference
+
+### QUESTION
+User review: "RMS AVX2 default-ON changes the accumulation from double to float. Confirm greedy output against the scalar reference on at least two models, or document the drift."
+
+### CODE FACT (no code change)
+`kernels/avx2.cpp:rms_norm_avx2` accumulates `ss` in `__m256d` (double) lanes (`s0..s3`), combines once, then tails in double; `inv = 1.0f/sqrt(float(ss/n)+eps)` exactly as scalar. So accumulation is NOT float — it stays double. The only difference vs `dense_transformer_runtime.cpp:rms_norm` scalar loop is associativity of the double partial sums (4 parallel 4-wide chunks + 4-lane horizontal vs strictly sequential). The predicted drift is <= ~1 ulp of float on `y` (documented in the kernel comment), not an accumulation-precision change.
+
+### METHOD
+- CPU path only (ZEN_BACKEND unset; ZEN_D3D12 unset). ZEN_CPU_RMS_AVX2=0 (scalar) vs =1 (AVX2 default), same model/prompt/greedy.
+- Tool: `zen_generate_ids` (greedy generated_ids, 32 new tokens) and `zen_decode_parity_dump` (last_logits max_abs over full vocab).
+- Prompt: "The quick brown fox" (text) for generated_ids; ids [12805,5304,264] for logits dump (max_new=8).
+
+### EVIDENCE
+| Model | Arch | Prompt | max_new | generated_ids RMS=0 vs 1 | last_logits max_abs_diff | Match |
+|---|---|---|---|---|---|---|
+| Llama-3.2-1B-Instruct-Q8_0 (H:/OLLAMA-Models/GGUF) | llama | "The quick brown fox" | 32 | identical (32 ids) | 0.0 (vocab 128256) | yes |
+| Qwen3-4B-Q8_0 (G:/More-models) | qwen3 | "The quick brown fox" | 32 | identical (32 ids) | 0.0 (vocab 151936) | yes |
+| Qwen2.5-Coder-7B-Instruct-Q5_K_M (G:/More-models) | qwen2 | "The quick brown fox" | 32 | identical (32 ids) | 0.0 (vocab 152064) | yes |
+
+Additional: `tools/rms_bench` (pseudo-random rows, hidden 64/2048/8192, T up to 1024) reports maxerr 0.0 PASS at 1e-5 tolerance; speedup 2.5-4.8x.
+
+### FINDINGS
+- Greedy generated_ids are byte-identical across 32 tokens on 3 models spanning llama/qwen2/qwen3, at T up to 32 (8..32 covered).
+- last_logits max_abs_diff = 0.0 on all three (full vocab), i.e. no measurable drift in end-to-end logits despite the associativity difference.
+- The predicted <=1-ulp float drift does not materialise as a distinct float value in these runs; rounding lands on the same float.
+
+### RECOMMENDATION
+Keep ZEN_CPU_RMS_AVX2 default ON. No tolerance gate or kill-switch change needed. The user's premise that the AVX2 path "changes accumulation from double to float" is incorrect: it accumulates in double (`__m256d`), and the only difference is lane-order of the double sum, which measured 0.0 max_abs on real models. If a future model/activation distribution ever shows nonzero drift, it is bounded to ~1 ulp float on `y` and is already inside `core_tests` tolerance; gate by `ZEN_CPU_RMS_AVX2=0` only if bit-exact reproducibility is required.
+
+
+## [RUN-011] 2026-11-06 — RMS AVX2 default-ON correctness vs scalar reference
+
+### QUESTION
+User review: "RMS AVX2 default-ON changes the accumulation from double to float. Confirm greedy output against the scalar reference on at least two models, or document the drift."
+
+### CODE FACT (no code change)
+`kernels/avx2.cpp:rms_norm_avx2` accumulates `ss` in `__m256d` (double) lanes (`s0..s3`), combines once, then tails in double; `inv = 1.0f/sqrt(float(ss/n)+eps)` exactly as scalar. So accumulation is NOT float — it stays double. The only difference vs `dense_transformer_runtime.cpp:rms_norm` scalar loop is associativity of the double partial sums (4 parallel 4-wide chunks + 4-lane horizontal vs strictly sequential). The predicted drift is <= ~1 ulp of float on `y` (documented in the kernel comment), not an accumulation-precision change.
+
+### METHOD
+- CPU path only (ZEN_BACKEND unset; ZEN_D3D12 unset). ZEN_CPU_RMS_AVX2=0 (scalar) vs =1 (AVX2 default), same model/prompt/greedy.
+- Tool: `zen_generate_ids` (greedy generated_ids, 32 new tokens) and `zen_decode_parity_dump` (last_logits max_abs over full vocab).
+- Prompt: "The quick brown fox" (text) for generated_ids; ids [12805,5304,264] for logits dump (max_new=8).
+
+### EVIDENCE
+| Model | Arch | Prompt | max_new | generated_ids RMS=0 vs 1 | last_logits max_abs_diff | Match |
+|---|---|---|---|---|---|---|
+| Llama-3.2-1B-Instruct-Q8_0 (H:/OLLAMA-Models/GGUF) | llama | "The quick brown fox" | 32 | identical (32 ids) | 0.0 (vocab 128256) | yes |
+| Qwen3-4B-Q8_0 (G:/More-models) | qwen3 | "The quick brown fox" | 32 | identical (32 ids) | 0.0 (vocab 151936) | yes |
+| Qwen2.5-Coder-7B-Instruct-Q5_K_M (G:/More-models) | qwen2 | "The quick brown fox" | 32 | identical (32 ids) | 0.0 (vocab 152064) | yes |
+
+Additional: `tools/rms_bench` (pseudo-random rows, hidden 64/2048/8192, T up to 1024) reports maxerr 0.0 PASS at 1e-5 tolerance; speedup 2.5-4.8x.
+
+### FINDINGS
+- Greedy generated_ids are byte-identical across 32 tokens on 3 models spanning llama/qwen2/qwen3, at T up to 32 (8..32 covered).
+- last_logits max_abs_diff = 0.0 on all three (full vocab), i.e. no measurable drift in end-to-end logits despite the associativity difference.
+- The predicted <=1-ulp float drift does not materialise as a distinct float value in these runs; rounding lands on the same float.
+
+### RECOMMENDATION
+Keep ZEN_CPU_RMS_AVX2 default ON. No tolerance gate or kill-switch change needed. The user's premise that the AVX2 path "changes accumulation from double to float" is incorrect: it accumulates in double (`__m256d`), and the only difference is lane-order of the double sum, which measured 0.0 max_abs on real models. If a future model/activation distribution ever shows nonzero drift, it is bounded to ~1 ulp float on `y` and is already inside `core_tests` tolerance; gate by `ZEN_CPU_RMS_AVX2=0` only if bit-exact reproducibility is required.

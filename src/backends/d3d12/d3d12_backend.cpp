@@ -35,6 +35,9 @@
 #include "q8_0_gemm_cso.h"
 #include "q8_0_gemm_v2_cso.h"
 #include "q8_0_gemm_v3_cso.h"
+#include "q8_0_gemm_fused_cso.h"
+#include "q8_0_gemm_rt_cso.h"
+#include "q8_0_gemm_fused_cso.h"
 #include "q8_0_gemm_dp4a_cso.h"
 #include "q8_0_gemv_dp4a_cso.h"
 #include "quantize_acts_cso.h"
@@ -355,6 +358,8 @@ struct State {
     ComPtr<ID3D12PipelineState> pso_gemm;
     ComPtr<ID3D12PipelineState> pso_gemm_v2;
     ComPtr<ID3D12PipelineState> pso_gemm_v3;
+    ComPtr<ID3D12PipelineState> pso_gemm_rt;
+    ComPtr<ID3D12PipelineState> pso_gemm_fused;
     ComPtr<ID3D12PipelineState> pso_gemm_dp4a;
 
     // Per-token activation scales for the DP4A GEMM, one float each.
@@ -694,6 +699,15 @@ bool gemm_v2_enabled() {
 // because it changes the arithmetic.
 bool gemm_v3_enabled() {
     const char* e = std::getenv("ZEN_D3D12_GEMM_V3");
+    return e && e[0] == '1';
+}
+
+bool gemm_rt_enabled() {
+    const char* e = std::getenv("ZEN_D3D12_GEMM_RT");
+    return e && e[0] == '1';
+}
+bool gemm_fused_enabled() {
+    const char* e = std::getenv("ZEN_D3D12_GEMM_FUSED");
     return e && e[0] == '1';
 }
 
@@ -1327,6 +1341,8 @@ bool init_locked(State& s) {
     // GEMM v3 (verify tile BLOCK_T=8, bit-identical): optional,
     // selected by ZEN_D3D12_GEMM_V3=1; v1 stays the default until validated.
     s.pso_gemm_v3 = build_pso(s, zen_dx12_shaders::kQ8_0GemmV3Cso, zen_dx12_shaders::kQ8_0GemmV3CsoSize);
+    s.pso_gemm_rt = build_pso(s, zen_dx12_shaders::kQ8_0GemmRtCso, zen_dx12_shaders::kQ8_0GemmRtCsoSize);
+    s.pso_gemm_fused = build_pso(s, zen_dx12_shaders::kQ8_0GemmFusedCso, zen_dx12_shaders::kQ8_0GemmFusedCsoSize);
     s.pso_gemm_dp4a = build_pso(s, zen_dx12_shaders::kQ8_0GemmDp4aCso,
                                 zen_dx12_shaders::kQ8_0GemmDp4aCsoSize);
     s.pso_addn = build_pso(s, zen_dx12_shaders::kAddnCso, zen_dx12_shaders::kAddnCsoSize);
@@ -2298,9 +2314,8 @@ bool gemm_locked(State& s, const std::uint8_t* weights, const float* input, floa
     // tokens per tile. It takes precedence over v2 when both gates are on
     // (verify T wants the 8-tile); DP4A still outranks both.
     const bool use_v3 = !dp4a && gemm_v3_enabled() && s.pso_gemm_v3 != nullptr;
-    // GEMM v2 (opt-in, bit-identical): 256-thread groups, 16 tokens per tile.
-    // DP4A takes precedence (it also changes math); v3 > v2 > v1 for fp32.
     const bool use_v2 = !dp4a && !use_v3 && gemm_v2_enabled() && s.pso_gemm_v2 != nullptr;
+    const bool use_fused = !dp4a && !use_v3 && !use_v2 && gemm_fused_enabled() && s.pso_gemm_fused != nullptr;
     const std::uint32_t tile_v2 = use_v3 ? kTokensPerTileV3
                                     : (use_v2 ? kTokensPerTileV2 : kTokensPerTile);
     const std::uint32_t rpg_v2 = use_v3 ? kGemmRowsPerGroupV3
@@ -2308,8 +2323,8 @@ bool gemm_locked(State& s, const std::uint8_t* weights, const float* input, floa
 
     const std::size_t xscale_bytes = tokens * sizeof(float);
     const std::size_t x_bytes = dp4a ? tokens * columns
-                                     : ((tokens + tile_v2 - 1) / tile_v2 *
-                                        tile_v2) * columns * sizeof(float);
+        : (use_fused ? tokens * columns * sizeof(float)
+        : (((tokens + tile_v2 - 1) / tile_v2 * tile_v2) * columns * sizeof(float)));
     const std::size_t y_bytes = tokens * rows * sizeof(float);
     if (!reserve_scratch(s, x_bytes, y_bytes + (dp4a ? xscale_bytes : 0))) {
         return false;
@@ -2370,8 +2385,9 @@ bool gemm_locked(State& s, const std::uint8_t* weights, const float* input, floa
     s.allocator->Reset();
     s.list->Reset(s.allocator.Get(),
                   dp4a ? s.pso_gemm_dp4a.Get()
-                       : (use_v3 ? s.pso_gemm_v3.Get()
-                       : (use_v2 ? s.pso_gemm_v2.Get() : s.pso_gemm.Get())));
+                        : (use_fused ? s.pso_gemm_fused.Get()
+                        : (use_v3 ? s.pso_gemm_v3.Get()
+                       : (use_v2 ? s.pso_gemm_v2.Get() : s.pso_gemm.Get()))));
     s.list->SetComputeRootSignature(s.root.Get());
     s.list->SetComputeRootConstantBufferView(0, s.params->GetGPUVirtualAddress() + 256);
     s.list->SetComputeRootShaderResourceView(1, entry->quants->GetGPUVirtualAddress());
@@ -2388,7 +2404,11 @@ bool gemm_locked(State& s, const std::uint8_t* weights, const float* input, floa
     // loop differs. Keeping them equal avoids a second dispatch geometry.
     // (v2 uses its own 8-row tiling; dp4a forces v1 tiling.)
     const std::uint32_t rows_per_group = dp4a ? kGemmRowsPerGroup : rpg_v2;
-    s.list->Dispatch(static_cast<UINT>((rows + rows_per_group - 1) / rows_per_group), 1, 1);
+    if (use_fused) {
+        s.list->Dispatch(static_cast<UINT>((rows + 3u) / 4u), static_cast<UINT>((tokens + 3u) / 4u), 1);
+    } else {
+        s.list->Dispatch(static_cast<UINT>((rows + rows_per_group - 1) / rows_per_group), 1, 1);
+    }
     if (s.trace) {
         s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
     }
@@ -2498,6 +2518,7 @@ bool gemm_batch_locked(State& s, const float* x, const GemmTask* tasks,
     const std::size_t blocks_per_row = columns / kElemsPerBlock;
     const bool use_v3_b = gemm_v3_enabled() && s.pso_gemm_v3 != nullptr;
     const bool use_v2_b = !use_v3_b && gemm_v2_enabled() && s.pso_gemm_v2 != nullptr;
+    const bool use_fused_b = !use_v3_b && !use_v2_b && gemm_fused_enabled() && s.pso_gemm_fused != nullptr;
     const std::uint32_t tile_b = use_v3_b ? kTokensPerTileV3
                               : (use_v2_b ? kTokensPerTileV2 : kTokensPerTile);
     const std::uint32_t rpg_b = use_v3_b ? kGemmRowsPerGroupV3
@@ -2537,8 +2558,9 @@ bool gemm_batch_locked(State& s, const float* x, const GemmTask* tasks,
 
     s.allocator->Reset();
     s.list->Reset(s.allocator.Get(),
-                  use_v3_b ? s.pso_gemm_v3.Get()
-                  : (use_v2_b ? s.pso_gemm_v2.Get() : s.pso_gemm.Get()));
+                  use_fused_b ? s.pso_gemm_fused.Get()
+                  : (use_v3_b ? s.pso_gemm_v3.Get()
+                  : (use_v2_b ? s.pso_gemm_v2.Get() : s.pso_gemm.Get())));
     s.list->SetComputeRootSignature(s.root.Get());
     if (s.trace) {
         s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
@@ -2552,8 +2574,215 @@ bool gemm_batch_locked(State& s, const float* x, const GemmTask* tasks,
         s.list->SetComputeRootShaderResourceView(2, scales[i]);
         s.list->SetComputeRootShaderResourceView(3, s.xbuf->GetGPUVirtualAddress());
         s.list->SetComputeRootUnorderedAccessView(5, s.ybuf->GetGPUVirtualAddress() + offsets[i]);
-        s.list->Dispatch(
-            static_cast<UINT>((tasks[i].rows + rpg_b - 1) / rpg_b), 1, 1);
+        if (use_fused_b) {
+            s.list->Dispatch(
+                static_cast<UINT>((tasks[i].rows + 3u) / 4u),
+                static_cast<UINT>((tokens + 3u) / 4u), 1);
+        } else {
+            s.list->Dispatch(
+                static_cast<UINT>((tasks[i].rows + rpg_b - 1) / rpg_b), 1, 1);
+        }
+    }
+    if (s.trace) {
+        s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+    }
+
+    if (!s.no_readback) {
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = s.ybuf.Get();
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        s.list->ResourceBarrier(1, &barrier);
+        s.list->CopyBufferRegion(s.yread.Get(), 0, s.ybuf.Get(), 0, span);
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        s.list->ResourceBarrier(1, &barrier);
+    }
+    if (s.trace) {
+        s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2);
+        s.list->ResolveQueryData(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 3,
+                                 s.ts_read.Get(), 0);
+    }
+    s.list->Close();
+
+    if (!execute_and_wait(s)) {
+        return false;
+    }
+
+    if (!s.no_readback) {
+        void* mapped = nullptr;
+        const D3D12_RANGE read_range{0, span};
+        if (FAILED(s.yread->Map(0, &read_range, &mapped))) {
+            return false;
+        }
+        const auto* base = static_cast<const std::uint8_t*>(mapped);
+        for (std::size_t i = 0; i < count; ++i) {
+            std::memcpy(tasks[i].y, base + offsets[i],
+                        tokens * tasks[i].rows * sizeof(float));
+        }
+        const D3D12_RANGE write_range{0, 0};
+        s.yread->Unmap(0, &write_range);
+    }
+    s.stats.dispatches += count;
+    ++s.stats.batches;
+    return true;
+}
+
+// Register-tiled RT variant (fp32 only). Mirrors gemm_locked but uses 64x64 tile.
+bool gemm_rt_locked(State& s, const std::uint8_t* weights, const float* input, float* output,
+                    std::size_t tokens, std::size_t rows, std::size_t columns) {
+    if (columns % kElemsPerBlock != 0) {
+        return false;
+    }
+    WeightEntry* entry = lookup_weights(s, weights, rows, columns);
+    if (!entry) {
+        return false;
+    }
+    const std::size_t blocks_per_row = columns / kElemsPerBlock;
+    const std::size_t x_bytes = tokens * columns * sizeof(float);
+    const std::size_t y_bytes = tokens * rows * sizeof(float);
+    if (!reserve_scratch(s, x_bytes, y_bytes)) {
+        return false;
+    }
+    std::memcpy(s.x_cpu, input, tokens * columns * sizeof(float));
+
+    auto* params = reinterpret_cast<GemmParams*>(static_cast<std::uint8_t*>(s.params_cpu) + 256);
+    params->rows = static_cast<std::uint32_t>(rows);
+    params->blocks_per_row = static_cast<std::uint32_t>(blocks_per_row);
+    params->token_count = static_cast<std::uint32_t>(tokens);
+    params->tokens_per_tile = 64;
+
+    s.allocator->Reset();
+    s.list->Reset(s.allocator.Get(), s.pso_gemm_rt.Get());
+    s.list->SetComputeRootSignature(s.root.Get());
+    s.list->SetComputeRootConstantBufferView(0, s.params->GetGPUVirtualAddress() + 256);
+    s.list->SetComputeRootShaderResourceView(1, entry->quants->GetGPUVirtualAddress());
+    s.list->SetComputeRootShaderResourceView(2, entry->scales_va);
+    s.list->SetComputeRootShaderResourceView(3, s.xbuf->GetGPUVirtualAddress());
+    s.list->SetComputeRootShaderResourceView(4, s.xbuf->GetGPUVirtualAddress());
+    s.list->SetComputeRootUnorderedAccessView(5, s.ybuf->GetGPUVirtualAddress());
+
+    if (s.trace) {
+        s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+    }
+    const std::uint32_t gx = static_cast<std::uint32_t>((rows + 3u) / 4u);
+    const std::uint32_t gy = static_cast<std::uint32_t>((tokens + 7u) / 8u);
+    s.list->Dispatch(gx, gy, 1);
+    if (s.trace) {
+        s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+    }
+
+    if (!s.no_readback) {
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = s.ybuf.Get();
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        s.list->ResourceBarrier(1, &barrier);
+        s.list->CopyBufferRegion(s.yread.Get(), 0, s.ybuf.Get(), 0, y_bytes);
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        s.list->ResourceBarrier(1, &barrier);
+    }
+    if (s.trace) {
+        s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2);
+        s.list->ResolveQueryData(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 3,
+                                 s.ts_read.Get(), 0);
+    }
+    s.list->Close();
+
+    const auto start = std::chrono::steady_clock::now();
+    ID3D12CommandList* lists[] = {s.list.Get()};
+    ++s.stats.submits;
+    s.queue->ExecuteCommandLists(1, lists);
+    if (!wait_gpu(s)) {
+        return false;
+    }
+    s.stats.wait_us += static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start)
+            .count());
+
+    if (!s.no_readback) {
+        void* mapped = nullptr;
+        const D3D12_RANGE read_range{0, y_bytes};
+        if (FAILED(s.yread->Map(0, &read_range, &mapped))) {
+            return false;
+        }
+        std::memcpy(output, mapped, y_bytes);
+        const D3D12_RANGE write_range{0, 0};
+        s.yread->Unmap(0, &write_range);
+    }
+    ++s.stats.dispatches;
+    return true;
+}
+
+bool gemm_rt_batch(State& s, const float* x, const GemmTask* tasks,
+                   std::size_t count, std::size_t tokens, std::size_t columns) {
+    if (count == 0 || count > kMaxBatch) {
+        return false;
+    }
+    if (columns % kElemsPerBlock != 0) {
+        return false;
+    }
+    for (std::size_t i = 0; i < count; ++i) {
+        if (!tasks[i].weights || !tasks[i].y || !tasks[i].rows) {
+            return false;
+        }
+    }
+    ComPtr<ID3D12Resource> quants[kMaxBatch];
+    std::uint64_t scales[kMaxBatch];
+    for (std::size_t i = 0; i < count; ++i) {
+        WeightEntry* entry = lookup_weights(s, tasks[i].weights, tasks[i].rows, columns);
+        if (!entry) {
+            return false;
+        }
+        quants[i] = entry->quants;
+        scales[i] = entry->scales_va;
+    }
+    const std::size_t blocks_per_row = columns / kElemsPerBlock;
+    const std::size_t x_bytes = tokens * columns * sizeof(float);
+    std::uint64_t offsets[kMaxBatch];
+    std::uint64_t span = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        offsets[i] = span;
+        const std::uint64_t y_bytes =
+            static_cast<std::uint64_t>(tokens) * tasks[i].rows * sizeof(float);
+        span = (span + y_bytes + 255u) & ~static_cast<std::uint64_t>(255u);
+    }
+    if (!reserve_scratch(s, x_bytes, span)) {
+        return false;
+    }
+    std::memcpy(s.x_cpu, x, tokens * columns * sizeof(float));
+
+    for (std::size_t i = 0; i < count; ++i) {
+        auto* params = reinterpret_cast<GemmParams*>(
+            static_cast<std::uint8_t*>(s.params_cpu) + 1024 + 256 * i);
+        params->rows = static_cast<std::uint32_t>(tasks[i].rows);
+        params->blocks_per_row = static_cast<std::uint32_t>(blocks_per_row);
+        params->token_count = static_cast<std::uint32_t>(tokens);
+        params->tokens_per_tile = 64;
+    }
+
+    s.allocator->Reset();
+    s.list->Reset(s.allocator.Get(), s.pso_gemm_rt.Get());
+    s.list->SetComputeRootSignature(s.root.Get());
+    if (s.trace) {
+        s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+    }
+    for (std::size_t i = 0; i < count; ++i) {
+        s.list->SetComputeRootConstantBufferView(
+            0, s.params->GetGPUVirtualAddress() + 1024 + 256 * i);
+        s.list->SetComputeRootShaderResourceView(1, quants[i]->GetGPUVirtualAddress());
+        s.list->SetComputeRootShaderResourceView(2, scales[i]);
+        s.list->SetComputeRootShaderResourceView(3, s.xbuf->GetGPUVirtualAddress());
+        s.list->SetComputeRootShaderResourceView(4, s.xbuf->GetGPUVirtualAddress());
+        s.list->SetComputeRootUnorderedAccessView(5, s.ybuf->GetGPUVirtualAddress() + offsets[i]);
+        const std::uint32_t gx = static_cast<std::uint32_t>((tasks[i].rows + 3u) / 4u);
+        const std::uint32_t gy = static_cast<std::uint32_t>((tokens + 7u) / 8u);
+        s.list->Dispatch(gx, gy, 1);
     }
     if (s.trace) {
         s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
@@ -2636,6 +2865,11 @@ bool gemm_q8_0_batch(const float* x, const GemmTask* tasks, std::size_t count,
     std::lock_guard<std::mutex> lock(s.mutex);
     if (!init_locked(s)) {
         return false;
+    }
+    if (gemm_rt_enabled() && s.pso_gemm_rt != nullptr) {
+        if (gemm_rt_batch(s, x, tasks, count, tokens, columns)) {
+            return true;
+        }
     }
     return gemm_batch_locked(s, x, tasks, count, tokens, columns);
 }
@@ -2954,6 +3188,8 @@ void shutdown() noexcept {
     s.pso_gemm.Reset();
     s.pso_gemm_v2.Reset();
     s.pso_gemm_v3.Reset();
+    s.pso_gemm_rt.Reset();
+    s.pso_gemm_fused.Reset();
     s.pso_gemm_dp4a.Reset();
     s.pso_gemv_dp4a.Reset();
     s.pso_quantize_acts.Reset();
@@ -4296,7 +4532,17 @@ bool gemm_q8_0(const std::uint8_t* weights, const float* input, float* output, s
         lookup_weights(s, weights, rows, columns);
         return false;
     }
-    if (!gemm_locked(s, weights, input, output, tokens, rows, columns)) {
+    bool use_rt = gemm_rt_enabled() && s.pso_gemm_rt != nullptr;
+    bool ok = false;
+    if (use_rt) {
+        ok = gemm_rt_locked(s, weights, input, output, tokens, rows, columns);
+        if (!ok) {
+            ok = gemm_locked(s, weights, input, output, tokens, rows, columns);
+        }
+    } else {
+        ok = gemm_locked(s, weights, input, output, tokens, rows, columns);
+    }
+    if (!ok) {
         ++s.stats.fallbacks;
         return false;
     }

@@ -319,3 +319,7 @@ writing more kernel variants; then split-K for the low-row matmuls
 - `zen_d3d12_probe` — adapter/feature-level report (reconstruction).
 - `ZEN_D3D12_DRED=1` enables DRED + the debug layer.
 - `ZEN_D3D12_STAGE=1` prints per-stage decode timings.
+
+## RMS AVX2 default-ON correctness (verified 2026-11-06)
+
+Greedy generated_ids byte-identical across 32 tokens on 3 models (Llama-3.2-1B-Q8_0, Qwen3-4B-Q8_0, Qwen2.5-Coder-7B-Q5_K_M) with ZEN_CPU_RMS_AVX2=0 vs 1. last_logits max_abs_diff = 0.0 on all three. AVX2 RMS accumulates in double (__m256d); only lane-order of sum differs, measured 0.0. Recommendation: keep default ON (see .opencode/sherlock-analysis.md RUN-011).
