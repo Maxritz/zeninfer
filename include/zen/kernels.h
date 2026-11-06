@@ -99,6 +99,12 @@ bool gemm_f16_kblk_avx2(const std::uint8_t* weights, const float* input, float* 
 bool gemm_q4k_kblk_avx2(const std::uint8_t* weights, const float* input, float* output,
                          std::size_t tokens, std::size_t rows, std::size_t columns,
                          std::size_t output_row_stride);
+bool gemm_bf16_kblk_avx2(const std::uint8_t* weights, const float* input, float* output,
+                          std::size_t tokens, std::size_t rows, std::size_t columns,
+                          std::size_t output_row_stride);
+bool gemm_q6k_kblk_avx2(const std::uint8_t* weights, const float* input, float* output,
+                        std::size_t tokens, std::size_t rows, std::size_t columns,
+                        std::size_t output_row_stride);
 #endif
 
 bool cpu_has_avx2_fma() noexcept;

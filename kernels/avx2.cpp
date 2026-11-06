@@ -1103,4 +1103,115 @@ void gdn_output_avx2(const float* sh, const float* qh, float* oh,
 }
 
 
+
+// BF16 dequant panel: bf16 (2 bytes) -> float. Conversion is just a left shift
+// by 16 (bf16 is the upper 16 bits of float32). No scale, no block.
+inline void dequant_bf16_panel(const std::uint8_t* wrow, std::size_t k0,
+                               std::size_t kc, float* dst) {
+    const std::uint16_t* srcp = reinterpret_cast<const std::uint16_t*>(wrow + k0 * 2);
+    std::size_t i = 0;
+    for (; i + 8 <= kc; i += 8) {
+        __m128i h = _mm_loadu_si128(reinterpret_cast<const __m128i*>(srcp + i));
+        __m256i u = _mm256_cvtepu16_epi32(h);
+        u = _mm256_slli_epi32(u, 16);
+        __m256 f = _mm256_castsi256_ps(u);
+        _mm256_storeu_ps(dst + i, f);
+    }
+    for (; i < kc; ++i) {
+        std::uint32_t u = (std::uint32_t)srcp[i] << 16;
+        std::memcpy(dst + i, &u, sizeof(float));
+    }
+}
+
+bool gemm_bf16_kblk_avx2(const std::uint8_t* weights, const float* input, float* output,
+                          std::size_t tokens, std::size_t rows, std::size_t columns,
+                          std::size_t output_row_stride) {
+    if (!weights || !input || !output || !tokens || !rows || !columns) return false;
+    if (columns % 32) return false;
+    static const std::size_t kKc = 128;
+    return gemm_kblk_impl(weights, input, output, tokens, rows, columns,
+                         output_row_stride, columns * 2, kKc, &dequant_bf16_panel);
+}
+
+
+// Q6_K dequant panel: 256-weight super-blocks. Each super-block has
+// ql[128] (low 4 bits), qh[64] (high 2 bits), scales[16] (signed int8),
+// d (fp16 overall scale). Dequant: q = (ql_nibble | (qh_bits<<4)) - 32,
+// weight = d * scales[sub] * q. Panel dequantizes kc floats starting at k0.
+inline void dequant_q6k_panel(const std::uint8_t* wrow, std::size_t k0,
+                              std::size_t kc, float* dst) {
+    std::size_t off = 0;
+    while (off < kc) {
+        std::size_t sb = (k0 + off) / 256;
+        std::size_t in_sb = (k0 + off) % 256;
+        const std::uint8_t* p = wrow + sb * 210;
+        const std::uint8_t* ql = p;
+        const std::uint8_t* qh = p + 128;
+        const std::int8_t* sc = reinterpret_cast<const std::int8_t*>(p + 192);
+        const float d = half_to_float_local(read16_local(p + 208));
+        std::size_t remain = std::min(kc - off, 256 - in_sb);
+        for (std::size_t i = 0; i < remain; ++i) {
+            std::size_t idx = in_sb + i;
+            std::size_t n128 = idx / 128;
+            std::size_t l = idx % 32;
+            std::size_t is = l / 16;
+            unsigned qval;
+            if (l < 32) {
+                if (n128 == 0) {
+                    if (l < 16) {
+                        qval = (ql[l] & 15u) | (((qh[l] >> 0) & 3u) << 4);
+                    } else {
+                        qval = (ql[l+32] & 15u) | (((qh[l] >> 2) & 3u) << 4);
+                    }
+                } else {
+                    if (l < 16) {
+                        qval = (ql[64+l] & 15u) | (((qh[32+l] >> 0) & 3u) << 4);
+                    } else {
+                        qval = (ql[64+l+32] & 15u) | (((qh[32+l] >> 2) & 3u) << 4);
+                    }
+                }
+            }
+            // Simplified: just use the scalar dequant for correctness
+            (void)qval;
+            // Fallback to scalar dequantize for this element
+            std::uint8_t tmp[210];
+            std::memcpy(tmp, p, 210);
+            float val;
+            // Use the reference implementation
+            const std::uint8_t* pp = tmp;
+            const std::uint8_t* qql = pp;
+            const std::uint8_t* qqh = pp + 128;
+            const std::int8_t* ssc = reinterpret_cast<const std::int8_t*>(pp + 192);
+            const float dd = half_to_float_local(read16_local(pp + 208));
+            unsigned n128r = idx / 128;
+            unsigned lr = idx % 32;
+            unsigned isr = lr / 16;
+            int q;
+            if (n128r == 0) {
+                if (lr < 16) q = int((qql[lr] & 15u) | (((qqh[lr] >> 0) & 3u) << 4)) - 32;
+                else q = int((qql[lr+32] & 15u) | (((qqh[lr] >> 2) & 3u) << 4)) - 32;
+            } else {
+                if (lr < 16) q = int((qql[64+lr] & 15u) | (((qqh[32+lr] >> 0) & 3u) << 4)) - 32;
+                else q = int((qql[64+lr+32] & 15u) | (((qqh[32+lr] >> 2) & 3u) << 4)) - 32;
+            }
+            int sc_idx;
+            if (n128r == 0) sc_idx = (lr < 16) ? isr : isr + 2;
+            else sc_idx = (lr < 16) ? isr + 4 : isr + 6;
+            val = dd * ssc[sc_idx] * q;
+            dst[off + i] = val;
+        }
+        off += remain;
+    }
+}
+
+bool gemm_q6k_kblk_avx2(const std::uint8_t* weights, const float* input, float* output,
+                        std::size_t tokens, std::size_t rows, std::size_t columns,
+                        std::size_t output_row_stride) {
+    if (!weights || !input || !output || !tokens || !rows || !columns) return false;
+    if (columns % 256) return false;
+    static const std::size_t kKc = 256;
+    return gemm_kblk_impl(weights, input, output, tokens, rows, columns,
+                         output_row_stride, columns * (210/256), kKc, &dequant_q6k_panel);
+}
+
 }  // namespace zen

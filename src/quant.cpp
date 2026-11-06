@@ -1053,14 +1053,21 @@ static bool gemm_q8_0_parallel(const std::uint8_t* w,const float* input,float* o
 static bool f16_fast_enabled() {
     static const bool v=[](){
         const char* e=std::getenv("ZEN_CPU_FAST_F16");
-        return (e&&e[0]=='1');
+        return !(e&&e[0]=='0');
     }();
     return v;
 }
 static bool q4k_fast_enabled() {
     static const bool v=[](){
         const char* e=std::getenv("ZEN_CPU_FAST_Q4K");
-        return (e&&e[0]=='1');
+        return !(e&&e[0]=='0');
+    }();
+    return v;
+}
+static bool bf16_fast_enabled() {
+    static const bool v=[](){
+        const char* e=std::getenv("ZEN_CPU_FAST_BF16");
+        return !(e&&e[0]=='0');
     }();
     return v;
 }
@@ -1275,6 +1282,14 @@ bool gemm(const Format& f,const std::uint8_t*w,const float*input,float*output,
         if(f.encoding==Encoding::q4_k&&q4k_fast_enabled()&&cols%256==0){
             g_gemm_routes.cpu_avx2.fetch_add(1,std::memory_order_relaxed);
             if(gemm_fast_parallel(zen::gemm_q4k_kblk_avx2,w,input,output,tokens,rows,cols,rb,requested_workers))return true;
+        }
+        if(f.encoding==Encoding::bf16&&bf16_fast_enabled()){
+            g_gemm_routes.cpu_avx2.fetch_add(1,std::memory_order_relaxed);
+            if(gemm_fast_parallel(zen::gemm_bf16_kblk_avx2,w,input,output,tokens,rows,cols,rb,requested_workers))return true;
+        }
+        if(f.encoding==Encoding::q6_k&&cols%256==0){
+            g_gemm_routes.cpu_avx2.fetch_add(1,std::memory_order_relaxed);
+            if(gemm_fast_parallel(zen::gemm_q6k_kblk_avx2,w,input,output,tokens,rows,cols,rb,requested_workers))return true;
         }
     }
 #endif
