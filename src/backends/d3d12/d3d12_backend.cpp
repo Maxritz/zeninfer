@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "q8_0_gemm_cso.h"
+#include "q8_0_gemm_q4k_cso.h"
 #include "q8_0_gemm_sh_cso.h"
 #include "q8_0_gemm_v2_cso.h"
 #include "q8_0_gemm_v3_cso.h"
@@ -357,6 +358,7 @@ struct State {
     std::size_t dq_cap{}, dk_cap{}, dv_cap{}, dqr_cap{}, dkr_cap{};
     std::size_t dcos_cap{}, dsin_cap{}, datt_cap{};
     ComPtr<ID3D12PipelineState> pso_gemm;
+    ComPtr<ID3D12PipelineState> pso_gemm_q4k;
     ComPtr<ID3D12PipelineState> pso_gemm_sh;
     ComPtr<ID3D12PipelineState> pso_gemm_v2;
     ComPtr<ID3D12PipelineState> pso_gemm_v3;
@@ -1344,6 +1346,7 @@ bool init_locked(State& s) {
     s.pso_rms = build_pso(s, zen_dx12_shaders::kRmsNormCso, zen_dx12_shaders::kRmsNormCsoSize);
     s.pso_silu = build_pso(s, zen_dx12_shaders::kSiluMulCso, zen_dx12_shaders::kSiluMulCsoSize);
     s.pso_gemm = build_pso(s, zen_dx12_shaders::kQ8_0GemmCso, zen_dx12_shaders::kQ8_0GemmCsoSize);
+    s.pso_gemm_q4k = build_pso(s, zen_dx12_shaders::kQ8_0GemmQ4kCso, zen_dx12_shaders::kQ8_0GemmQ4kCsoSize);
     s.pso_gemm_sh = build_pso(s, zen_dx12_shaders::kQ8_0GemmShCso, zen_dx12_shaders::kQ8_0GemmShCsoSize);
     // GEMM v2 (256-thread groups, halved accumulators, bit-identical): optional,
     // selected by ZEN_D3D12_GEMM_V2=1; v1 stays the default until validated.
