@@ -1,8 +1,14 @@
 #include "zen/model_backend.h"
 #include "zen/chat_template.h"
+#include "zen/chat_compaction.h"
 #include <stdexcept>
 #include <algorithm>
 namespace zen::runtime {
+ModelBackend::ModelBackend(std::unique_ptr<ModelRuntime> runtime,std::string id)
+    : runtime_(std::move(runtime)),model_id_(std::move(id)) {
+    if(!runtime_)throw std::invalid_argument("Model runtime must not be null");
+    if(model_id_.empty())model_id_="zeninfer";
+}
 bool ModelBackend::load(const std::filesystem::path& path,std::string id,std::string* error,const std::filesystem::path& draft_path){
     runtime_=load_model_runtime(path,nullptr,error);if(!runtime_)return false;
     if(!runtime_->tokenizer_available()){if(error)*error="Model has no supported tokenizer vocabulary";return false;}
@@ -14,14 +20,20 @@ bool ModelBackend::load(const std::filesystem::path& path,std::string id,std::st
 http::GenerationResult ModelBackend::generate(const http::GenerationRequest& req,
         const std::function<void(const std::string&)>& on_token,const std::atomic<bool>& cancelled){
     std::string prompt=req.prompt;
-    if(prompt.empty()){
-        std::string template_error;
-        if(!chat::format_legacy_chat(runtime_->chat_template(),runtime_->architecture_name(),req.messages,prompt,&template_error))
-            throw std::runtime_error(template_error.empty()?"Chat messages could not be formatted":template_error);
-    }
-    if(prompt.empty())throw std::runtime_error("The request contains no text prompt");
     std::vector<std::uint32_t> prompt_ids;
-    if(!runtime_->tokenize(prompt,prompt_ids))throw std::runtime_error("Model tokenizer is unavailable");
+    http::CompactionInfo compaction;
+    if(req.compaction.enabled){
+        if(!prompt.empty())throw chat::CompactionError("Compaction is only supported for chat requests");
+        chat::prepare_compacted_chat(*runtime_,req,cancelled,prompt,prompt_ids,compaction);
+    } else {
+        if(prompt.empty()){
+            std::string template_error;
+            if(!chat::format_legacy_chat(runtime_->chat_template(),runtime_->architecture_name(),req.messages,prompt,&template_error))
+                throw std::runtime_error(template_error.empty()?"Chat messages could not be formatted":template_error);
+        }
+        if(prompt.empty())throw std::runtime_error("The request contains no text prompt");
+        if(!runtime_->tokenize(prompt,prompt_ids))throw std::runtime_error("Model tokenizer is unavailable");
+    }
     runtime::Generation generated;std::string text,error;
     auto stream=[&](const std::string& piece){if(cancelled.load(std::memory_order_relaxed))throw std::runtime_error("Generation cancelled");if(on_token)on_token(piece);};
     GenerationOptions options;options.temperature=static_cast<float>(req.temperature);options.top_k=req.top_k;options.top_p=static_cast<float>(req.top_p);options.seed=req.seed;options.stop=req.stop;options.logit_bias=req.logit_bias;options.allowed_token_ids=req.allowed_token_ids;
@@ -38,6 +50,7 @@ http::GenerationResult ModelBackend::generate(const http::GenerationRequest& req
     result.prompt_tokens=static_cast<std::uint32_t>(prompt_ids.size());
     result.completion_tokens=static_cast<std::uint32_t>(generated.token_ids.size());
     result.finish_reason=(generated.stopped_on_eos||generated.stopped_on_stop)?"stop":"length";
+    result.compaction=std::move(compaction);
     return result;
 }
 }
