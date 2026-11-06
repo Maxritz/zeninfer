@@ -73,6 +73,9 @@ bool gemv_q8_0(const std::uint8_t* weights, const float* x, float* y,
                std::size_t rows, std::size_t columns) noexcept;
 bool gemm_q8_0(const std::uint8_t* weights, const float* input, float* output,
                std::size_t tokens, std::size_t rows, std::size_t columns) noexcept;
+// Q4_K GPU GEMM (experimental, basic, no tiling). Falls back to CPU on failure.
+bool gemm_q4k(const std::uint8_t* weights, const float* input, float* output,
+              std::size_t tokens, std::size_t rows, std::size_t columns) noexcept;
 
 // One matvec target for a batched submission. All tasks in a batch share the input
 // vector, which is exactly the Q|K|V and gate|up pattern in a transformer block.
