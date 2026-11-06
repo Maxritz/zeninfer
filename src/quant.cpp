@@ -18,6 +18,7 @@
 #include <thread>
 #include <atomic>
 #include <cmath>
+#include <array>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -197,12 +198,55 @@ static inline float rocmfp4_ue4m3_to_fp32_half(std::uint8_t e) noexcept {
     return out;
 }
 
+// GGML NVFP4's UE4M3 scale is half the nominal value, because the
+// E2M1 lookup values are doubled. Upstream masks the exponent to four bits
+// even for bytes with bit 7 set; 0x7f is the only NaN code mapped to zero.
+static float nvfp4_scale(std::uint8_t x) noexcept {
+    if(x==0 || x==0x7f)return 0.0f;
+    const unsigned exp=(x>>3)&15u, mant=x&7u;
+    const float raw=exp==0?std::ldexp(float(mant),-9):std::ldexp(1.0f+float(mant)/8.0f,int(exp)-7);
+    return raw*0.5f;
+}
+static float f8_e4m3_to_float(std::uint8_t x) noexcept {
+    const auto ax=std::uint8_t(x&0x7f);
+    if(ax==0x7f)return std::numeric_limits<float>::quiet_NaN();
+    const unsigned exp=(ax>>3)&15u, mant=ax&7u;
+    const float value=exp==0?std::ldexp(float(mant),-9):std::ldexp(1.0f+float(mant)/8.0f,int(exp)-7);
+    return (x&0x80u)?-value:value;
+}
+// Both encodings have only 256 byte values; compute them once rather than
+// calling ldexp for every element/scale in every projection.
+static const std::array<float,256>& f8_values() noexcept {
+    static const auto values=[] {std::array<float,256> v{};for(unsigned i=0;i<256;++i)v[i]=f8_e4m3_to_float(std::uint8_t(i));return v;}();
+    return values;
+}
+static const std::array<float,256>& nvfp4_scales() noexcept {
+    static const auto values=[] {std::array<float,256> v{};for(unsigned i=0;i<256;++i)v[i]=nvfp4_scale(std::uint8_t(i));return v;}();
+    return values;
+}
+static std::uint64_t read64_le(const std::uint8_t* p) noexcept {
+    std::uint64_t value=0;for(unsigned i=0;i<8;++i)value|=std::uint64_t(p[i])<<(8*i);return value;
+}
+static std::uint32_t read32_le(const std::uint8_t* p) noexcept {
+    return std::uint32_t(p[0])|(std::uint32_t(p[1])<<8)|(std::uint32_t(p[2])<<16)|(std::uint32_t(p[3])<<24);
+}
+
 const std::vector<Format>& registry() {
     static const std::vector<Format> f=[] {
         std::vector<Format> v{
             {"F32",Encoding::fp32,32,1,4,true,"IEEE-754 binary32"},
             {"F16",Encoding::fp16,16,1,2,true,"IEEE-754 binary16"},
             {"BF16",Encoding::bf16,16,1,2,true,"IEEE-754 bfloat16"},
+            {"F64",Encoding::fp64,64,1,8,true,"IEEE-754 binary64, converted to FP32"},
+            {"F8_E4M3",Encoding::fp8_e4m3,8,1,1,true,"OCP FP8 E4M3 finite-numbers encoding"},
+            {"I8",Encoding::i8,8,1,1,true,"Signed 8-bit integer, converted to FP32"},
+            {"I16",Encoding::i16,16,1,2,true,"Signed 16-bit integer, converted to FP32"},
+            {"I32",Encoding::i32,32,1,4,true,"Signed 32-bit integer, converted to FP32"},
+            {"I64",Encoding::i64,64,1,8,true,"Signed 64-bit integer, converted to FP32"},
+            {"Q1_0",Encoding::q1_0,1,128,18,true,"GGML Q1_0: fp16 scale plus 128 packed signs"},
+            {"Q2_0",Encoding::q2_0,2,64,18,true,"GGML Q2_0: fp16 scale plus 64 packed 2-bit codes"},
+            {"Q8_1",Encoding::q8_1,8,32,36,true,"Current GGML Q8_1: fp16 scale and sum plus 32 signed quants"},
+            {"NVFP4",Encoding::nvfp4,4,64,36,true,"GGML NVFP4: four UE4M3 scales and E2M1 nibbles"},
             {"Q4_0",Encoding::q4_0,4,32,18,true,"GGML Q4_0 block: fp16 scale plus 16 packed bytes"},
             {"Q4_1",Encoding::q4_1,4,32,20,true,"GGML Q4_1 block: fp16 scale, fp16 minimum and 16 packed bytes"},
             {"Q5_0",Encoding::q5_0,5,32,22,true,"GGML Q5_0 block"},
@@ -273,6 +317,47 @@ bool dequantize(const Format& f,const std::uint8_t* src,std::size_t n,float* dst
             float v;std::memcpy(&v,&bits,sizeof(v));dst[i]=v;
         }
         return true;
+    case Encoding::fp64:
+        for(std::size_t i=0;i<n;++i){const auto bits=read64_le(src+8*i);double v;std::memcpy(&v,&bits,8);dst[i]=static_cast<float>(v);}return true;
+    case Encoding::fp8_e4m3: {
+        const auto& table=f8_values();
+        for(std::size_t i=0;i<n;++i)dst[i]=table[src[i]];
+        return true;
+    }
+    case Encoding::i8:
+        for(std::size_t i=0;i<n;++i)dst[i]=float(src[i]<128?int(src[i]):int(src[i])-256);
+        return true;
+    case Encoding::i16:
+        for(std::size_t i=0;i<n;++i){const auto v=read16(src+2*i);dst[i]=float(v<32768?int(v):int(v)-65536);}return true;
+    case Encoding::i32:
+        for(std::size_t i=0;i<n;++i){const auto u=read32_le(src+4*i);std::int32_t v;std::memcpy(&v,&u,4);dst[i]=float(v);}return true;
+    case Encoding::i64:
+        for(std::size_t i=0;i<n;++i){const auto u=read64_le(src+8*i);std::int64_t v;std::memcpy(&v,&u,8);dst[i]=float(v);}return true;
+    case Encoding::q1_0:
+        if(n%128)return false;
+        for(std::size_t b=0;b<n/128;++b){const auto* p=src+b*18;const float d=half_to_float(read16(p));
+            for(unsigned j=0;j<128;++j)dst[b*128+j]=(p[2+j/8]&(1u<<(j%8)))?d:-d;}
+        return true;
+    case Encoding::q2_0:
+        if(n%64)return false;
+        for(std::size_t b=0;b<n/64;++b){const auto* p=src+b*18;const float d=half_to_float(read16(p));
+            for(unsigned j=0;j<64;++j)dst[b*64+j]=float(int((p[2+j/4]>>((j%4)*2))&3u)-1)*d;}
+        return true;
+    case Encoding::q8_1:
+        if(n%32)return false;
+        for(std::size_t b=0;b<n/32;++b){const auto* p=src+b*36;const float d=half_to_float(read16(p));
+            for(unsigned j=0;j<32;++j){const auto v=p[4+j];dst[b*32+j]=float(v<128?int(v):int(v)-256)*d;}}
+        return true;
+    case Encoding::nvfp4: {
+        if(n%64)return false;
+        const auto& table=nvfp4_scales();
+        for(std::size_t b=0;b<n/64;++b){const auto* p=src+b*36;
+            for(unsigned group=0;group<4;++group){const float d=table[p[group]];
+                for(unsigned j=0;j<8;++j){const auto q=p[4+group*8+j];
+                    dst[b*64+group*16+j]=float(kvalues_mxfp4[q&15u])*d;
+                    dst[b*64+group*16+j+8]=float(kvalues_mxfp4[q>>4])*d;}}}
+        return true;
+    }
     case Encoding::q4_1:
         if(n%32)return false;
         for(std::size_t b=0;b<n/32;++b){
@@ -788,6 +873,14 @@ std::size_t row_bytes(const Format& f,std::size_t columns) noexcept {
     switch(f.encoding){
     case Encoding::fp32:return columns>std::numeric_limits<std::size_t>::max()/4?0:columns*4;
     case Encoding::fp16:case Encoding::bf16:return columns>std::numeric_limits<std::size_t>::max()/2?0:columns*2;
+    case Encoding::fp64:case Encoding::i64:return columns>std::numeric_limits<std::size_t>::max()/8?0:columns*8;
+    case Encoding::fp8_e4m3:case Encoding::i8:return columns;
+    case Encoding::i16:return columns>std::numeric_limits<std::size_t>::max()/2?0:columns*2;
+    case Encoding::i32:return columns>std::numeric_limits<std::size_t>::max()/4?0:columns*4;
+    case Encoding::q1_0:return blocks(128,18);
+    case Encoding::q2_0:return blocks(64,18);
+    case Encoding::q8_1:return blocks(32,36);
+    case Encoding::nvfp4:return blocks(64,36);
     case Encoding::q4_0:return blocks(32,18);
     case Encoding::q4_1:return blocks(32,20);
     case Encoding::q5_0:return blocks(32,22);

@@ -51,12 +51,12 @@ std::uint64_t tensor_bytes(std::uint32_t type,std::uint64_t elements){
     struct T{std::uint32_t id,block,bytes;};
     static constexpr T ts[]={
         {0,1,4},{1,1,2},{2,32,18},{3,32,20},
-        {6,32,22},{7,32,24},{8,32,34},{9,32,40},
+        {6,32,22},{7,32,24},{8,32,34},{9,32,36},
         {10,256,84},{11,256,110},{12,256,144},{13,256,176},{14,256,210},{15,256,292},
         {16,256,66},{17,256,74},{18,256,98},{19,256,50},{20,32,18},{21,256,110},
         {22,256,82},{23,256,136},{24,1,1},{25,1,2},{26,1,4},{27,1,8},{28,1,8},
         {29,256,56},{30,1,2},{34,256,54},{35,256,66},
-        {39,32,17},{100,32,18},{101,32,17},{143,128,28}
+        {39,32,17},{40,64,36},{41,128,18},{42,64,18},{43,1,1},{100,32,18},{101,32,17},{143,128,28}
     };
     for(auto t:ts)if(t.id==type){
         if(elements%t.block)return 0;
@@ -202,7 +202,10 @@ LoadReport parse_gguf(R& r,std::uint64_t file_size){
         d.dimensions.resize(nd);std::uint64_t elements=1;
         for(auto&dim:d.dimensions){if(!r.read(dim)||dim==0||elements>std::numeric_limits<std::uint64_t>::max()/dim){out.error="Invalid tensor dimensions";return out;}elements*=dim;}
         if(!r.read(d.ggml_type)||!r.read(d.offset)){out.error="Truncated tensor descriptor";return out;}
-        d.byte_size=tensor_bytes(d.ggml_type,elements);d.role=model::infer_tensor_role(d.name);out.tensors.push_back(std::move(d));
+        // GGML blocks are row-local, not allowed to straddle dimension 0.
+        // A total element count divisible by the block is not sufficient.
+        d.byte_size=tensor_bytes(d.ggml_type,d.dimensions[0]) ? tensor_bytes(d.ggml_type,elements) : 0;
+        d.role=model::infer_tensor_role(d.name);out.tensors.push_back(std::move(d));
     }
     std::uint32_t alignment=32;auto it=out.config.metadata.find("general.alignment");
     if(it!=out.config.metadata.end())try{alignment=static_cast<std::uint32_t>(std::stoul(it->second));}catch(...){}
@@ -295,7 +298,7 @@ bool read_tensor_f32(const std::filesystem::path& path,const LoadReport& report,
         case 0:format_name="F32";break; case 1:format_name="F16";break;
         case 2:format_name="Q4_0";break; case 3:format_name="Q4_1";break;
         case 6:format_name="Q5_0";break; case 7:format_name="Q5_1";break;
-        case 8:format_name="Q8_0";break; case 10:format_name="Q2_K";break;
+        case 8:format_name="Q8_0";break; case 9:format_name="Q8_1";break; case 10:format_name="Q2_K";break;
         case 11:format_name="Q3_K";break; case 12:format_name="Q4_K";break;
         case 13:format_name="Q5_K";break; case 14:format_name="Q6_K";break;
         case 15:format_name="Q8_K";break; case 16:format_name="IQ2_XXS";break;
@@ -303,9 +306,14 @@ bool read_tensor_f32(const std::filesystem::path& path,const LoadReport& report,
         case 19:format_name="IQ1_S";break; case 20:format_name="IQ4_NL";break;
         case 21:format_name="IQ3_S";break; case 22:format_name="IQ2_S";break;
         case 23:format_name="IQ4_XS";break; case 29:format_name="IQ1_M";break;
+        case 24:format_name="I8";break; case 25:format_name="I16";break;
+        case 26:format_name="I32";break; case 27:format_name="I64";break;
+        case 28:format_name="F64";break;
         case 30:format_name="BF16";break; case 34:format_name="TQ1_0";break;
         case 35:format_name="TQ2_0";break;
-        case 39:format_name="MXFP4";break;
+        case 39:format_name="MXFP4";break; case 40:format_name="NVFP4";break;
+        case 41:format_name="Q1_0";break; case 42:format_name="Q2_0";break;
+        case 43:format_name="F8_E4M3";break;
         case 100:format_name="Q4_0_ROCMFP4";break;
         case 101:format_name="Q4_0_ROCMFP4_FAST";break;
         case 143:format_name="PTQ1_0";break;

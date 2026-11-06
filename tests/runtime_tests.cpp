@@ -33,6 +33,41 @@ int main(int argc,char**argv){
             for(auto id:tc.expected)std::cerr<<id<<",";std::cerr<<" got=";for(auto id:got)std::cerr<<id<<",";std::cerr<<"\n";return 1;}}
     }
     std::string roundtrip;if(!runtime->detokenize(ids,roundtrip)||roundtrip.empty()){std::cerr<<"tokenizer round-trip failed\n";return 1;}
+    // Regression: a zero-generation cache entry must be safely reused by a
+    // longer request. Compare warm decode with a fresh prefill in this runtime.
+    {
+        zen::runtime::GenerationOptions constrained;constrained.allowed_token_ids={42};
+        zen::runtime::Generation prime,warm,cold,evict;
+        if(!runtime->generate(ids,0,prime,&error)||!runtime->generate(ids,6,warm,&error,{},constrained)){
+            std::cerr<<"growing prefix-cache generation failed: "<<error<<"\n";return 1;
+        }
+        auto different=ids;different.back()=(different.back()+1)%runtime->config().vocab;
+        if(!runtime->generate(different,0,evict,&error)||!runtime->generate(ids,6,cold,&error,{},constrained)){
+            std::cerr<<"cold prefix-cache comparison failed: "<<error<<"\n";return 1;
+        }
+        if(!warm.cache_hit||cold.cache_hit||warm.token_ids.size()!=6||warm.token_ids!=cold.token_ids||warm.last_logits.size()!=cold.last_logits.size()){
+            std::cerr<<"growing prefix-cache token mismatch\n";return 1;
+        }
+        for(std::size_t i=0;i<cold.last_logits.size();++i)if(std::abs(warm.last_logits[i]-cold.last_logits[i])>1e-4f*std::max(1.0f,std::abs(cold.last_logits[i]))){
+            std::cerr<<"growing prefix-cache logits mismatch\n";return 1;
+        }
+    }
+    // Compare greedy incremental generation with full-prefill recomputation at
+    // each produced token; cache hits agreeing with themselves are insufficient.
+    {
+        zen::runtime::Generation generated;zen::runtime::GenerationOptions greedy;
+        if(!runtime->generate(ids,4,generated,&error,{},greedy)){std::cerr<<"greedy parity generation failed: "<<error<<"\n";return 1;}
+        auto prefix=ids;
+        for(auto token:generated.token_ids){
+            zen::runtime::Generation recomputed;
+            if(!runtime->generate(prefix,0,recomputed,&error)||recomputed.last_logits.empty()){
+                std::cerr<<"greedy full-prefix recomputation failed: "<<error<<"\n";return 1;
+            }
+            const auto expected=std::uint32_t(std::max_element(recomputed.last_logits.begin(),recomputed.last_logits.end())-recomputed.last_logits.begin());
+            if(token!=expected){std::cerr<<"incremental greedy token differs from full prefix\n";return 1;}
+            prefix.push_back(token);
+        }
+    }
     // Report real end-to-end model prefill and decode-forward throughput before
     // any repeated-prompt prefix-cache hit can affect the measurement. A 128-token
     // deterministic prompt avoids reporting a misleading 5-token prefill rate.

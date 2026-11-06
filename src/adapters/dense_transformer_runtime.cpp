@@ -384,13 +384,17 @@ const quant::Format* format_for_ggml(std::uint32_t id){
     const char* name=nullptr;switch(id){
         case 0:name="F32";break; case 1:name="F16";break; case 30:name="BF16";break;
         case 2:name="Q4_0";break; case 3:name="Q4_1";break; case 6:name="Q5_0";break;
-        case 7:name="Q5_1";break; case 8:name="Q8_0";break;
+        case 7:name="Q5_1";break; case 8:name="Q8_0";break; case 9:name="Q8_1";break;
         case 10:name="Q2_K";break; case 11:name="Q3_K";break; case 12:name="Q4_K";break;
         case 13:name="Q5_K";break; case 14:name="Q6_K";break; case 15:name="Q8_K";break;
         case 16:name="IQ2_XXS";break; case 17:name="IQ2_XS";break; case 18:name="IQ3_XXS";break;
         case 19:name="IQ1_S";break; case 20:name="IQ4_NL";break; case 21:name="IQ3_S";break;
         case 22:name="IQ2_S";break; case 23:name="IQ4_XS";break; case 29:name="IQ1_M";break;
+        case 24:name="I8";break; case 25:name="I16";break; case 26:name="I32";break;
+        case 27:name="I64";break; case 28:name="F64";break;
         case 34:name="TQ1_0";break; case 35:name="TQ2_0";break; case 39:name="MXFP4";break;
+        case 40:name="NVFP4";break; case 41:name="Q1_0";break; case 42:name="Q2_0";break;
+        case 43:name="F8_E4M3";break;
         case 100:name="Q4_0_ROCMFP4";break; case 101:name="Q4_0_ROCMFP4_FAST";break;
         case 143:name="PTQ1_0";break;
         default:break;}
@@ -654,6 +658,10 @@ bool DenseTransformerRuntime::load(const std::filesystem::path& path,std::string
     config_.heads=report.config.attention_head_count;config_.kv_heads=report.config.kv_head_count;
     config_.ffn=report.config.feed_forward_length;config_.context=report.config.context_length;
     config_.vocab=report.config.vocabulary_size;
+    // Validate divisors before deriving head_dim and rotary defaults. A malformed
+    // model with zero heads must fail to load rather than divide by zero.
+    if(!config_.embedding||!config_.layers||!config_.heads||!config_.kv_heads||!config_.ffn||!config_.context||!config_.vocab||config_.embedding%config_.heads||config_.heads%config_.kv_heads)
+        return fail("Incomplete or inconsistent dense transformer dimensions");
     // Head dimension: explicit attention.key_length metadata when present,
     // otherwise derived from the block attention-Q projection width (which
     // accommodates models whose q width is heads*head_dim != embedding), and
@@ -730,8 +738,6 @@ bool DenseTransformerRuntime::load(const std::filesystem::path& path,std::string
             return fail("Unparseable numeric GGUF metadata (see [meta] fallback log)");
     }
     std::string tokenizer_error;tokenizer_loaded_=tokenizer_.load(report.config,&tokenizer_error);
-    if(!config_.embedding||!config_.layers||!config_.heads||!config_.kv_heads||!config_.ffn||!config_.context||!config_.vocab||config_.embedding%config_.heads||config_.heads%config_.kv_heads)
-        return fail("Incomplete or inconsistent dense transformer dimensions");
     const auto head_dim=config_.head_dim;
     if(config_.rope_dim==0||config_.rope_dim>head_dim||config_.rope_dim%2)return fail("Invalid rotary dimension");
     if(!std::isfinite(config_.rope_base)||config_.rope_base<=0.0f||!std::isfinite(config_.rms_epsilon)||config_.rms_epsilon<=0.0f||!std::isfinite(config_.rope_scaling_factor)||config_.rope_scaling_factor<1.0f||!std::isfinite(config_.rope_low_freq_factor)||config_.rope_low_freq_factor<=0.0f||!std::isfinite(config_.rope_high_freq_factor)||config_.rope_high_freq_factor<=config_.rope_low_freq_factor||!std::isfinite(config_.rope_yarn_beta_fast)||config_.rope_yarn_beta_fast<=0.0f||!std::isfinite(config_.rope_yarn_beta_slow)||config_.rope_yarn_beta_slow<=0.0f)return fail("Invalid RoPE base, scaling factor or RMS normalisation epsilon");
@@ -944,6 +950,16 @@ bool DenseTransformerRuntime::forward_q35_batch(const std::vector<std::uint32_t>
     if(!T||!S||!NK||!NV||!CK)return false;
     const std::size_t QW=std::size_t(H)*D,KW=std::size_t(KH)*D;
     const std::size_t key_dim=std::size_t(S)*NK,value_dim=std::size_t(S)*NV,conv_dim=key_dim*2+value_dim;
+    if(start_pos>config_.context||T>config_.context-start_pos ||
+       kc.size()<config_.layers||vc.size()<config_.layers||
+       convc.size()<config_.layers||ssmc.size()<config_.layers)return false;
+    for(std::size_t l=0;l<config_.layers;++l){
+        if(layer_is_recurrent(static_cast<std::uint32_t>(l))){
+            if(convc[l].size()<(CK-1+std::size_t(start_pos)+T)*conv_dim||
+               ssmc[l].size()!=NV*S*S)return false;
+        }else if(kc[l].size()<(std::size_t(start_pos)+T)*KW ||
+                 vc[l].size()<(std::size_t(start_pos)+T)*KW)return false;
+    }
     const float eps=config_.rms_epsilon;
     std::vector<float> x(T*E),norm(T*E),tmp(T*E);
     std::vector<float> qkv(T*conv_dim),z(T*value_dim),conv_out(T*conv_dim);
@@ -995,6 +1011,12 @@ bool DenseTransformerRuntime::forward_q35_batch(const std::vector<std::uint32_t>
             // conv state ring: [CK-1, conv_dim] at offset 0, plus one scratch
             // window per position this batch can visit (prefill or decode).
             if(convc[l].size()<std::size_t(CK-1+start_pos+T)*conv_dim)return false;
+            // Starting at position zero begins a fresh sequence even if the
+            // caller reuses cache buffers from an earlier forward pass.
+            if(start_pos==0){
+                std::fill_n(convc[l].begin(),(CK-1)*conv_dim,0.0f);
+                std::fill(ssmc[l].begin(),ssmc[l].end(),0.0f);
+            }
             // The window has to be published BEFORE the convolution reads it;
             // window_row() below reads these same rows for idx >= 0.
             const float* state_ring=convc[l].data();
@@ -1112,13 +1134,12 @@ bool DenseTransformerRuntime::forward_q35_batch(const std::vector<std::uint32_t>
             // T-CK+1) reversed the window and corrupted every later step.
             // publish this batch's conv inputs at scratch rows [0, T), shift the
             // ring by T, then take the newest CK-1 rows of [ring | scratch].
-            for(std::size_t ch=0;ch<conv_dim;++ch){
-                // a fresh sequence starts with an empty ring
-                if(start_pos==0)for(std::size_t w=0;w<CK-1;++w)convc[l][w*conv_dim+ch]=0.0f;
-                for(std::size_t w=0;w<CK-1;++w){
-                    const std::int64_t idx=std::int64_t(T)-1-std::int64_t(w);
-                    convc[l][w*conv_dim+ch]=window_row(idx)[ch];
-                }
+            // Copy oldest destination first: for T < CK-1, a destination
+            // depends on an older ring row. Forward order overwrites that row
+            // before it is read, duplicating the newest token into the history.
+            for(std::size_t w=CK-1;w-- > 0;){
+                const std::int64_t idx=std::int64_t(T)-1-std::int64_t(w);
+                std::copy_n(window_row(idx),conv_dim,convc[l].data()+w*conv_dim);
             }
             // Gated norm: qwen35 build_norm_gated calls
             //   ggml_swiglu_split(ctx0, gate=z, normalized)
@@ -2074,7 +2095,7 @@ bool DenseTransformerRuntime::generate(const std::vector<std::uint32_t>& prompt,
     for(const auto&[id,bias]:options.logit_bias)if(id>=config_.vocab||!std::isfinite(bias))return fail("Logit bias contains an invalid token ID or non-finite value");
     if(prompt.size()>config_.context||max_new>config_.context-prompt.size())return fail("Prompt plus generation exceeds model context length");
     std::uint64_t kv_elements=config_.context;
-    for(std::uint64_t factor:{std::uint64_t(config_.kv_heads),std::uint64_t(config_.embedding/config_.heads),std::uint64_t(config_.layers)}){
+    for(std::uint64_t factor:{std::uint64_t(config_.kv_heads),std::uint64_t(config_.head_dim),std::uint64_t(config_.layers)}){
         if(factor&&kv_elements>std::numeric_limits<std::uint64_t>::max()/factor)return fail("KV cache size overflow");
         kv_elements*=factor;
     }
@@ -2101,6 +2122,14 @@ bool DenseTransformerRuntime::generate(const std::vector<std::uint32_t>& prompt,
     std::vector<std::vector<float>> convc,ssmc;
     using clock=std::chrono::steady_clock;auto t0=clock::now();
     {std::lock_guard<std::mutex> lock(prefix_cache_mutex_);if(prefix_cache_&&prefix_cache_->tokens==prompt){kc=prefix_cache_->key;vc=prefix_cache_->value;logits=prefix_cache_->logits;if(q35){convc=prefix_cache_->conv;ssmc=prefix_cache_->ssm;}cache_hit=true;}}
+    // Cache entries were allocated for the previous request's max_new, which
+    // need not match this one. Preserve the prompt state but size all request-
+    // local buffers for the positions the current generation may visit.
+    if(cache_hit){
+        for(auto& layer:kc)layer.resize(kvsize);
+        for(auto& layer:vc)layer.resize(kvsize);
+        if(q35)for(auto& layer:convc)layer.resize(std::size_t(config_.ssm_d_conv-1+cache_positions)*conv_dim);
+    }
 #if defined(ZEN_HAS_D3D12)
     // The device KV cache is not part of the host prefix cache. A hit restores kc/vc
     // on the host but leaves the device cache holding whatever the previous
@@ -2209,7 +2238,7 @@ bool DenseTransformerRuntime::generate_speculative(const std::vector<std::uint32
     // the allocation matches the work.
     const std::size_t cache_positions=prompt.size()+static_cast<std::size_t>(max_new);
     auto cache_elements=[](const RuntimeConfig& c,std::uint64_t& out){
-        out=c.context;for(std::uint64_t f:{std::uint64_t(c.kv_heads),std::uint64_t(c.embedding/c.heads),std::uint64_t(c.layers)}){if(f&&out>std::numeric_limits<std::uint64_t>::max()/f)return false;out*=f;}return out<=std::numeric_limits<std::uint64_t>::max()/(2*sizeof(float));};
+        out=c.context;for(std::uint64_t f:{std::uint64_t(c.kv_heads),std::uint64_t(c.head_dim),std::uint64_t(c.layers)}){if(f&&out>std::numeric_limits<std::uint64_t>::max()/f)return false;out*=f;}return out<=std::numeric_limits<std::uint64_t>::max()/(2*sizeof(float));};
     std::uint64_t target_elements{},draft_elements{};if(!cache_elements(config_,target_elements))return fail("Target KV cache size overflow");
     if(prompt.size()>draft.config_.context||!cache_elements(draft.config_,draft_elements))return generate(prompt,max_new,result,error,on_tokens,options,cancelled);
     zen::ResourceGovernor governor;const auto policy=governor.current_policy();
