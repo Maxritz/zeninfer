@@ -1102,4 +1102,5 @@ void gdn_output_avx2(const float* sh, const float* qh, float* oh,
     }
 }
 
+
 }  // namespace zen
