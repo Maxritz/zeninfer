@@ -542,7 +542,9 @@ if(ZEN_BUILD_TESTS)
   add_executable(zen_core_tests tests/core_tests.cpp)
   target_link_libraries(zen_core_tests PRIVATE zen_model_adapters)
   add_test(NAME zen_core_tests COMMAND zen_core_tests)
-  set_tests_properties(zen_core_tests PROPERTIES TIMEOUT 120)
+  # Coverage builds with atomic profile counters can be much slower on shared
+  # CI runners; retain a bounded timeout without killing valid coverage runs.
+  set_tests_properties(zen_core_tests PROPERTIES TIMEOUT 600)
   add_executable(zen_q35_incremental_tests tests/q35_incremental_tests.cpp)
   target_link_libraries(zen_q35_incremental_tests PRIVATE zen_model_adapters)
   add_executable(zen_new_quant_tests tests/new_quant_tests.cpp)

@@ -18,10 +18,10 @@ def main():
             if not quantised:
                 # The batch/chunk check alone shares runtime code. Independently
                 # compare each full-prefix row to the NumPy recurrence oracle.
-                data=np.load(Path(tmp)/(label+'.npz'))
-                params={k[3:]: (data[k].item() if data[k].ndim==0 else data[k])
-                        for k in data.files if k.startswith('p__')}
-                weights={k[3:]:data[k] for k in data.files if k.startswith('w__')}
+                with np.load(Path(tmp)/(label+'.npz')) as data:
+                    params={k[3:]: (data[k].item() if data[k].ndim==0 else data[k])
+                            for k in data.files if k.startswith('p__')}
+                    weights={k[3:]:data[k] for k in data.files if k.startswith('w__')}
                 tokens=[11,51,30,25,17,42,99,7]
                 worst=0.0
                 for end in range(1,len(tokens)+1):
