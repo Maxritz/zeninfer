@@ -1,0 +1,5 @@
+ffn_gate   8192x2048  t=128  cold=  126.3 ms best=   1.41 ms    3.04 TFLOP/s
+ffn_up     8192x2048  t=128  cold=    5.6 ms best=   1.41 ms    3.06 TFLOP/s
+ffn_down   2048x8192  t=128  cold=    6.9 ms best=   1.28 ms    3.35 TFLOP/s
+attn_q     2048x2048  t=128  cold=    1.7 ms best=   0.46 ms    2.31 TFLOP/s
+TOTAL 4.57 ms for 14.0 GFLOP -> 3.06 TFLOP/s (one layer's 4 big matmuls; 8000 tok/s needs ~15.4)

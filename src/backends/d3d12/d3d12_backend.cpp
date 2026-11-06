@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "q8_0_gemm_cso.h"
+#include "q8_0_gemm_sh_cso.h"
 #include "q8_0_gemm_v2_cso.h"
 #include "q8_0_gemm_v3_cso.h"
 #include "q8_0_gemm_fused_cso.h"
@@ -356,6 +357,7 @@ struct State {
     std::size_t dq_cap{}, dk_cap{}, dv_cap{}, dqr_cap{}, dkr_cap{};
     std::size_t dcos_cap{}, dsin_cap{}, datt_cap{};
     ComPtr<ID3D12PipelineState> pso_gemm;
+    ComPtr<ID3D12PipelineState> pso_gemm_sh;
     ComPtr<ID3D12PipelineState> pso_gemm_v2;
     ComPtr<ID3D12PipelineState> pso_gemm_v3;
     ComPtr<ID3D12PipelineState> pso_gemm_rt;
@@ -672,6 +674,13 @@ bool lm_fuse_enabled() {
 // int8-activation DP4A. Default OFF: the fp32 path is the parity default.
 bool dp4a_enabled() {
     const char* e = std::getenv("ZEN_D3D12_DP4A");
+    return e && e[0] == '1';
+}
+
+// Scale-hoist GEMM switch: ZEN_D3D12_GEMM_SCALEHOIST=1 selects the scale-hoisted
+// Q8_0 GEMM (scale multiplied once per block, mad() accumulation). Default OFF.
+bool gemm_sh_enabled() {
+    const char* e = std::getenv("ZEN_D3D12_GEMM_SCALEHOIST");
     return e && e[0] == '1';
 }
 
@@ -1335,6 +1344,7 @@ bool init_locked(State& s) {
     s.pso_rms = build_pso(s, zen_dx12_shaders::kRmsNormCso, zen_dx12_shaders::kRmsNormCsoSize);
     s.pso_silu = build_pso(s, zen_dx12_shaders::kSiluMulCso, zen_dx12_shaders::kSiluMulCsoSize);
     s.pso_gemm = build_pso(s, zen_dx12_shaders::kQ8_0GemmCso, zen_dx12_shaders::kQ8_0GemmCsoSize);
+    s.pso_gemm_sh = build_pso(s, zen_dx12_shaders::kQ8_0GemmShCso, zen_dx12_shaders::kQ8_0GemmShCsoSize);
     // GEMM v2 (256-thread groups, halved accumulators, bit-identical): optional,
     // selected by ZEN_D3D12_GEMM_V2=1; v1 stays the default until validated.
     s.pso_gemm_v2 = build_pso(s, zen_dx12_shaders::kQ8_0GemmV2Cso, zen_dx12_shaders::kQ8_0GemmV2CsoSize);
@@ -2120,6 +2130,7 @@ bool gemv_batch_locked(State& s, const float* x, const GemvTask* tasks, std::siz
     if (s.trace) {
         s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
     }
+    const bool use_rt_b = gemm_rt_enabled() && s.pso_gemm_rt != nullptr;
     for (std::size_t i = 0; i < count; ++i) {
         s.list->SetComputeRootConstantBufferView(
             0, s.params->GetGPUVirtualAddress() + 512 + 256 * i);
@@ -2316,6 +2327,7 @@ bool gemm_locked(State& s, const std::uint8_t* weights, const float* input, floa
     const bool use_v3 = !dp4a && gemm_v3_enabled() && s.pso_gemm_v3 != nullptr;
     const bool use_v2 = !dp4a && !use_v3 && gemm_v2_enabled() && s.pso_gemm_v2 != nullptr;
     const bool use_fused = !dp4a && !use_v3 && !use_v2 && gemm_fused_enabled() && s.pso_gemm_fused != nullptr;
+    const bool use_sh = !dp4a && !use_v3 && !use_v2 && !use_fused && gemm_sh_enabled() && s.pso_gemm_sh != nullptr;
     const std::uint32_t tile_v2 = use_v3 ? kTokensPerTileV3
                                     : (use_v2 ? kTokensPerTileV2 : kTokensPerTile);
     const std::uint32_t rpg_v2 = use_v3 ? kGemmRowsPerGroupV3
@@ -2387,7 +2399,8 @@ bool gemm_locked(State& s, const std::uint8_t* weights, const float* input, floa
                   dp4a ? s.pso_gemm_dp4a.Get()
                         : (use_fused ? s.pso_gemm_fused.Get()
                         : (use_v3 ? s.pso_gemm_v3.Get()
-                       : (use_v2 ? s.pso_gemm_v2.Get() : s.pso_gemm.Get()))));
+                        : (use_v2 ? s.pso_gemm_v2.Get()
+                        : (use_sh ? s.pso_gemm_sh.Get() : s.pso_gemm.Get())))));
     s.list->SetComputeRootSignature(s.root.Get());
     s.list->SetComputeRootConstantBufferView(0, s.params->GetGPUVirtualAddress() + 256);
     s.list->SetComputeRootShaderResourceView(1, entry->quants->GetGPUVirtualAddress());
@@ -2519,6 +2532,8 @@ bool gemm_batch_locked(State& s, const float* x, const GemmTask* tasks,
     const bool use_v3_b = gemm_v3_enabled() && s.pso_gemm_v3 != nullptr;
     const bool use_v2_b = !use_v3_b && gemm_v2_enabled() && s.pso_gemm_v2 != nullptr;
     const bool use_fused_b = !use_v3_b && !use_v2_b && gemm_fused_enabled() && s.pso_gemm_fused != nullptr;
+    const bool use_sh_b = !use_v3_b && !use_v2_b && !use_fused_b && gemm_sh_enabled() && s.pso_gemm_sh != nullptr;
+    const bool use_rt_b = !use_v3_b && !use_v2_b && !use_fused_b && !use_sh_b && gemm_rt_enabled() && s.pso_gemm_rt != nullptr;
     const std::uint32_t tile_b = use_v3_b ? kTokensPerTileV3
                               : (use_v2_b ? kTokensPerTileV2 : kTokensPerTile);
     const std::uint32_t rpg_b = use_v3_b ? kGemmRowsPerGroupV3
@@ -2780,8 +2795,8 @@ bool gemm_rt_batch(State& s, const float* x, const GemmTask* tasks,
         s.list->SetComputeRootShaderResourceView(3, s.xbuf->GetGPUVirtualAddress());
         s.list->SetComputeRootShaderResourceView(4, s.xbuf->GetGPUVirtualAddress());
         s.list->SetComputeRootUnorderedAccessView(5, s.ybuf->GetGPUVirtualAddress() + offsets[i]);
-        const std::uint32_t gx = static_cast<std::uint32_t>((tasks[i].rows + 3u) / 4u);
-        const std::uint32_t gy = static_cast<std::uint32_t>((tokens + 7u) / 8u);
+        std::uint32_t gx = static_cast<std::uint32_t>((tasks[i].rows + 3u) / 4u);
+        std::uint32_t gy = static_cast<std::uint32_t>((tokens + 7u) / 8u);
         s.list->Dispatch(gx, gy, 1);
     }
     if (s.trace) {
