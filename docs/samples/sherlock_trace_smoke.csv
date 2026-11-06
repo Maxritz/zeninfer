@@ -1,0 +1,6 @@
+component,phase,ops,exclusive_total_us,inclusive_total_us,avg_exclusive_us,min_exclusive_us,max_exclusive_us
+"instrumentation.floor",other,256,4.491,4.491,0.017543,0.017,0.023
+"gemm.selected",compute,12,25349,25349,2112.41,89.147,6657.42
+"gemm.scalar",compute,12,760148,760148,63345.7,1978.74,202090
+"gemv.selected",compute,16,312303,312303,19519,7905.65,46101.2
+"gemv.scalar",compute,16,1.1006e+06,1.1006e+06,68787.3,22699.6,161255

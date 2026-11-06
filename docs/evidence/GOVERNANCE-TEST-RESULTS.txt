@@ -1,0 +1,19 @@
+Governance adoption test results
+Date: 2026-10-31
+
+1) python3 .zeninfer-governance-check.py
+   PASS: 5/5 policy assertions
+
+2) cmake -S . -B build-avx2 -DZEN_ENABLE_AVX2=ON -DZEN_BUILD_TESTS=ON
+   cmake --build build-avx2 -j2
+   ctest --test-dir build-avx2 --output-on-failure
+   PASS: 8/8 CTest tests
+
+3) cmake -S . -B build-scalar -DZEN_ENABLE_AVX2=OFF -DZEN_BUILD_TESTS=ON
+   cmake --build build-scalar -j2
+   ctest --test-dir build-scalar --output-on-failure
+   PASS: 8/8 CTest tests (standalone rerun after combined command timeout)
+
+Caveat: CMake reports ZEN_ENABLE_AVX2 is not a recognised project option. The suite passed in both build directories, but these results alone do not prove that one build used AVX2 and the other disabled it. Confirm the actual compile flags/dispatch before using them as ISA comparison evidence.
+
+No production source code changed in this governance-only task. No ECC native hooks/agents were installed or invoked. No MSVC run occurred.

@@ -1,0 +1,157 @@
+Opened log file 'H:\llamadx\update\zeninfer\tmp_cdb.log'
+
+************* Preparing the environment for Debugger Extensions Gallery repositories **************
+   ExtensionRepository : Implicit
+   UseExperimentalFeatureForNugetShare : true
+   AllowNugetExeUpdate : true
+   NonInteractiveNuget : true
+   AllowNugetMSCredentialProviderInstall : true
+   AllowParallelInitializationOfLocalRepositories : true
+   EnableRedirectToChakraJsProvider : false
+
+   -- Configuring repositories
+      ----> Repository : LocalInstalled, Enabled: true
+      ----> Repository : UserExtensions, Enabled: true
+
+>>>>>>>>>>>>> Preparing the environment for Debugger Extensions Gallery repositories completed, duration 0.000 seconds
+
+************* Waiting for Debugger Extensions Gallery to Initialize **************
+
+>>>>>>>>>>>>> Waiting for Debugger Extensions Gallery to Initialize completed, duration 0.031 seconds
+   ----> Repository : UserExtensions, Enabled: true, Packages count: 0
+   ----> Repository : LocalInstalled, Enabled: true, Packages count: 30
+
+Microsoft (R) Windows Debugger Version 10.0.28000.2526 AMD64
+Copyright (c) Microsoft Corporation. All rights reserved.
+
+CommandLine: H:\llamadx\update\zeninfer\build-dx12\zen_generate_ids.exe H:\llamadx\models\Llama-3.2-1B-Instruct-Q8_0.gguf --prompt-ids 12805 --max-new 1 --runs 1
+NatVis script successfully loaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\atlmfc.natvis'
+NatVis script successfully loaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\concurrency.natvis'
+NatVis script successfully loaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\cpp_rest.natvis'
+NatVis script successfully loaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\ObjectiveC.natvis'
+NatVis script successfully loaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\stl.natvis'
+NatVis script successfully loaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Data.Json.natvis'
+NatVis script successfully loaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Devices.Geolocation.natvis'
+NatVis script successfully loaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Devices.Sensors.natvis'
+NatVis script successfully loaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Media.natvis'
+NatVis script successfully loaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\windows.natvis'
+NatVis script successfully loaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\winrt.natvis'
+
+************* Path validation summary **************
+Response                         Time (ms)     Location
+Deferred                                       srv*
+Symbol search path is: srv*
+Executable search path is: 
+
++------------------------------------------------------------------------+
+| This target supports Hardware-enforced Stack Protection. A HW based    |
+| "Shadow Stack" may be available to assist in debugging and analysis.   |
+| See aka.ms/userhsp for more info.                                      |
+|                                                                        |
+| dps @ssp                                                               |
+|                                                                        |
++------------------------------------------------------------------------+
+
+ModLoad: 00007ff6`00ec0000 00007ff6`00f91000   zen_generate_ids.exe
+ModLoad: 00007ffb`a8c30000 00007ffb`a8e98000   ntdll.dll
+ModLoad: 00007ffb`a7590000 00007ffb`a764f000   C:\WINDOWS\System32\KERNEL32.DLL
+ModLoad: 00007ffb`a5f20000 00007ffb`a632e000   C:\WINDOWS\System32\KERNELBASE.dll
+ModLoad: 00007ffb`a6810000 00007ffb`a6957000   C:\WINDOWS\System32\ucrtbase.dll
+ModLoad: 00007ffb`93fb0000 00007ffb`9404d000   C:\WINDOWS\SYSTEM32\MSVCP140.dll
+ModLoad: 00007ffb`274d0000 00007ffb`274f1000   C:\WINDOWS\SYSTEM32\d3d12.dll
+ModLoad: 00007ffb`a31c0000 00007ffb`a32ff000   C:\WINDOWS\SYSTEM32\dxgi.dll
+ModLoad: 00007ffb`93f70000 00007ffb`93f9c000   C:\WINDOWS\SYSTEM32\VCRUNTIME140.dll
+ModLoad: 00007ffb`a5e70000 00007ffb`a5f0e000   C:\WINDOWS\System32\msvcp_win.dll
+ModLoad: 0000027f`b8210000 0000027f`b82ae000   C:\WINDOWS\System32\msvcp_win.dll
+ModLoad: 00007ffb`93fa0000 00007ffb`93fac000   C:\WINDOWS\SYSTEM32\VCRUNTIME140_1.dll
+ModLoad: 00007ffb`a6660000 00007ffb`a6687000   C:\WINDOWS\System32\win32u.dll
+ModLoad: 0000027f`b8210000 0000027f`b821c000   C:\WINDOWS\SYSTEM32\VCRUNTIME140_1.dll
+ModLoad: 00007ffb`a5ca0000 00007ffb`a5cfd000   C:\WINDOWS\SYSTEM32\powrprof.dll
+ModLoad: 00007ffb`a8a30000 00007ffb`a8b42000   C:\WINDOWS\System32\RPCRT4.dll
+(2ae8.6684): Break instruction exception - code 80000003 (first chance)
+ntdll!LdrpDoDebuggerBreak+0x38:
+00007ffb`a8d51b78 cc              int     3
+0:000> sxe av
+0:000> g
+ModLoad: 00007ffb`a5c80000 00007ffb`a5c9a000   C:\WINDOWS\SYSTEM32\UMPDC.dll
+ModLoad: 00007ffb`a8900000 00007ffb`a8930000   C:\WINDOWS\System32\gdi32.dll
+ModLoad: 00007ffb`a6480000 00007ffb`a659d000   C:\WINDOWS\System32\gdi32full.dll
+ModLoad: 00007ffb`a5e40000 00007ffb`a5e69000   C:\WINDOWS\System32\etw.dll
+ModLoad: 00007ffb`a86f0000 00007ffb`a88c3000   C:\WINDOWS\System32\USER32.dll
+ModLoad: 00007ffb`a7ca0000 00007ffb`a7ccd000   C:\WINDOWS\System32\IMM32.DLL
+ModLoad: 00007ffa`c37c0000 00007ffa`c3c95000   H:\llamadx\update\zeninfer\build-dx12\D3D12Core.dll
+ModLoad: 00007ffb`a8b50000 00007ffb`a8bd6000   C:\WINDOWS\System32\sechost.dll
+ModLoad: 00007ffb`a8430000 00007ffb`a84e5000   C:\WINDOWS\System32\advapi32.dll
+ModLoad: 00007ffb`a7b70000 00007ffb`a7c18000   C:\WINDOWS\System32\msvcrt.dll
+ModLoad: 00007ffb`a77f0000 00007ffb`a7b69000   C:\WINDOWS\System32\combase.dll
+ModLoad: 00007ffb`a69b0000 00007ffb`a710f000   C:\WINDOWS\System32\SHELL32.dll
+ModLoad: 00007ffb`a4b70000 00007ffb`a4b8b000   C:\WINDOWS\SYSTEM32\kernel.appcore.dll
+ModLoad: 00007ffb`a3160000 00007ffb`a31b4000   C:\WINDOWS\SYSTEM32\dxcore.dll
+ModLoad: 00007ffb`a6690000 00007ffb`a6804000   C:\WINDOWS\System32\CRYPT32.dll
+ModLoad: 00007ffb`a72f0000 00007ffb`a73ea000   C:\WINDOWS\System32\shcore.dll
+ModLoad: 00007ffb`a59c0000 00007ffb`a5a10000   C:\WINDOWS\SYSTEM32\cfgmgr32.dll
+ModLoad: 00007ffb`a5b20000 00007ffb`a5bcb000   C:\WINDOWS\SYSTEM32\bcryptprimitives.dll
+ModLoad: 00007ffb`a36d0000 00007ffb`a36e7000   C:\WINDOWS\SYSTEM32\resourcepolicyclient.dll
+ModLoad: 00007ffb`9ec50000 00007ffb`9ecb0000   C:\WINDOWS\SYSTEM32\directxdatabasehelper.dll
+onecore\windows\directx\database\helperlibrary\lib\perappusersettingsqueryimpl.cpp(135)\directxdatabasehelper.dll!00007FFB9EC6D7F8: (caller: 00007FFB9EC6D6B7) ReturnHr(1) tid(6684) 80070002 The system cannot find the file specified.
+onecore\windows\directx\database\helperlibrary\lib\directxdatabasehelper.cpp(2328)\directxdatabasehelper.dll!00007FFB9EC65E30: (caller: 00007FFBA3229860) ReturnHr(2) tid(6684) 80070002 The system cannot find the file specified.
+onecore\windows\directx\database\helperlibrary\lib\perappusersettingsqueryimpl.cpp(135)\directxdatabasehelper.dll!00007FFB9EC6D7F8: (caller: 00007FFB9EC6D6B7) ReturnHr(3) tid(6684) 80070002 The system cannot find the file specified.
+onecore\windows\directx\database\helperlibrary\lib\perappusersettingsqueryimpl.cpp(135)\directxdatabasehelper.dll!00007FFB9EC6D7F8: (caller: 00007FFB9EC6D6B7) ReturnHr(4) tid(6684) 80070002 The system cannot find the file specified.
+onecore\windows\directx\database\helperlibrary\lib\perappusersettingsqueryimpl.cpp(135)\directxdatabasehelper.dll!00007FFB9EC6D7F8: (caller: 00007FFB9EC6D6B7) ReturnHr(5) tid(6684) 80070002 The system cannot find the file specified.
+onecore\windows\directx\database\helperlibrary\lib\perappusersettingsqueryimpl.cpp(135)\directxdatabasehelper.dll!00007FFB9EC6D7F8: (caller: 00007FFB9EC6D6B7) ReturnHr(6) tid(6684) 80070002 The system cannot find the file specified.
+onecore\windows\directx\database\helperlibrary\lib\perappusersettingsqueryimpl.cpp(135)\directxdatabasehelper.dll!00007FFB9EC6D7F8: (caller: 00007FFB9EC6D6B7) ReturnHr(7) tid(6684) 80070002 The system cannot find the file specified.
+onecore\windows\directx\database\helperlibrary\lib\perappusersettingsqueryimpl.cpp(135)\directxdatabasehelper.dll!00007FFB9EC6D7F8: (caller: 00007FFB9EC6D6B7) ReturnHr(8) tid(6684) 80070002 The system cannot find the file specified.
+onecore\windows\directx\database\helperlibrary\lib\perappusersettingsqueryimpl.cpp(135)\directxdatabasehelper.dll!00007FFB9EC6D7F8: (caller: 00007FFB9EC6D6B7) ReturnHr(9) tid(6684) 80070002 The system cannot find the file specified.
+onecore\windows\directx\database\helperlibrary\lib\perappusersettingsqueryimpl.cpp(135)\directxdatabasehelper.dll!00007FFB9EC6D7F8: (caller: 00007FFB9EC6D6B7) ReturnHr(10) tid(6684) 80070002 The system cannot find the file specified.
+ModLoad: 00007ffa`c7610000 00007ffa`cfd8f000   C:\WINDOWS\System32\DriverStore\FileRepository\u0204178.inf_amd64_bf339633144a741d\B026502\amdxc64.dll
+ModLoad: 00007ffb`9dbc0000 00007ffb`9dbcb000   C:\WINDOWS\SYSTEM32\VERSION.dll
+ModLoad: 00007ffb`9a920000 00007ffb`9a955000   C:\WINDOWS\SYSTEM32\WINMM.dll
+ModLoad: 00007ffb`a39e0000 00007ffb`a429d000   C:\WINDOWS\SYSTEM32\windows.storage.dll
+ModLoad: 00007ffb`a7780000 00007ffb`a77e0000   C:\WINDOWS\System32\shlwapi.dll
+ModLoad: 00007ffb`a73f0000 00007ffb`a7581000   C:\WINDOWS\System32\ole32.dll
+ModLoad: 00007ffb`a65b0000 00007ffb`a65da000   C:\WINDOWS\System32\BCrypt.dll
+ModLoad: 00007ffb`98510000 00007ffb`98553000   C:\WINDOWS\System32\DriverStore\FileRepository\u0204178.inf_amd64_bf339633144a741d\B026502\amdihk64.dll
+onecore\windows\directx\database\helperlibrary\lib\directxdatabasehelper.cpp(969)\directxdatabasehelper.dll!00007FFB9EC64EF3: (caller: 00007FFB9EC6466C) ReturnNt(11) tid(6684) C00000BB The request is not supported.
+onecore\windows\directx\database\helperlibrary\lib\directxdatabasehelper.cpp(969)\directxdatabasehelper.dll!00007FFB9EC64EF3: (caller: 00007FFB9EC6466C) ReturnNt(12) tid(6684) C00000BB The request is not supported.
+ModLoad: 00007ffb`11060000 00007ffb`11146000   C:\WINDOWS\SYSTEM32\D3DSCache.dll
+ModLoad: 00007ffb`a50e0000 00007ffb`a5112000   C:\WINDOWS\SYSTEM32\USERENV.dll
+ModLoad: 00007ffa`c67d0000 00007ffa`c699b000   C:\WINDOWS\SYSTEM32\dxilconv.dll
+onecore\windows\directx\database\helperlibrary\lib\perappusersettingsqueryimpl.cpp(135)\directxdatabasehelper.dll!00007FFB9EC6D7F8: (caller: 00007FFB9EC6D6B7) ReturnHr(13) tid(6684) 80070002 The system cannot find the file specified.
+(2ae8.6684): Access violation - code c0000005 (first chance)
+First chance exceptions are reported before any exception handling.
+This exception may be expected and handled.
+D3D12Core!ConvertRootSignature+0x4b3:
+00007ffa`c3912e7f 428b448a04      mov     eax,dword ptr [rdx+r9*4+4] ds:00007ff6`00f91000=????????
+0:000> .echo ===AV CAUGHT===
+===AV CAUGHT===
+0:000> .r
+        ^ Syntax error in '.r'
+0:000> kb 15
+RetAddr               : Args to Child                                                           : Call Site
+00007ffa`c3914678     : 000000ff`00000007 00000000`00000001 000000ff`6035cf78 00007ffa`60685810 : D3D12Core!ConvertRootSignature+0x4b3
+00007ffa`c37d518a     : 000000ff`61d9fab8 000000ff`61d9fab8 000000ff`61d9fad0 00000000`00000001 : D3D12Core!RootSignatureVerifier::VerifyRootSignature+0x80
+00007ffb`274d679f     : 000000ff`6035d418 00000000`00000001 00000000`00000000 00000000`00000038 : D3D12Core!D3D12SerializeRootSignature+0xaa
+*** WARNING: Unable to verify checksum for zen_generate_ids.exe
+00007ff6`00ef6cff     : 00000000`00000000 00007ff6`00000009 000000ff`61d9faa0 00000000`00000009 : d3d12!D3D12SerializeRootSignature+0x4f
+00007ff6`00efc26d     : 000000ff`61d89a60 00007ff6`00f8a150 00007ffa`c3b50160 000000ff`61d89ba0 : zen_generate_ids+0x36cff
+00007ff6`00efbc7f     : 000000ff`6035d9c0 00000000`00000008 000000ff`6070efc8 000000ff`6070c820 : zen_generate_ids+0x3c26d
+00007ff6`00ed7d28     : 00000000`00000008 00007ffb`a8c83041 00000000`00000001 000000ff`60610000 : zen_generate_ids+0x3bc7f
+00007ff6`00ee0443     : 00000000`00000000 00000000`00000000 000000ff`6035f6d0 00000000`00000000 : zen_generate_ids+0x17d28
+00007ff6`00ec4330     : 0000000b`44a9678c 000000ff`00000000 00000000`00000000 00000000`00000030 : zen_generate_ids+0x20443
+00007ff6`00f290ef     : 000000ff`60622340 00007ff6`00f29169 00000000`00000000 00000000`00000000 : zen_generate_ids+0x4330
+00007ffb`a75bee63     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : zen_generate_ids+0x690ef
+00007ffb`a8caa560     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : KERNEL32!BaseThreadInitThunk+0x13
+00000000`00000000     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!RtlUserThreadStart+0x20
+0:000> q
+quit:
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\atlmfc.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\concurrency.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\cpp_rest.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\ObjectiveC.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\stl.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Data.Json.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Devices.Geolocation.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Devices.Sensors.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Media.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\windows.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\winrt.natvis'

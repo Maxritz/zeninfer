@@ -1,0 +1,36 @@
+STALE (2026-11-05): superseded by FINAL_STATUS.md — see root status for current build/test evidence.
+ZenInfer 0.4.6 working-copy verification
+
+Scope: Qwen2 dense-layout synthetic fixture and independent NumPy forward parity.
+Not a release and not a claim that all remaining-work items are complete.
+
+AVX2 build: PASS
+AVX2 CTest: 9/9 PASS
+Scalar build: PASS
+Scalar CTest: 9/9 PASS
+Windows/MSVC: NOT RUN (Linux execution environment)
+
+Independent NumPy parity:
+  max_abs_error = 5.7220458984375e-06
+  mean_abs_error = 7.013059548626188e-07
+  rms_error = 9.407100268923686e-07
+  argmax_match = true
+  top5_match = true
+
+Synthetic fixture SHA256:
+  314e6c9f9ee40a2f564e29ee1bc90c28e27236f8b71444e1e1b0aa8f8b59cd20
+
+The fixture preserves Tiny-LLM/Llama tensor payloads and rewrites architecture
+metadata to Qwen2. It is a layout/dispatch test, not a Qwen2-trained checkpoint.
+
+qwen35-hybrid (ZI-004) addition, 2026-11-01:
+  AVX2, scalar and ASan/UBSan builds: 9/9 CTest each.
+  ASan/UBSan zen_parity_probe: CLEAN on prefill and decode across 1-, 2-, 3-
+    and 5-token prompts, f32 / PTQ1_0 / identity-signs variants.
+  zen_bonsai2_hybrid_parity --numeric (now the CTest gate): PASS
+    f32      abs=5.7e-05 rel=2.6e-05 argmax match top5 match (parity gate)
+    ptq1_0   spearman=0.989 argmax match (rank-graded; quantization loss)
+  f32 Spearman rank correlation vs the reference: 1.000000 across depth 1-8.
+  Real Ternary-Bonsai-2 checkpoint: NOT RUN (synthetic fixture only).
+  Detail: docs/REMAINING_WORK.md ZI-004 and
+    docs/evidence/ZI-004-qwen35-hybrid-loader-and-gdn.md.

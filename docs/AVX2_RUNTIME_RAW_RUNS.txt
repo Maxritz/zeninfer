@@ -1,0 +1,10 @@
+avx2 run1 load_ms=45.5409 prefill_ms=18.849 decode_ms=352.519 decode_tokens_per_second=280.836
+avx2 run2 load_ms=40.0891 prefill_ms=12.5832 decode_ms=299.079 decode_tokens_per_second=331.017
+avx2 run3 load_ms=43.2034 prefill_ms=14.6783 decode_ms=286.494 decode_tokens_per_second=345.557
+avx2 run4 load_ms=44.6165 prefill_ms=12.1587 decode_ms=294.276 decode_tokens_per_second=336.419
+avx2 run5 load_ms=41.3282 prefill_ms=11.9739 decode_ms=279.064 decode_tokens_per_second=354.757
+scalar run1 load_ms=37.9501 prefill_ms=65.5706 decode_ms=1400.31 decode_tokens_per_second=70.6985
+scalar run2 load_ms=44.5835 prefill_ms=71.7386 decode_ms=1391.09 decode_tokens_per_second=71.1675
+scalar run3 load_ms=41.8205 prefill_ms=68.786 decode_ms=1453.22 decode_tokens_per_second=68.1247
+scalar run4 load_ms=45.4378 prefill_ms=75.9762 decode_ms=1440.09 decode_tokens_per_second=68.7459
+scalar run5 load_ms=39.2267 prefill_ms=70.9142 decode_ms=1399.77 decode_tokens_per_second=70.7258

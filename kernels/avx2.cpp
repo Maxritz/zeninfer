@@ -1,0 +1,528 @@
+#include "zen/kernels.h"
+#include <immintrin.h>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <cmath>
+#include <limits>
+#include <vector>
+
+namespace zen {
+void gemv_avx2(const float* a, const float* x, float* y,
+               std::size_t m, std::size_t k) {
+    for (std::size_t i=0; i<m; ++i) {
+        const float* row = a + i*k;
+        std::size_t p = 0;
+        __m256 s0 = _mm256_setzero_ps();
+        __m256 s1 = _mm256_setzero_ps();
+        __m256 s2 = _mm256_setzero_ps();
+        __m256 s3 = _mm256_setzero_ps();
+        for (; p + 31 < k; p += 32) {
+            s0 = _mm256_fmadd_ps(_mm256_loadu_ps(row+p),      _mm256_loadu_ps(x+p),      s0);
+            s1 = _mm256_fmadd_ps(_mm256_loadu_ps(row+p+8),    _mm256_loadu_ps(x+p+8),    s1);
+            s2 = _mm256_fmadd_ps(_mm256_loadu_ps(row+p+16),   _mm256_loadu_ps(x+p+16),   s2);
+            s3 = _mm256_fmadd_ps(_mm256_loadu_ps(row+p+24),   _mm256_loadu_ps(x+p+24),   s3);
+        }
+        __m256 sum = _mm256_add_ps(_mm256_add_ps(s0,s1), _mm256_add_ps(s2,s3));
+        for (; p + 7 < k; p += 8)
+            sum = _mm256_fmadd_ps(_mm256_loadu_ps(row+p), _mm256_loadu_ps(x+p), sum);
+        alignas(32) float lanes[8];
+        _mm256_store_ps(lanes, sum);
+        float total = lanes[0]+lanes[1]+lanes[2]+lanes[3]+lanes[4]+lanes[5]+lanes[6]+lanes[7];
+        for (; p<k; ++p) total += row[p]*x[p];
+        y[i] = total;
+    }
+}
+
+// 4x8 register micro-kernel. B is traversed contiguously; each loaded B vector
+// is reused across four rows of A. Edge tiles fall back to scalar code.
+void gemm_avx2(const float* a, const float* b, float* c,
+               std::size_t m, std::size_t n, std::size_t k) {
+    constexpr std::size_t MR=4, NR=8;
+    for (std::size_t i0=0; i0<m; i0+=MR) {
+        for (std::size_t j0=0; j0<n; j0+=NR) {
+            const std::size_t rows = (m-i0 < MR) ? (m-i0) : MR;
+            const std::size_t cols = (n-j0 < NR) ? (n-j0) : NR;
+            if (rows != MR || cols != NR) {
+                for (std::size_t ii=0; ii<rows; ++ii)
+                    for (std::size_t jj=0; jj<cols; ++jj) {
+                        float sum=0.0f;
+                        for (std::size_t p=0; p<k; ++p)
+                            sum += a[(i0+ii)*k+p]*b[p*n+(j0+jj)];
+                        c[(i0+ii)*n+(j0+jj)] = sum;
+                    }
+                continue;
+            }
+            __m256 c0=_mm256_setzero_ps(), c1=_mm256_setzero_ps();
+            __m256 c2=_mm256_setzero_ps(), c3=_mm256_setzero_ps();
+            for (std::size_t p=0; p<k; ++p) {
+                const __m256 bv = _mm256_loadu_ps(b+p*n+j0);
+                c0 = _mm256_fmadd_ps(_mm256_set1_ps(a[(i0+0)*k+p]), bv, c0);
+                c1 = _mm256_fmadd_ps(_mm256_set1_ps(a[(i0+1)*k+p]), bv, c1);
+                c2 = _mm256_fmadd_ps(_mm256_set1_ps(a[(i0+2)*k+p]), bv, c2);
+                c3 = _mm256_fmadd_ps(_mm256_set1_ps(a[(i0+3)*k+p]), bv, c3);
+            }
+            _mm256_storeu_ps(c+(i0+0)*n+j0, c0);
+            _mm256_storeu_ps(c+(i0+1)*n+j0, c1);
+            _mm256_storeu_ps(c+(i0+2)*n+j0, c2);
+            _mm256_storeu_ps(c+(i0+3)*n+j0, c3);
+        }
+    }
+}
+}
+
+
+namespace zen {
+namespace {
+float q8_half_to_float(std::uint16_t h) noexcept {
+    const std::uint32_t sign=std::uint32_t(h&0x8000u)<<16;
+    std::uint32_t exp=(h>>10)&31u, mant=h&1023u, out{};
+    if(exp==0){
+        if(mant==0) out=sign;
+        else { int e=-14; while((mant&1024u)==0){mant<<=1;--e;} mant&=1023u; out=sign|(std::uint32_t(e+127)<<23)|(mant<<13); }
+    } else if(exp==31) out=sign|0x7f800000u|(mant<<13);
+    else out=sign|((exp+112u)<<23)|(mant<<13);
+    float f; std::memcpy(&f,&out,sizeof(f)); return f;
+}
+}
+// Sum the eight lanes. The previous version stored to a stack array and summed
+// scalars once per 32-element block, which cost more than the dot product itself.
+static inline float hsum_ps256(__m256 v) {
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 s  = _mm_add_ps(lo, hi);
+    s = _mm_hadd_ps(s, s);
+    s = _mm_hadd_ps(s, s);
+    return _mm_cvtss_f32(s);
+}
+
+// Quantise one activation vector to Q8_0 form: 32 int8 per block plus a scale.
+// Used only by the opt-in int8 path below.
+static void quantise_acts_q8_0(const float* x, std::size_t columns,
+                               std::vector<std::int8_t>& q, std::vector<float>& sc) {
+    const std::size_t blocks = columns / 32;
+    q.resize(blocks * 32);
+    sc.resize(blocks);
+    for (std::size_t b = 0; b < blocks; ++b) {
+        const float* xb = x + b * 32;
+        float amax = 0.0f;
+        for (unsigned i = 0; i < 32; ++i) {
+            const float a = std::fabs(xb[i]);
+            amax = a > amax ? a : amax;
+        }
+        const float d = amax > 0.0f ? amax / 127.0f : 0.0f;
+        const float inv = d > 0.0f ? 1.0f / d : 0.0f;
+        sc[b] = d;
+        std::int8_t* qb = q.data() + b * 32;
+        for (unsigned i = 0; i < 32; ++i) {
+            float v = xb[i] * inv;
+            v = v > 127.0f ? 127.0f : (v < -127.0f ? -127.0f : v);
+            qb[i] = static_cast<std::int8_t>(std::lround(v));
+        }
+    }
+}
+
+// int8 x int8 dot per block, 32 MACs in five instructions (two sign, maddubs,
+// madd, convert). This is llama.cpp's non-VNNI AVX2 formulation; this CPU is Zen 3,
+// so there is no _mm256_dpbusd_epi32 to use instead.
+// Opt-in: quantising the activations changes the arithmetic, so the exact fp32
+// path below stays the default and the parity tests keep covering it.
+static bool gemv_q8_0_avx2_int8(const std::uint8_t* weights, const float* x, float* y,
+                                std::size_t rows, std::size_t columns) {
+    const std::size_t blocks = columns / 32, row_bytes = blocks * 34;
+    thread_local std::vector<std::int8_t> xq;
+    thread_local std::vector<float> xsc;
+    quantise_acts_q8_0(x, columns, xq, xsc);
+
+    for (std::size_t r = 0; r < rows; ++r) {
+        const std::uint8_t* row = weights + r * row_bytes;
+        __m256 acc = _mm256_setzero_ps();
+        for (std::size_t b = 0; b < blocks; ++b) {
+            const std::uint8_t* p = row + b * 34;
+            const float d = q8_half_to_float(std::uint16_t(p[0]) | (std::uint16_t(p[1]) << 8)) * xsc[b];
+            const __m256i qw = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + 2));
+            const __m256i qa = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xq.data() + b * 32));
+            // |w| * (a * sign(w)) == w * a, in the unsigned-x-signed form maddubs
+            // needs. |w| <= 128 and |a| <= 127, so a pair sum stays under 32767 and
+            // the int16 intermediate cannot saturate.
+            const __m256i aw = _mm256_sign_epi8(qw, qw);
+            const __m256i sa = _mm256_sign_epi8(qa, qw);
+            const __m256i p16 = _mm256_maddubs_epi16(aw, sa);
+            const __m256i p32 = _mm256_madd_epi16(p16, _mm256_set1_epi16(1));
+            acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(p32), acc);
+        }
+        y[r] = hsum_ps256(acc);
+    }
+    return true;
+}
+
+bool gemv_q8_0_avx2(const std::uint8_t* weights,const float* x,float* y,
+                    std::size_t rows,std::size_t columns) {
+    if(!weights||!x||!y||!rows||!columns||columns%32) return false;
+    static const bool use_int8 = [] {
+        const char* e = std::getenv("ZEN_CPU_Q8_ACT");
+        return e && e[0] == '1';
+    }();
+    if (use_int8) return gemv_q8_0_avx2_int8(weights, x, y, rows, columns);
+
+    // Exact fp32 activations (the parity path).
+    //
+    // Kept bit-comparable with dequantise-then-dot, but the reduction is now a
+    // single horizontal sum at the end. The old version stored the vector to a
+    // stack array and summed eight scalars for every 32-element block, so a
+    // 2048-wide row paid 64 stores plus 512 scalar adds on top of the dot
+    // products; here each block costs four vector adds and one FMA.
+    const std::size_t blocks=columns/32, row_bytes=blocks*34;
+    for(std::size_t r=0;r<rows;++r){
+        const std::uint8_t* row=weights+r*row_bytes;
+        __m256 acc=_mm256_setzero_ps();
+        for(std::size_t b=0;b<blocks;++b){
+            const std::uint8_t* p=row+b*34;
+            const float d=q8_half_to_float(std::uint16_t(p[0])|(std::uint16_t(p[1])<<8));
+            __m256 a0=_mm256_setzero_ps(),a1=_mm256_setzero_ps();
+            __m256 a2=_mm256_setzero_ps(),a3=_mm256_setzero_ps();
+            for(unsigned chunk=0;chunk<4;++chunk){
+                std::uint64_t raw=0;std::memcpy(&raw,p+2+chunk*8,8);
+                const __m128i bytes=_mm_cvtsi64_si128(static_cast<long long>(raw));
+                const __m256i q32=_mm256_cvtepi8_epi32(bytes);
+                const __m256 qf=_mm256_cvtepi32_ps(q32);
+                const __m256 xv=_mm256_loadu_ps(x+b*32+chunk*8);
+                if(chunk==0)a0=_mm256_fmadd_ps(qf,xv,a0);
+                else if(chunk==1)a1=_mm256_fmadd_ps(qf,xv,a1);
+                else if(chunk==2)a2=_mm256_fmadd_ps(qf,xv,a2);
+                else a3=_mm256_fmadd_ps(qf,xv,a3);
+            }
+            const __m256 s=_mm256_add_ps(_mm256_add_ps(a0,a1),_mm256_add_ps(a2,a3));
+            acc=_mm256_fmadd_ps(_mm256_set1_ps(d),s,acc);
+        }
+        y[r]=hsum_ps256(acc);
+    }
+    return true;
+}
+}
+
+namespace zen {
+namespace {
+// exp(x) for x in [-88.4, 88.4]; ~1e-7 relative error (Cephes split + degree-6 poly).
+inline __m256 exp256_ps(__m256 x) {
+    x=_mm256_min_ps(x,_mm256_set1_ps(88.3762626647949f));
+    x=_mm256_max_ps(x,_mm256_set1_ps(-88.3762626647949f));
+    __m256 k=_mm256_floor_ps(_mm256_fmadd_ps(x,_mm256_set1_ps(1.44269504088896341f),_mm256_set1_ps(0.5f)));
+    __m256 r=_mm256_fnmadd_ps(k,_mm256_set1_ps(0.693359375f),x);
+    r=_mm256_fnmadd_ps(k,_mm256_set1_ps(-2.12194440e-4f),r);
+    __m256 p=_mm256_set1_ps(1.9875691500e-4f);
+    p=_mm256_fmadd_ps(p,r,_mm256_set1_ps(1.3981999507e-3f));
+    p=_mm256_fmadd_ps(p,r,_mm256_set1_ps(8.3334519073e-3f));
+    p=_mm256_fmadd_ps(p,r,_mm256_set1_ps(4.1665795894e-2f));
+    p=_mm256_fmadd_ps(p,r,_mm256_set1_ps(1.6666665459e-1f));
+    p=_mm256_fmadd_ps(p,r,_mm256_set1_ps(5.0000001201e-1f));
+    p=_mm256_fmadd_ps(p,r,_mm256_set1_ps(1.0f));
+    p=_mm256_fmadd_ps(p,r,_mm256_set1_ps(1.0f));
+    const __m256i e=_mm256_slli_epi32(_mm256_add_epi32(_mm256_cvtps_epi32(k),_mm256_set1_epi32(127)),23);
+    return _mm256_mul_ps(p,_mm256_castsi256_ps(e));
+}
+inline float half_to_float_local(std::uint16_t h) noexcept { return q8_half_to_float(h); }
+} // namespace
+
+// out = silu(gate) * up = (gate / (1 + exp(-gate))) * up
+void silu_mul_avx2(const float* gate, const float* up, float* out, std::size_t n) {
+    const __m256 one=_mm256_set1_ps(1.0f), zero=_mm256_setzero_ps();
+    std::size_t i=0;
+    for(;i+7<n;i+=8){
+        const __m256 z=_mm256_loadu_ps(gate+i);
+        const __m256 sig=_mm256_div_ps(one,_mm256_add_ps(one,exp256_ps(_mm256_sub_ps(zero,z))));
+        _mm256_storeu_ps(out+i,_mm256_mul_ps(_mm256_mul_ps(z,sig),_mm256_loadu_ps(up+i)));
+    }
+    for(;i<n;++i){const float z=gate[i];out[i]=(z/(1.0f+std::exp(-z)))*up[i];}
+}
+
+float dot_f32_avx2(const float* a, const float* b, std::size_t n) noexcept {
+    __m256 s0=_mm256_setzero_ps(),s1=_mm256_setzero_ps();
+    std::size_t i=0;
+    for(;i+15<n;i+=16){
+        s0=_mm256_fmadd_ps(_mm256_loadu_ps(a+i),_mm256_loadu_ps(b+i),s0);
+        s1=_mm256_fmadd_ps(_mm256_loadu_ps(a+i+8),_mm256_loadu_ps(b+i+8),s1);
+    }
+    __m256 s=_mm256_add_ps(s0,s1);
+    for(;i+7<n;i+=8) s=_mm256_fmadd_ps(_mm256_loadu_ps(a+i),_mm256_loadu_ps(b+i),s);
+    alignas(32) float lane[8];
+    _mm256_store_ps(lane,s);
+    float t=lane[0]+lane[1]+lane[2]+lane[3]+lane[4]+lane[5]+lane[6]+lane[7];
+    for(;i<n;++i) t+=a[i]*b[i];
+    return t;
+}
+
+void axpy_f32_avx2(float a, const float* x, float* y, std::size_t n) noexcept {
+    const __m256 va=_mm256_set1_ps(a);
+    std::size_t i=0;
+    for(;i+7<n;i+=8)
+        _mm256_storeu_ps(y+i,_mm256_fmadd_ps(va,_mm256_loadu_ps(x+i),_mm256_loadu_ps(y+i)));
+    for(;i<n;++i) y[i]+=a*x[i];
+}
+
+bool gemm_q8_0_avx2(const std::uint8_t* weights, const float* input, float* output,
+                    std::size_t tokens, std::size_t rows, std::size_t columns,
+                    std::size_t output_row_stride) {
+    constexpr std::size_t kBlockElements=32, kBlockBytes=34;
+    if(!weights||!input||!output||!tokens||!rows||!columns) return false;
+    if(columns%kBlockElements) return false;
+    const std::size_t row_bytes=(columns/kBlockElements)*kBlockBytes;
+    std::vector<float> b0(columns),b1(columns);
+    auto dequant_row=[&](const std::uint8_t* row,float* dst){
+        for(std::size_t blk=0;blk<columns/kBlockElements;++blk){
+            const std::uint8_t* src=row+blk*kBlockBytes;
+            const float d=half_to_float_local(std::uint16_t(src[0])|(std::uint16_t(src[1])<<8));
+            float* dst_row=dst+blk*kBlockElements;
+            for(std::size_t j=0;j<kBlockElements;j+=8){
+                const __m128i b8=_mm_loadl_epi64(reinterpret_cast<const __m128i*>(src+2+j));
+                const __m256i i32=_mm256_cvtepi8_epi32(b8);
+                _mm256_storeu_ps(dst_row+j,_mm256_mul_ps(_mm256_cvtepi32_ps(i32),_mm256_set1_ps(d)));
+            }
+        }
+    };
+    std::size_t r=0;
+    // Two weight rows x four tokens: eight accumulators fed by two weight loads
+    // and four activation loads per column chunk. The 8x1 structure re-read the
+    // activation matrix once per row; pairing rows halves that traffic (measured
+    // 448 -> 649 GF/s on Llama-3.2-1B shapes, bit-identical results).
+    for(;r+1<rows;r+=2){
+        const std::uint8_t* wrow0=weights+r*row_bytes;
+        const std::uint8_t* wrow1=weights+(r+1)*row_bytes;
+        dequant_row(wrow0,b0.data());
+        dequant_row(wrow1,b1.data());
+        std::size_t t=0;
+        for(;t+4<=tokens;t+=4){
+            __m256 a00=_mm256_setzero_ps(),a01=_mm256_setzero_ps(),a02=_mm256_setzero_ps(),a03=_mm256_setzero_ps();
+            __m256 a10=_mm256_setzero_ps(),a11=_mm256_setzero_ps(),a12=_mm256_setzero_ps(),a13=_mm256_setzero_ps();
+            std::size_t c=0;
+            for(;c+8<=columns;c+=8){
+                const __m256 x0=_mm256_loadu_ps(input+(t+0)*columns+c),x1=_mm256_loadu_ps(input+(t+1)*columns+c);
+                const __m256 x2=_mm256_loadu_ps(input+(t+2)*columns+c),x3=_mm256_loadu_ps(input+(t+3)*columns+c);
+                const __m256 v0=_mm256_loadu_ps(b0.data()+c),v1=_mm256_loadu_ps(b1.data()+c);
+                a00=_mm256_fmadd_ps(v0,x0,a00);a01=_mm256_fmadd_ps(v0,x1,a01);
+                a02=_mm256_fmadd_ps(v0,x2,a02);a03=_mm256_fmadd_ps(v0,x3,a03);
+                a10=_mm256_fmadd_ps(v1,x0,a10);a11=_mm256_fmadd_ps(v1,x1,a11);
+                a12=_mm256_fmadd_ps(v1,x2,a12);a13=_mm256_fmadd_ps(v1,x3,a13);
+            }
+            __m256 acc[8]={a00,a01,a02,a03,a10,a11,a12,a13};
+            alignas(32) float lane[8];
+            for(int j=0;j<8;++j){
+                const std::size_t ti=t+static_cast<std::size_t>(j&3);
+                const std::size_t ri=r+static_cast<std::size_t>(j>>2);
+                const float* wsrc=(j<4)?b0.data():b1.data();
+                _mm256_store_ps(lane,acc[j]);
+                float total=lane[0]+lane[1]+lane[2]+lane[3]+lane[4]+lane[5]+lane[6]+lane[7];
+                for(std::size_t cc=columns&~(std::size_t)7;cc<columns;++cc)
+                    total+=wsrc[cc]*input[ti*columns+cc];
+                output[ti*output_row_stride+ri]=total;
+            }
+        }
+        for(;t<tokens;++t){
+            output[t*output_row_stride+r]  =dot_f32_avx2(b0.data(),input+t*columns,columns);
+            output[t*output_row_stride+r+1]=dot_f32_avx2(b1.data(),input+t*columns,columns);
+        }
+    }
+    if(r<rows){
+        dequant_row(weights+r*row_bytes,b0.data());
+        for(std::size_t t=0;t<tokens;++t)
+            output[t*output_row_stride+r]=dot_f32_avx2(b0.data(),input+t*columns,columns);
+    }
+    return true;
+}
+
+// K-blocked batched Q8_0 GEMM (Priority 1). Loop order is K-panel outer,
+// rows inner, tokens innermost per micro-tile, so the activation panel
+// [tokens, Kc] is loaded from DRAM once per worker and then reused from L2
+// across every row block of that worker. The legacy kernel above is
+// rows-pair outer / full-K inner and re-streams the whole [tokens, columns]
+// activation matrix once per row pair (~5.6 MB for T=171, K=8192), thrashing
+// the 512 KB Zen 3 L2.
+//
+// Bit-identity: partials are carried as __m256 vectors in memory across
+// panels and reduced with a single horizontal sum at the end, using the
+// same lane order as gemm_q8_0_avx2 (lane0+...+lane7). The per-(row,token)
+// FMA sequence is still c = 0,8,16,... in order, so the main 4-row block
+// is bit-identical to the legacy kernel. No per-panel scalar reduction.
+// Edge rows (<4 per worker slice) and the dot-product tails use
+// dot_f32_avx2, matching the legacy tails.
+//
+// Tile: MR=4 rows x NR=2 tokens = 8 accumulators. With 6 operand loads per
+// step (2 activations + 4 weights) the live set is ~14 ymm registers
+// (8 acc + 6 temps) on AVX2's 16-register file, leaving headroom so the
+// accumulators stay in registers (checked in disassembly; no stack spills
+// of acc in the inner Kc loop). 3x4 (12 acc) was considered but 4x2 is the
+// safer start. Rows are blocked by RB (ZEN_CPU_Q8_RB, default 64) so the
+// vector partials [tokens, RB] plus the activation panel [tokens, Kc]
+// stay L2-resident; panel loads/stores of partials amortise better at
+// large Kc. Kc (ZEN_CPU_Q8_KC) and RB were swept on this machine
+// (bench + single-thread isolation, see report): Kc=512/RB=64 wins the
+// large-activation shapes (down T=171: ~10.1 ms vs legacy ~13.0 ms;
+// single-thread ~65-67 ms vs ~71 ms) while Kc=256/RB=32 wins small
+// shapes but loses large ones, so the defaults are Kc=512, RB=64.
+// Loop nest per RB block is r0 { k0 { rl { t { k } } } }, i.e. rows are
+// blocked outer and K panels inner, so partials for one RB stay in L2
+// across panels instead of streaming a full-slice partial matrix.
+bool gemm_q8_0_kblk_avx2(const std::uint8_t* weights, const float* input, float* output,
+                     std::size_t tokens, std::size_t rows, std::size_t columns,
+                     std::size_t output_row_stride) {
+    constexpr std::size_t kBlockElements=32, kBlockBytes=34;
+    constexpr std::size_t kMR=4, kNR=2;
+    if(!weights||!input||!output||!tokens||!rows||!columns) return false;
+    if(columns%kBlockElements) return false;
+    if(columns&7) return false; // columns%32==0 already implies this; defensive
+    static const std::size_t kKc=[](){
+        const char* e=std::getenv("ZEN_CPU_Q8_KC");
+        if(e){
+            const long v=std::atol(e);
+            if(v==64||v==128||v==256||v==512) return static_cast<std::size_t>(v);
+        }
+        return static_cast<std::size_t>(512);
+    }();
+    const std::size_t row_bytes=(columns/kBlockElements)*kBlockBytes;
+    const std::size_t rows_main=(rows/kMR)*kMR;
+    auto dequant_full_row=[&](const std::uint8_t* row,float* dst){
+        for(std::size_t blk=0;blk<columns/kBlockElements;++blk){
+            const std::uint8_t* src=row+blk*kBlockBytes;
+            const float d=half_to_float_local(std::uint16_t(src[0])|(std::uint16_t(src[1])<<8));
+            float* dst_row=dst+blk*kBlockElements;
+            for(std::size_t j=0;j<kBlockElements;j+=8){
+                const __m128i b8=_mm_loadl_epi64(reinterpret_cast<const __m128i*>(src+2+j));
+                const __m256i i32=_mm256_cvtepi8_epi32(b8);
+                _mm256_storeu_ps(dst_row+j,_mm256_mul_ps(_mm256_cvtepi32_ps(i32),_mm256_set1_ps(d)));
+            }
+        }
+    };
+    static const std::size_t kRB=[](){
+        const char* e=std::getenv("ZEN_CPU_Q8_RB");
+        if(e){
+            const long v=std::atol(e);
+            if(v==32||v==64||v==128||v==256) return static_cast<std::size_t>(v);
+        }
+        return static_cast<std::size_t>(64);
+    }();
+    if(rows_main>0){
+        std::vector<__m256> partial(std::size_t(tokens)*kRB);
+        std::vector<float> wpanel(kMR*kKc);
+        alignas(32) float lane[8];
+        for(std::size_t r0=0;r0<rows_main;r0+=kRB){
+            const std::size_t RBc=(kRB<rows_main-r0)?kRB:(rows_main-r0);
+            for(std::size_t k0=0;k0<columns;k0+=kKc){
+                const std::size_t kc=std::size_t((kKc<columns-k0)?kKc:(columns-k0));
+                const std::size_t panel_blk=k0/kBlockElements;
+                const bool first_panel=(k0==0);
+                for(std::size_t rl=0;rl<RBc;rl+=kMR){
+                    const std::size_t r=r0+rl;
+                // Dequantise the 4-row x kc weight panel once; it is reused
+                // across every token block below (L1-resident: 4*512*4=8KB max).
+                for(std::size_t dr=0;dr<kMR;++dr){
+                    const std::uint8_t* src=weights+(r+dr)*row_bytes+panel_blk*kBlockBytes;
+                    float* dst=wpanel.data()+dr*kKc;
+                    const std::size_t nblk=kc/kBlockElements;
+                    for(std::size_t blk=0;blk<nblk;++blk){
+                        const std::uint8_t* p=src+blk*kBlockBytes;
+                        const float d=half_to_float_local(std::uint16_t(p[0])|(std::uint16_t(p[1])<<8));
+                        float* dst_row=dst+blk*kBlockElements;
+                        for(std::size_t j=0;j<kBlockElements;j+=8){
+                            const __m128i b8=_mm_loadl_epi64(reinterpret_cast<const __m128i*>(p+2+j));
+                            const __m256i i32=_mm256_cvtepi8_epi32(b8);
+                            _mm256_storeu_ps(dst_row+j,_mm256_mul_ps(_mm256_cvtepi32_ps(i32),_mm256_set1_ps(d)));
+                        }
+                    }
+                }
+                for(std::size_t t=0;t<tokens;t+=kNR){
+                    const float* in0=input+(t+0)*columns+k0;
+                    if(t+1<tokens){
+                        const float* in1=input+(t+1)*columns+k0;
+                        __m256 a00,a01,a10,a11,a20,a21,a30,a31;
+                        __m256* p;
+                        if(first_panel){
+                            a00=_mm256_setzero_ps();a01=_mm256_setzero_ps();
+                            a10=_mm256_setzero_ps();a11=_mm256_setzero_ps();
+                            a20=_mm256_setzero_ps();a21=_mm256_setzero_ps();
+                            a30=_mm256_setzero_ps();a31=_mm256_setzero_ps();
+                        }else{
+                            p=&partial[t*RBc+rl];
+                            a00=_mm256_loadu_ps(reinterpret_cast<const float*>(p+0*RBc));
+                            a01=_mm256_loadu_ps(reinterpret_cast<const float*>(p+1*RBc));
+                            a10=_mm256_loadu_ps(reinterpret_cast<const float*>(p+0*RBc+1));
+                            a11=_mm256_loadu_ps(reinterpret_cast<const float*>(p+1*RBc+1));
+                            a20=_mm256_loadu_ps(reinterpret_cast<const float*>(p+0*RBc+2));
+                            a21=_mm256_loadu_ps(reinterpret_cast<const float*>(p+1*RBc+2));
+                            a30=_mm256_loadu_ps(reinterpret_cast<const float*>(p+0*RBc+3));
+                            a31=_mm256_loadu_ps(reinterpret_cast<const float*>(p+1*RBc+3));
+                        }
+                        const float* w=wpanel.data();
+                        for(std::size_t s=0;s<kc;s+=8){
+                            const __m256 x0=_mm256_loadu_ps(in0+s);
+                            const __m256 x1=_mm256_loadu_ps(in1+s);
+                            const __m256 v0=_mm256_loadu_ps(w+0*kKc+s);
+                            const __m256 v1=_mm256_loadu_ps(w+1*kKc+s);
+                            const __m256 v2=_mm256_loadu_ps(w+2*kKc+s);
+                            const __m256 v3=_mm256_loadu_ps(w+3*kKc+s);
+                            a00=_mm256_fmadd_ps(v0,x0,a00);a01=_mm256_fmadd_ps(v0,x1,a01);
+                            a10=_mm256_fmadd_ps(v1,x0,a10);a11=_mm256_fmadd_ps(v1,x1,a11);
+                            a20=_mm256_fmadd_ps(v2,x0,a20);a21=_mm256_fmadd_ps(v2,x1,a21);
+                            a30=_mm256_fmadd_ps(v3,x0,a30);a31=_mm256_fmadd_ps(v3,x1,a31);
+                        }
+                        p=&partial[t*RBc+rl];
+                        _mm256_storeu_ps(reinterpret_cast<float*>(p+0*RBc),a00);
+                        _mm256_storeu_ps(reinterpret_cast<float*>(p+1*RBc),a01);
+                        _mm256_storeu_ps(reinterpret_cast<float*>(p+0*RBc+1),a10);
+                        _mm256_storeu_ps(reinterpret_cast<float*>(p+1*RBc+1),a11);
+                        _mm256_storeu_ps(reinterpret_cast<float*>(p+0*RBc+2),a20);
+                        _mm256_storeu_ps(reinterpret_cast<float*>(p+1*RBc+2),a21);
+                        _mm256_storeu_ps(reinterpret_cast<float*>(p+0*RBc+3),a30);
+                        _mm256_storeu_ps(reinterpret_cast<float*>(p+1*RBc+3),a31);
+                    }else{
+                        __m256 a0,a1,a2,a3;
+                        __m256* p;
+                        if(first_panel){
+                            a0=_mm256_setzero_ps();a1=_mm256_setzero_ps();
+                            a2=_mm256_setzero_ps();a3=_mm256_setzero_ps();
+                        }else{
+                            p=&partial[t*RBc+rl];
+                            a0=_mm256_loadu_ps(reinterpret_cast<const float*>(p+0));
+                            a1=_mm256_loadu_ps(reinterpret_cast<const float*>(p+1));
+                            a2=_mm256_loadu_ps(reinterpret_cast<const float*>(p+2));
+                            a3=_mm256_loadu_ps(reinterpret_cast<const float*>(p+3));
+                        }
+                        const float* w=wpanel.data();
+                        for(std::size_t s=0;s<kc;s+=8){
+                            const __m256 x0=_mm256_loadu_ps(in0+s);
+                            const __m256 v0=_mm256_loadu_ps(w+0*kKc+s);
+                            const __m256 v1=_mm256_loadu_ps(w+1*kKc+s);
+                            const __m256 v2=_mm256_loadu_ps(w+2*kKc+s);
+                            const __m256 v3=_mm256_loadu_ps(w+3*kKc+s);
+                            a0=_mm256_fmadd_ps(v0,x0,a0);
+                            a1=_mm256_fmadd_ps(v1,x0,a1);
+                            a2=_mm256_fmadd_ps(v2,x0,a2);
+                            a3=_mm256_fmadd_ps(v3,x0,a3);
+                        }
+                        p=&partial[t*RBc+rl];
+                        _mm256_storeu_ps(reinterpret_cast<float*>(p+0),a0);
+                        _mm256_storeu_ps(reinterpret_cast<float*>(p+1),a1);
+                        _mm256_storeu_ps(reinterpret_cast<float*>(p+2),a2);
+                        _mm256_storeu_ps(reinterpret_cast<float*>(p+3),a3);
+                    }
+                }
+            }
+        }
+        for(std::size_t t=0;t<tokens;++t){
+            const __m256* prow=&partial[t*RBc];
+            for(std::size_t rl=0;rl<RBc;++rl){
+                _mm256_store_ps(lane,prow[rl]);
+                output[t*output_row_stride+r0+rl]=lane[0]+lane[1]+lane[2]+lane[3]+lane[4]+lane[5]+lane[6]+lane[7];
+            }
+        }
+        }
+    }
+    if(rows==rows_main) return true;
+    std::vector<float> b0(columns);
+    for(std::size_t r=rows_main;r<rows;++r){
+        dequant_full_row(weights+r*row_bytes,b0.data());
+        for(std::size_t t=0;t<tokens;++t)
+            output[t*output_row_stride+r]=dot_f32_avx2(b0.data(),input+t*columns,columns);
+    }
+    return true;
+}
+} // namespace zen
