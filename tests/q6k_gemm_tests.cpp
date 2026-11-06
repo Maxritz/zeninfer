@@ -87,6 +87,12 @@ int main() {
                     ref[t * rows + r] += term; magnitude[t * rows + r] += std::abs(term);
                 }
             for (unsigned workers : {1u, 4u}) {
+                if (tokens == 1) {
+                    std::vector<float> vout(rows);
+                    if (!zen::quant::gemv(*format, packed.data(), input.data(), vout.data(), rows, cols, 1.0f, workers)) {
+                        std::cerr << "FAIL production Q6_K GEMV declined a valid shape\n"; ++failures;
+                    } else check_output("GEMV", vout, rows, ref, magnitude, 1, rows, cols, workers);
+                }
                 std::vector<float> output(tokens * rows);
                 if (!zen::quant::gemm(*format, packed.data(), input.data(), output.data(), tokens, rows, cols, 1.0f, workers)) {
                     std::cerr << "FAIL production Q6_K GEMM declined a valid shape\n"; ++failures;
@@ -105,7 +111,7 @@ int main() {
 #endif
         }
     }
-    if (failures) std::cerr << failures << " Q6_K GEMM failures\n";
-    else std::cout << "Q6_K GEMM parity passed\n";
+    if (failures) std::cerr << failures << " Q6_K GEMM/GEMV failures\n";
+    else std::cout << "Q6_K GEMM/GEMV parity passed\n";
     return failures ? 1 : 0;
 }

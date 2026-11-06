@@ -757,11 +757,19 @@ bool dequantize(const Format& f,const std::uint8_t* src,std::size_t n,float* dst
     case Encoding::signed_uniform: {
         const unsigned bits=f.bits;
         if(bits<1||bits>18||f.block_elements==0)return false;
+        // Read only the bytes belonging to each value (never beyond the final
+        // partial byte). This replaces a branch and bit test per encoded bit.
         std::size_t bit=0;
-        for(std::size_t i=0;i<n;++i){
-            std::uint32_t raw=0;
-            for(unsigned k=0;k<bits;++k,++bit)
-                if(src[bit/8]&(1u<<(bit%8))) raw|=1u<<k;
+        const std::uint32_t mask=(1u<<bits)-1u;
+        for(std::size_t i=0;i<n;++i,bit+=bits){
+            const unsigned shift=static_cast<unsigned>(bit%8);
+            const unsigned bytes=(shift+bits+7)/8;
+            const auto* p=src+bit/8;
+            std::uint32_t raw=p[0];
+            if(bytes>1)raw|=std::uint32_t(p[1])<<8;
+            if(bytes>2)raw|=std::uint32_t(p[2])<<16;
+            if(bytes>3)raw|=std::uint32_t(p[3])<<24;
+            raw=(raw>>shift)&mask;
             const std::int32_t signed_value=(raw&(1u<<(bits-1)))
                 ?static_cast<std::int32_t>(raw|(~0u<<bits)):static_cast<std::int32_t>(raw);
             dst[i]=static_cast<float>(signed_value)*scale;
@@ -861,6 +869,28 @@ bool gemv(const Format& f,const std::uint8_t*w,const float*x,float*y,
         });
         return success.load();
     }
+    static const bool f16_gemv_enabled=[](){
+        const char* e=std::getenv("ZEN_CPU_FAST_F16_GEMV");return !(e&&e[0]=='0');
+    }();
+    static const bool tq2_fast_enabled=[](){
+        const char* e=std::getenv("ZEN_CPU_FAST_TQ2");return !(e&&e[0]=='0');
+    }();
+    if (((kquant_gemv_enabled && (f.encoding==Encoding::q6_k || f.encoding==Encoding::q3_k) && cols%256==0) ||
+         (tq2_fast_enabled && f.encoding==Encoding::tq2_0 && cols%256==0) ||
+         (f16_gemv_enabled && f.encoding==Encoding::fp16)) && zen::cpu_has_avx2_fma()) {
+        const auto fn = f.encoding==Encoding::q6_k ? zen::gemv_q6k_avx2 :
+                        f.encoding==Encoding::q3_k ? zen::gemv_q3k_avx2 :
+                        f.encoding==Encoding::tq2_0 ? zen::gemv_tq2_avx2 : zen::gemv_f16_avx2;
+        const unsigned workers=requested_workers ? requested_workers : zen::ResourceGovernor{}.current_policy().worker_threads;
+        const unsigned count=(rows>=64 && workers>1) ? std::min<unsigned>(workers,static_cast<unsigned>(rows)) : 1;
+        g_gemv_routes.cpu_avx2.fetch_add(1,std::memory_order_relaxed);
+        if(count==1)return fn(w,x,y,rows,cols);
+        std::atomic<bool> success{true};
+        zen::ComputePool::instance().parallel_for(rows,count,[&](std::size_t first,std::size_t last){
+            if(!fn(w+first*rb,x,y+first,last-first,cols))success.store(false,std::memory_order_relaxed);
+        });
+        return success.load();
+    }
     if(f.encoding==Encoding::q8_0 && scale==1.0f && zen::cpu_has_avx2_fma()) {
         g_gemv_routes.cpu_avx2.fetch_add(1,std::memory_order_relaxed);
         zen::ResourceGovernor governor;const unsigned workers=requested_workers?requested_workers:governor.current_policy().worker_threads;
@@ -880,23 +910,23 @@ bool gemv(const Format& f,const std::uint8_t*w,const float*x,float*y,
     const unsigned count=(rows>=64&&workers>1)?std::min<unsigned>(workers,static_cast<unsigned>(rows)):1;
     std::atomic<bool> ok{true};
     auto work=[&](std::size_t first,std::size_t last){
-        const bool block_quant=f.encoding!=Encoding::fp32&&f.encoding!=Encoding::fp16&&f.encoding!=Encoding::bf16;
-        const std::size_t block=block_quant?f.block_elements:cols;
-        const std::size_t block_bytes=block_quant?f.block_bytes:rb;
-        if(!block||!block_bytes){ok=false;return;}
-        std::vector<float> scratch(block);[[maybe_unused]] const bool simd=
+        // Decode a row in one call, then perform one dot product. Besides
+        // removing a format dispatch and horizontal reduction per block this
+        // lets each decoder traverse its natural block layout without re-entry.
+        std::vector<float> scratch(cols);
+        [[maybe_unused]] const bool simd=
 #ifdef ZEN_HAS_AVX2_KERNELS
             zen::cpu_has_avx2_fma();
 #else
             false;
 #endif
-        for(std::size_t r=first;r<last&&ok.load(std::memory_order_relaxed);++r){double total=0.0;
-            for(std::size_t off=0;off<cols;off+=block){const auto count=std::min(block,cols-off);if(!dequantize(f,w+r*rb+(off/block)*block_bytes,count,scratch.data(),scale)){ok=false;break;}
+        for(std::size_t r=first;r<last&&ok.load(std::memory_order_relaxed);++r){
+            if(!dequantize(f,w+r*rb,cols,scratch.data(),scale)){ok=false;break;}
 #ifdef ZEN_HAS_AVX2_KERNELS
-                if(simd){float part{};zen::gemv_avx2(scratch.data(),x+off,&part,1,count);total+=part;continue;}
+            if(simd){zen::gemv_avx2(scratch.data(),x,y+r,1,cols);continue;}
 #endif
-                for(std::size_t c=0;c<count;++c)total+=double(scratch[c])*x[off+c];
-            }
+            double total=0.0;
+            for(std::size_t c=0;c<cols;++c)total+=double(scratch[c])*x[c];
             y[r]=static_cast<float>(total);
         }
     };
@@ -1080,7 +1110,7 @@ static bool gemm_q8_0_parallel(const std::uint8_t* w,const float* input,float* o
     return success.load();
 }
 // Non-Q8 K-blocked GEMM uses the same row-parallel shape as Q8 and is
-// counted under cpu_avx2. F16/Q4_K/BF16 are enabled unless their respective
+// counted under cpu_avx2. F16/Q3_K/Q4_K/Q5_K/BF16/TQ2_0 are enabled unless their respective
 // ZEN_CPU_FAST_* variable starts with 0. Q6_K is ungated; IQ uses generic GEMM.
 static bool f16_fast_enabled() {
     static const bool v=[](){
@@ -1094,6 +1124,18 @@ static bool q4k_fast_enabled() {
         const char* e=std::getenv("ZEN_CPU_FAST_Q4K");
         return !(e&&e[0]=='0');
     }();
+    return v;
+}
+static bool q5k_fast_enabled() {
+    static const bool v=[](){const char* e=std::getenv("ZEN_CPU_FAST_Q5K");return !(e&&e[0]=='0');}();
+    return v;
+}
+static bool q3k_fast_enabled() {
+    static const bool v=[](){const char* e=std::getenv("ZEN_CPU_FAST_Q3K");return !(e&&e[0]=='0');}();
+    return v;
+}
+static bool tq2_gemm_fast_enabled() {
+    static const bool v=[](){const char* e=std::getenv("ZEN_CPU_FAST_TQ2");return !(e&&e[0]=='0');}();
     return v;
 }
 static bool bf16_fast_enabled() {
@@ -1321,6 +1363,18 @@ bool gemm(const Format& f,const std::uint8_t*w,const float*input,float*output,
             g_gemm_routes.cpu_avx2.fetch_add(1,std::memory_order_relaxed);
             if(gemm_fast_parallel(zen::gemm_q4k_kblk_avx2,w,input,output,tokens,rows,cols,rb,requested_workers))return true;
         }
+        if(f.encoding==Encoding::q5_k&&q5k_fast_enabled()&&cols%256==0){
+            g_gemm_routes.cpu_avx2.fetch_add(1,std::memory_order_relaxed);
+            if(gemm_fast_parallel(zen::gemm_q5k_kblk_avx2,w,input,output,tokens,rows,cols,rb,requested_workers))return true;
+        }
+        if(f.encoding==Encoding::q3_k&&q3k_fast_enabled()&&cols%256==0){
+            g_gemm_routes.cpu_avx2.fetch_add(1,std::memory_order_relaxed);
+            if(gemm_fast_parallel(zen::gemm_q3k_kblk_avx2,w,input,output,tokens,rows,cols,rb,requested_workers))return true;
+        }
+        if(f.encoding==Encoding::tq2_0&&tq2_gemm_fast_enabled()&&cols%256==0){
+            g_gemm_routes.cpu_avx2.fetch_add(1,std::memory_order_relaxed);
+            if(gemm_fast_parallel(zen::gemm_tq2_kblk_avx2,w,input,output,tokens,rows,cols,rb,requested_workers))return true;
+        }
         if(f.encoding==Encoding::bf16&&bf16_fast_enabled()){
             g_gemm_routes.cpu_avx2.fetch_add(1,std::memory_order_relaxed);
             if(gemm_fast_parallel(zen::gemm_bf16_kblk_avx2,w,input,output,tokens,rows,cols,rb,requested_workers))return true;
@@ -1336,10 +1390,6 @@ bool gemm(const Format& f,const std::uint8_t*w,const float*input,float*output,
     const unsigned count=(rows>=32&&workers>1)?std::min<unsigned>(workers,static_cast<unsigned>(rows)):1;
     std::atomic<bool> ok{true};
     auto work=[&](std::size_t first,std::size_t last){
-        const bool block_quant=f.encoding!=Encoding::fp32&&f.encoding!=Encoding::fp16&&f.encoding!=Encoding::bf16;
-        const std::size_t block=block_quant?f.block_elements:cols;
-        const std::size_t block_bytes=block_quant?f.block_bytes:rb;
-        if(!block||!block_bytes){ok=false;return;}
         // ZI-P1: dequantise the whole row once, then run T full-row dots from the
         // row buffer. The previous structure ran T x (cols/block) block-sized dots,
         // each paying a horizontal reduction and an output read-modify-write, which
@@ -1353,8 +1403,7 @@ bool gemm(const Format& f,const std::uint8_t*w,const float*input,float*output,
             false;
 #endif
         for(std::size_t r=first;r<last&&ok.load(std::memory_order_relaxed);++r){
-            for(std::size_t off=0,b=0;off<cols;off+=block,++b){const auto count=std::min(block,cols-off);
-                if(!dequantize(f,w+r*rb+b*block_bytes,count,rowbuf.data()+off,scale)){ok=false;return;}}
+            if(!dequantize(f,w+r*rb,cols,rowbuf.data(),scale)){ok=false;return;}
             for(std::size_t t=0;t<tokens;++t){float*y=output+t*rows+r;const float*x=input+t*cols;
 #ifdef ZEN_HAS_AVX2_KERNELS
                 if(simd){zen::gemv_avx2(rowbuf.data(),x,y,1,cols);continue;}
