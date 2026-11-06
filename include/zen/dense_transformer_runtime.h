@@ -19,6 +19,7 @@ namespace zen::runtime {
 class MappedFile;
 class DenseTransformerRuntime {
 public:
+    ~DenseTransformerRuntime();
     bool load(const std::filesystem::path& path, std::string* error=nullptr);
     bool loaded() const noexcept { return loaded_; }
     bool tokenizer_available() const noexcept { return tokenizer_loaded_; }

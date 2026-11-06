@@ -1,147 +1,70 @@
-// ZenInfer D3D12 backend: Q4_K batched matrix product, FP32 activations.
-// Experimental (ZEN_D3D12_Q4K=1). Fused dequant: Q4_K weights dequantized
-// in registers, never spilled to scratch. Same math as CPU dequantize() in
-// src/quant.cpp (k_scale_min + d/dmin fp16 scales).
-//
-// Q4_K super-block: 256 weights, 144 bytes.
-//   d (fp16), dmin (fp16), scales[12], quants[128]
-// Dequant: sub-block j (0-7, 32 weights each), scale = d*sc[j], min = dmin*m[j]
-//   weight[i] = scale * nibble - min
-// Nibbles: weights 0-127 use low nibbles, 128-255 use high nibbles.
-//
-// Layout: 1 warp per row, 32 tokens per tile. Each lane handles 8 K per
-// 256-weight block. Scale folded out of inner loop.
-//
-// Bindings match q8_0_gemm.hlsl. Dispatch: (ceil(rows/32), ceil(token_count/32), 1).
-
-cbuffer GemmParams : register(b0)
-{
+// Q4_K / Q5_K matrix product with FP32 activations. A 32-lane logical
+// warp owns one output row; each lane processes one element of each 32-value
+// sub-block. Four tokens share every decoded weight. Raw GGML blocks are
+// 144/176 bytes, both multiples of four, so ByteAddressBuffer loads are aligned.
+// The host dispatches ceil(rows/8) x ceil(tokens/4) groups.
+cbuffer Params : register(b0) {
     uint rows;
-    uint blocks_per_row;   // 256-weight blocks per row (cols/256)
-    uint token_count;
-    uint tokens_per_tile;
+    uint blocks_per_row; // 256 values each
+    uint tokens;
+    uint is_q5;
 };
+ByteAddressBuffer weights : register(t0);
+ByteAddressBuffer input_data : register(t2);
+RWStructuredBuffer<float> output_data : register(u0);
 
-ByteAddressBuffer         qbuf : register(t0);
-StructuredBuffer<float>   sbuf : register(t1);   // unused, keeps root layout
-ByteAddressBuffer         xraw : register(t2);
-RWStructuredBuffer<float> yvec : register(u0);
-
-#define ROWS_PER_GROUP 32u
-#define BLOCK_T        32u
-#define WEIGHTS_PER_BLOCK 256u
-
-float h2f(uint h) {
-    uint sign = (h >> 15u) & 1u;
-    uint exp  = (h >> 10u) & 0x1Fu;
-    uint mant = h & 0x3FFu;
-    if (exp == 0u) return 0.0f;
-    if (exp == 31u) return sign ? -1e30f : 1e30f;
-    uint bits = (sign << 31u) | ((exp + 112u) << 23u) | (mant << 13u);
-    return asfloat(bits);
+uint load_byte(uint offset) {
+    return (weights.Load(offset & ~3u) >> ((offset & 3u) * 8u)) & 255u;
 }
-
-// k_scale_min for sub-block j (0-7) within a 256-block.
-// scales is the 12-byte packed array at scales_base.
-uint2 get_scale_min(uint j, ByteAddressBuffer qbuf, uint scales_base) {
-    uint sc, m;
-    if (j < 4u) {
-        sc = qbuf.Load<uint>(scales_base + j) & 0x3Fu;
-        m  = qbuf.Load<uint>(scales_base + j + 4u) & 0x3Fu;
-    } else {
-        sc = (qbuf.Load<uint>(scales_base + j + 4u) & 0x0Fu) |
-             ((qbuf.Load<uint>(scales_base + j - 4u) >> 6u) << 4u);
-        m  = (qbuf.Load<uint>(scales_base + j + 4u) >> 4u) |
-             ((qbuf.Load<uint>(scales_base + j) >> 6u) << 4u);
-    }
-    return uint2(sc, m);
+uint2 scale_min(uint base, uint j) {
+    if (j < 4u) return uint2(load_byte(base+j) & 63u, load_byte(base+j+4u) & 63u);
+    const uint s = load_byte(base+j+4u);
+    return uint2((s & 15u) | ((load_byte(base+j-4u) >> 6u) << 4u),
+                 (s >> 4u) | ((load_byte(base+j) >> 6u) << 4u));
 }
-
-float warp32_sum(float v, uint lane) {
+float sum32(float v, uint lane) {
     const uint base = WaveGetLaneIndex() - lane;
-    [unroll]
-    for (uint s = 16u; s > 0u; s >>= 1u) {
-        const float other = WaveReadLaneAt(v, base + ((lane + s) & 31u));
-        if (lane + s < 32u) {
-            v += other;
-        }
+    [unroll] for (uint s=16u; s>0u; s>>=1u) {
+        const float other = WaveReadLaneAt(v, base + ((lane+s) & 31u));
+        if (lane+s < 32u) v += other;
     }
     return v;
 }
-
-[numthreads(1024, 1, 1)]
-void GemmQ4_K(uint3 gid : SV_GroupID, uint tid : SV_GroupThreadID)
-{
-    const uint warp = tid >> 5u;
+[numthreads(256,1,1)]
+void GemmQ4_K(uint3 gid : SV_GroupID, uint tid : SV_GroupThreadID) {
     const uint lane = tid & 31u;
-    const uint row  = gid.x * ROWS_PER_GROUP + warp;
-    const bool active = row < rows;
-
-    const uint cols = blocks_per_row * WEIGHTS_PER_BLOCK;
-    const uint tgroups = (token_count + BLOCK_T - 1u) / BLOCK_T;
-
-    for (uint tg = 0; tg < tgroups; ++tg)
-    {
-        const uint tbase = tg * BLOCK_T;
-
-        float acc[BLOCK_T];
-        [unroll]
-        for (uint t = 0; t < BLOCK_T; ++t) acc[t] = 0.0f;
-
-        for (uint blk = 0; blk < blocks_per_row; ++blk)
-        {
-            uint block_base = (row * blocks_per_row + blk) * 144u;
-            uint d_half = qbuf.Load<uint>(block_base) & 0xFFFFu;
-            uint dmin_half = (qbuf.Load<uint>(block_base + 2u)) & 0xFFFFu;
-            float d = h2f(d_half);
-            float dmin = h2f(dmin_half);
-            uint scales_base = block_base + 4u;
-            uint quants_base = block_base + 16u;
-
-            // Each lane handles 8 K elements: lane*8 .. lane*8+7
-            // These span sub-blocks: lane*8/32 = lane/4 (sub 0-7)
-            for (uint j = 0; j < 8u; ++j) {
-                uint widx = lane * 8u + j;
-                uint sub = widx / 32u;
-                uint2 sm = get_scale_min(sub, qbuf, scales_base);
-                float scale = d * (float)sm.x;
-                float minv = dmin * (float)sm.y;
-
-                // Load nibble
-                uint nibble;
-                uint byte_idx;
-                if (widx < 128u) {
-                    byte_idx = widx;
-                    uint packed = qbuf.Load<uint>(quants_base + byte_idx / 2u);
-                    nibble = (byte_idx % 2u == 0u) ? (packed & 0x0Fu) : ((packed >> 4u) & 0x0Fu);
-                } else {
-                    byte_idx = widx - 128u;
-                    uint packed = qbuf.Load<uint>(quants_base + byte_idx / 2u);
-                    nibble = (byte_idx % 2u == 0u) ? (packed & 0x0Fu) : ((packed >> 4u) & 0x0Fu);
-                }
-                float w = scale * (float)nibble - minv;
-
-                uint k_global = blk * WEIGHTS_PER_BLOCK + widx;
-                if (k_global >= cols) continue;
-
-                [unroll]
-                for (uint t = 0; t < BLOCK_T; ++t) {
-                    uint tok = tbase + t;
-                    if (tok >= token_count) break;
-                    float x = asfloat(xraw.Load<uint>((tok * cols + k_global) * 4u));
-                    acc[t] += w * x;
-                }
+    const uint row = gid.x*8u + (tid >> 5u);
+    const uint token_base = gid.y*4u;
+    const uint cols = blocks_per_row*256u;
+    const uint block_bytes = is_q5 != 0u ? 176u : 144u;
+    float a0=0.0f, a1=0.0f, a2=0.0f, a3=0.0f;
+    if (row < rows) {
+        for (uint b=0u; b<blocks_per_row; ++b) {
+            const uint base = (row*blocks_per_row+b)*block_bytes;
+            const uint halves = weights.Load(base);
+            const float d = f16tof32(halves & 65535u);
+            const float dmin = f16tof32(halves >> 16u);
+            [unroll] for (uint j=0u; j<8u; ++j) {
+                const uint2 sm = scale_min(base+4u,j);
+                const uint qbase = base + (is_q5 != 0u ? 48u : 16u);
+                const uint packed = load_byte(qbase + (j >> 1u)*32u + lane);
+                uint q = (packed >> ((j & 1u)*4u)) & 15u;
+                if (is_q5 != 0u) q |= ((load_byte(base+16u+lane) >> j) & 1u) << 4u;
+                const float w = (d*(float)sm.x)*(float)q - dmin*(float)sm.y;
+                const uint c = b*256u+j*32u+lane;
+                if (token_base     < tokens) a0 += w*asfloat(input_data.Load(((token_base    )*cols+c)*4u));
+                if (token_base+1u < tokens) a1 += w*asfloat(input_data.Load(((token_base+1u)*cols+c)*4u));
+                if (token_base+2u < tokens) a2 += w*asfloat(input_data.Load(((token_base+2u)*cols+c)*4u));
+                if (token_base+3u < tokens) a3 += w*asfloat(input_data.Load(((token_base+3u)*cols+c)*4u));
             }
         }
-
-        [unroll]
-        for (uint t = 0; t < BLOCK_T; ++t) {
-            const uint tok = tbase + t;
-            if (tok >= token_count) break;
-            const float total = warp32_sum(acc[t], lane);
-            if (lane == 0u && active) {
-                yvec[tok * rows + row] = total;
-            }
-        }
+    }
+    // All lanes participate even for out-of-range rows on wave32 or wave64.
+    a0=sum32(a0,lane); a1=sum32(a1,lane); a2=sum32(a2,lane); a3=sum32(a3,lane);
+    if (lane == 0u && row < rows) {
+        if (token_base    < tokens) output_data[(token_base   )*rows+row]=a0;
+        if (token_base+1u < tokens) output_data[(token_base+1u)*rows+row]=a1;
+        if (token_base+2u < tokens) output_data[(token_base+2u)*rows+row]=a2;
+        if (token_base+3u < tokens) output_data[(token_base+3u)*rows+row]=a3;
     }
 }

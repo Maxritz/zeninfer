@@ -69,6 +69,14 @@ void trace_report();
 // Weights stay resident in VRAM, keyed by the host pointer the loader handed out.
 // Q8_0 rows are repacked on upload because a raw GGML block is 34 bytes, which
 // leaves every odd block index misaligned for a ByteAddressBuffer load.
+// Raw GGML Q4_K/Q5_K GPU matrix products (experimental). The buffers must
+// remain immutable while resident; returns false when unsupported/unavailable.
+bool gemm_kquant(const std::uint8_t* weights, const float* input, float* output,
+                 std::size_t tokens, std::size_t rows, std::size_t columns,
+                 bool q5) noexcept;
+// Call before freeing or reusing a K-quant weight address.
+void release_kquant_weights(const std::uint8_t* weights) noexcept;
+
 bool gemv_q8_0(const std::uint8_t* weights, const float* x, float* y,
                std::size_t rows, std::size_t columns) noexcept;
 bool gemm_q8_0(const std::uint8_t* weights, const float* input, float* output,

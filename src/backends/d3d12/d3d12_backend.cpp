@@ -27,6 +27,7 @@
 #include <iostream>
 #include <cstring>
 #include <map>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -243,6 +244,9 @@ struct WeightEntry {
     std::uint64_t scales_va{};      // quants GPU VA + scale_offset
     std::size_t rows{};
     std::size_t columns{};
+    // 0 = repacked Q8_0, 4/5 = raw Q4_K/Q5_K. Pointer reuse must not
+    // cause one shader to interpret another format's resident bytes.
+    unsigned kind{};
 };
 
 // Concatenated weight table for the pipeline's fused dispatches: one buffer holds
@@ -1975,7 +1979,7 @@ bool upload_weights(State& s, const std::uint8_t* weights, std::size_t rows,
 WeightEntry* lookup_weights(State& s, const std::uint8_t* weights, std::size_t rows,
                             std::size_t columns) {
     auto it = s.weights.find(weights);
-    if (it != s.weights.end() && it->second.rows == rows && it->second.columns == columns) {
+    if (it != s.weights.end() && it->second.rows == rows && it->second.columns == columns && it->second.kind == 0) {
         return &it->second;
     }
     // A different shape at the same address means the loader reused the storage;
@@ -1994,6 +1998,97 @@ WeightEntry* lookup_weights(State& s, const std::uint8_t* weights, std::size_t r
     auto& slot = s.weights[weights];
     slot = std::move(entry);
     return &slot;
+}
+
+// Keep GGML K-quants in their original byte layout in VRAM. They share the
+// residency budget and eviction map with Q8, but carry a distinct layout tag.
+WeightEntry* lookup_kquant_weights(State& s, const std::uint8_t* weights,
+                                  std::size_t rows, std::size_t columns, bool q5) {
+    const unsigned kind = q5 ? 5u : 4u;
+    auto it = s.weights.find(weights);
+    if (it != s.weights.end() && it->second.rows == rows &&
+        it->second.columns == columns && it->second.kind == kind) return &it->second;
+    if (it != s.weights.end()) {
+        s.weight_bytes -= it->second.quants->GetDesc().Width;
+        s.weights.erase(it);
+    }
+    // The public entry has already checked all products and shader address bounds.
+    const std::size_t bytes = rows * (columns / 256) * (q5 ? 176u : 144u);
+    if (s.adapter.dedicated_vram) {
+        const std::uint64_t budget = s.adapter.dedicated_vram / 100 * kVRAMBudgetPercent;
+        if (bytes > budget) return nullptr;
+        if (s.weight_bytes > budget - bytes) { s.weights.clear(); s.weight_bytes = 0; }
+    }
+    WeightEntry entry;
+    entry.quants = create_buffer(s.device.Get(), bytes, D3D12_HEAP_TYPE_DEFAULT,
+                                 D3D12_RESOURCE_STATE_COPY_DEST);
+    if (!entry.quants) return nullptr;
+    if (bytes > s.stage_cap) {
+        s.stage.Reset(); s.stage_cpu = nullptr; s.stage_cap = 0;
+        s.stage = create_buffer(s.device.Get(), bytes, upload_heap_type(), upload_heap_state());
+        if (!s.stage || FAILED(s.stage->Map(0, nullptr, &s.stage_cpu))) return nullptr;
+        s.stage_cap = bytes;
+    }
+    std::memcpy(s.stage_cpu, weights, bytes);
+    if (FAILED(s.allocator->Reset()) || FAILED(s.list->Reset(s.allocator.Get(), nullptr))) return nullptr;
+    s.list->CopyBufferRegion(entry.quants.Get(), 0, s.stage.Get(), 0, bytes);
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = entry.quants.Get();
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    s.list->ResourceBarrier(1, &barrier);
+    if (FAILED(s.list->Close()) || !execute_and_wait(s)) return nullptr;
+    entry.rows=rows; entry.columns=columns; entry.kind=kind;
+    s.weight_bytes += bytes; s.stats.weight_bytes = s.weight_bytes; s.stats.upload_bytes += bytes;
+    auto& slot=s.weights[weights]; slot=std::move(entry);
+    return &slot;
+}
+
+// One shader handles both decode (T=1) and tiled prefill. Output is always
+// read back: this API returns host data even when NO_READBACK benchmarking is set.
+bool gemm_kquant_locked(State& s, const std::uint8_t* weights, const float* input,
+                         float* output, std::size_t tokens, std::size_t rows,
+                         std::size_t columns, bool q5) {
+    if (!s.pso_gemm_q4k) return false;
+    WeightEntry* entry=lookup_kquant_weights(s,weights,rows,columns,q5);
+    if (!entry) return false;
+    const std::size_t x_bytes=tokens*columns*sizeof(float), y_bytes=tokens*rows*sizeof(float);
+    if (!reserve_scratch(s,x_bytes,y_bytes)) return false;
+    std::memcpy(s.x_cpu,input,x_bytes);
+    auto* p=static_cast<GemmParams*>(s.params_cpu);
+    p->rows=static_cast<std::uint32_t>(rows);
+    p->blocks_per_row=static_cast<std::uint32_t>(columns/256);
+    p->token_count=static_cast<std::uint32_t>(tokens);
+    p->tokens_per_tile=q5?1u:0u; // shader field is_q5
+    if (FAILED(s.allocator->Reset()) || FAILED(s.list->Reset(s.allocator.Get(),s.pso_gemm_q4k.Get()))) return false;
+    s.list->SetComputeRootSignature(s.root.Get());
+    s.list->SetComputeRootConstantBufferView(0,s.params->GetGPUVirtualAddress());
+    s.list->SetComputeRootShaderResourceView(1,entry->quants->GetGPUVirtualAddress());
+    s.list->SetComputeRootShaderResourceView(2,s.xbuf->GetGPUVirtualAddress());
+    s.list->SetComputeRootShaderResourceView(3,s.xbuf->GetGPUVirtualAddress());
+    s.list->SetComputeRootShaderResourceView(4,s.xbuf->GetGPUVirtualAddress());
+    s.list->SetComputeRootUnorderedAccessView(5,s.ybuf->GetGPUVirtualAddress());
+    s.list->Dispatch(static_cast<UINT>((rows+7)/8),static_cast<UINT>((tokens+3)/4),1);
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource=s.ybuf.Get();
+    barrier.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    barrier.Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE;
+    s.list->ResourceBarrier(1,&barrier);
+    s.list->CopyBufferRegion(s.yread.Get(),0,s.ybuf.Get(),0,y_bytes);
+    barrier.Transition.StateBefore=D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barrier.Transition.StateAfter=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    s.list->ResourceBarrier(1,&barrier);
+    if (FAILED(s.list->Close()) || !execute_and_wait(s)) return false;
+    void* mapped=nullptr; const D3D12_RANGE read_range{0,y_bytes};
+    if (FAILED(s.yread->Map(0,&read_range,&mapped))) return false;
+    std::memcpy(output,mapped,y_bytes);
+    const D3D12_RANGE no_write{0,0}; s.yread->Unmap(0,&no_write);
+    ++s.stats.dispatches;
+    return true;
 }
 
 FusedMat* ensure_fused_mat(
@@ -3204,6 +3299,7 @@ void shutdown() noexcept {
     // reuse a scratch buffer that belongs to the destroyed device.
     s.pso_gemv.Reset();
     s.pso_gemm.Reset();
+    s.pso_gemm_q4k.Reset();
     s.pso_gemm_v2.Reset();
     s.pso_gemm_v3.Reset();
     s.pso_gemm_rt.Reset();
@@ -4513,6 +4609,37 @@ bool gemv_q8_0_ffn(const std::uint8_t* gate, const std::uint8_t* up, const std::
     if (!gemv_ffn_locked(s, gate, up, down, x, y, ffn_rows, columns, out_rows)) {
         ++s.stats.fallbacks;
         return false;
+    }
+    return true;
+}
+
+void release_kquant_weights(const std::uint8_t* weights) noexcept {
+    if (!weights) return;
+    State& s=state(); std::lock_guard<std::mutex> lock(s.mutex);
+    auto it=s.weights.find(weights);
+    if (it!=s.weights.end() && (it->second.kind==4 || it->second.kind==5)) {
+        s.weight_bytes-=it->second.quants->GetDesc().Width;
+        s.weights.erase(it);
+        s.stats.weight_bytes=s.weight_bytes;
+    }
+}
+
+bool gemm_kquant(const std::uint8_t* weights, const float* input, float* output,
+                 std::size_t tokens, std::size_t rows, std::size_t columns, bool q5) noexcept {
+    if (!weights || !input || !output || !tokens || !rows || !columns || columns%256) return false;
+    // Shader uses 32-bit byte offsets and D3D12 permits at most 65535 groups
+    // in each dispatch dimension. Check before any multiplication/cast.
+    constexpr std::size_t max_bytes=std::numeric_limits<std::uint32_t>::max();
+    const std::size_t block_bytes=q5?176u:144u;
+    const std::size_t blocks=columns/256;
+    if (rows > 65535u*8u || tokens > 65535u*4u ||
+        blocks > max_bytes/block_bytes || rows > max_bytes/(blocks*block_bytes) ||
+        columns > max_bytes/sizeof(float) || tokens > max_bytes/(columns*sizeof(float)) ||
+        rows > max_bytes/sizeof(float) || tokens > max_bytes/(rows*sizeof(float))) return false;
+    State& s=state(); std::lock_guard<std::mutex> lock(s.mutex);
+    if (!init_locked(s)) return false;
+    if (!gemm_kquant_locked(s,weights,input,output,tokens,rows,columns,q5)) {
+        ++s.stats.fallbacks; return false;
     }
     return true;
 }

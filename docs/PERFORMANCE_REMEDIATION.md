@@ -40,9 +40,10 @@ with the D3D12 define on Linux, but this is not an MSVC build or GPU test.
 
 ## Outstanding work
 
-- Native Q4_K/Q5_K GPU GEMV and GEMM, and GPU support for other formats, are
-  **not implemented**. Those matrix operations still fall back to CPU even if
-  a GPU backend is enabled. Mixed-format models may have a mix of routes.
+- An experimental D3D12 Q4_K/Q5_K GEMV/GEMM path has been added; see below.
+  It is off by default and has not yet been verified on Windows or a GPU. HIP
+  still has no Q4_K/Q5_K matrix path. Other formats may still fall back to CPU;
+  mixed-format models can take a mix of routes.
 - Qwen3 Q/K normalization prevents using the existing fully fused Q8_0 decode
   layer pipeline. Its low reported prefill score has not been reproduced or
   diagnosed; it needs per-stage and per-shape measurement on the 9070 XT.
@@ -76,3 +77,41 @@ GPU dispatches alone do not prove all weights or an entire model ran on the
 GPU. Capture model filenames/types, build configuration, driver, prompt and
 output lengths, generated IDs/logit parity and prefill/decode times alongside
 D3D12 traces. Test each reported model before claiming improvement.
+
+## Experimental D3D12 K-quant path
+
+`ZEN_D3D12_KQUANT=1` opts Q4_K/Q5_K GEMV (decode) and GEMM (prefill) into a
+D3D12 shader using raw GGML blocks and FP32 activations. Q4_K/Q5_K weights are
+cached in VRAM with format-tagged entries, and runtime model reload/destruction
+releases those entries. The API for external callers requires immutable weight
+buffers while resident; call `release_kquant_weights` before changing or freeing
+one. Failed/unsupported dispatches use the existing CPU paths. The shader tiles
+four tokens and performs host input/output transfers on each call; it is not a
+fully GPU-resident transformer pipeline, and its speedup is not established.
+
+This is experimental: **the shader, Windows build, GPU parity and performance
+have not been run in this environment**. Do not treat it as production-validated.
+HIP support, fused K-quant layer/FFN submissions, and real-model parity and
+performance remain outstanding. CTest on a D3D12 build adds
+`zen_d3d12_kquant_parity`, covering decode/prefill, odd rows and token tails,
+Q5 high bits, packed scales/mins, FP16 subnormals, residency replacement and
+actual production dispatch (not a CPU fallback). It skips only when device
+initialization fails; shader or dispatch failure is a test failure.
+
+On a Windows machine with the D3D12 build prerequisites:
+
+```powershell
+cmake -S . -B build-dx12 -G "Visual Studio 17 2022" -A x64 -DZEN_BUILD_D3D12=ON -DZEN_DXC_DIR="C:/path/to/dxc"
+cmake --build build-dx12 --config Release --parallel
+ctest --test-dir build-dx12 -C Release -R zen_d3d12_kquant_parity --output-on-failure
+$env:ZEN_BACKEND = 'd3d12'
+$env:ZEN_D3D12_KQUANT = '1'
+$env:ZEN_QGEMM_TRACE = '1'
+.\build-dx12\Release\zen_generate_ids.exe model.gguf --prompt-ids 1,2,3,4 --max-new 32
+```
+
+Run parity first and use a realistic prompt for performance comparisons. A
+`gpu_ok` route count for an individual GEMV/GEMM proves that dispatch succeeded,
+not that an entire mixed-format model ran on the GPU or that the results are
+correct. Compare real-model logits/outputs against the CPU, test cache pressure,
+and measure prefill and decode separately on the 9070 XT before relying on it.

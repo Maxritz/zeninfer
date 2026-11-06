@@ -609,7 +609,25 @@ void DenseTransformerRuntime::Hadamard::transform(float* x,std::size_t width,std
 void DenseTransformerRuntime::Hadamard::unrotate(float* x,std::size_t width,std::vector<float>& scratch)const{
     (void)x;(void)width;(void)scratch;
 }
+DenseTransformerRuntime::~DenseTransformerRuntime() {
+#if defined(ZEN_HAS_D3D12)
+    for (const auto& entry : tensors_) {
+        const auto& t=entry.second;
+        if (t.raw && t.format && (t.format->encoding==quant::Encoding::q4_k || t.format->encoding==quant::Encoding::q5_k))
+            zen::d3d12::release_kquant_weights(t.raw);
+    }
+#endif
+}
 bool DenseTransformerRuntime::load(const std::filesystem::path& path,std::string* error){
+#if defined(ZEN_HAS_D3D12)
+    // The old mapping may be unmapped on either a successful reload or an
+    // early failure. Drop its cached K-quant entries before addresses can recur.
+    for (const auto& entry : tensors_) {
+        const auto& t=entry.second;
+        if (t.raw && t.format && (t.format->encoding==quant::Encoding::q4_k || t.format->encoding==quant::Encoding::q5_k))
+            zen::d3d12::release_kquant_weights(t.raw);
+    }
+#endif
     zen::diag::Scope trace("model.load",zen::diag::Phase::io);
     auto fail=[&](const std::string& e){if(error)*error=e;loaded_=false;tensors_.clear();mapping_.reset();{std::lock_guard<std::mutex> lock(prefix_cache_mutex_);prefix_cache_.reset();}return false;};
     auto report=gguf::inspect(path);if(!report.ok)return fail("GGUF: "+report.error);

@@ -34,6 +34,14 @@ namespace {
 // measurements stay clean. This is the evidence for "is prefill actually
 // taking the GPU gemm?" - the aggregated d3d12 stats line mixes every other
 // op into the same dispatch count, so it cannot answer route questions.
+#ifdef ZEN_HAS_D3D12
+// Opt in until D3D12 parity and real-model benchmarks have been run on the
+// target hardware. The old CPU paths remain the default and fallback.
+bool d3d12_kquant_enabled() noexcept {
+    static const bool enabled=[](){const char* e=std::getenv("ZEN_D3D12_KQUANT");return e && e[0]=='1';}();
+    return enabled;
+}
+#endif
 struct RouteCounters {
     std::atomic<unsigned long long> gpu_try{0};
     std::atomic<unsigned long long> gpu_ok{0};
@@ -810,6 +818,13 @@ bool gemv(const Format& f,const std::uint8_t*w,const float*x,float*y,
     if(!w||!x||!y||!rows||!cols||!std::isfinite(scale))return false;
     const auto rb=row_bytes(f,cols);if(!rb)return false;
 #ifdef ZEN_HAS_D3D12
+    if(d3d12_kquant_enabled() && (f.encoding==Encoding::q4_k||f.encoding==Encoding::q5_k) &&
+       scale==1.0f && zen::d3d12::enabled()) {
+        g_gemv_routes.gpu_try.fetch_add(1,std::memory_order_relaxed);
+        if(zen::d3d12::gemm_kquant(w,x,y,1,rows,cols,f.encoding==Encoding::q5_k)) {
+            g_gemv_routes.gpu_ok.fetch_add(1,std::memory_order_relaxed); return true;
+        }
+    }
     // GPU residency is keyed by the weight pointer, so the first token pays a
     // one-off upload and every later token reads VRAM instead of DDR4.
     if(f.encoding==Encoding::q8_0&&scale==1.0f&&zen::d3d12::enabled()){
@@ -1253,6 +1268,13 @@ bool gemm(const Format& f,const std::uint8_t*w,const float*input,float*output,
     if(!w||!input||!output||!tokens||!rows||!cols||!std::isfinite(scale))return false;
     const auto rb=row_bytes(f,cols);if(!rb)return false;
 #ifdef ZEN_HAS_D3D12
+    if(d3d12_kquant_enabled() && (f.encoding==Encoding::q4_k||f.encoding==Encoding::q5_k) &&
+       scale==1.0f && zen::d3d12::enabled()) {
+        g_gemm_routes.gpu_try.fetch_add(1,std::memory_order_relaxed);
+        if(zen::d3d12::gemm_kquant(w,input,output,tokens,rows,cols,f.encoding==Encoding::q5_k)) {
+            g_gemm_routes.gpu_ok.fetch_add(1,std::memory_order_relaxed); return true;
+        }
+    }
     if(f.encoding==Encoding::q8_0&&scale==1.0f&&zen::d3d12::enabled()){
         g_gemm_routes.gpu_try.fetch_add(1,std::memory_order_relaxed);
         if(zen::d3d12::gemm_q8_0(w,input,output,tokens,rows,cols)){

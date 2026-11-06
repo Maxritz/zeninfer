@@ -211,6 +211,9 @@ if(ZEN_BUILD_D3D12)
       add_executable(zen_d3d12_gemm_parity tools/d3d12_gemm_parity.cpp)
       target_link_libraries(zen_d3d12_gemm_parity PRIVATE zen_core)
 
+      add_executable(zen_d3d12_kquant_parity tools/d3d12_kquant_parity.cpp)
+      target_link_libraries(zen_d3d12_kquant_parity PRIVATE zen_core)
+
       # Task 2 of docs/d3d12_full_backend_todo.md exported the residual add, so its
       # harness is built again and now tests the real out = a + b path instead of
       # standing in rms_norm against a reference it could never match.
@@ -296,6 +299,12 @@ if(ZEN_BUILD_D3D12)
         set_tests_properties(zen_d3d12_gemm_parity PROPERTIES
           LABELS "d3d12;quant" TIMEOUT 120
           ENVIRONMENT "ZEN_BACKEND=d3d12;ZEN_D3D12_GEMM_EXPERIMENTAL=1"
+          SKIP_RETURN_CODE 77)
+
+        add_test(NAME zen_d3d12_kquant_parity COMMAND zen_d3d12_kquant_parity)
+        set_tests_properties(zen_d3d12_kquant_parity PROPERTIES
+          LABELS "d3d12;quant" TIMEOUT 180
+          ENVIRONMENT "ZEN_BACKEND=d3d12;ZEN_D3D12_KQUANT=1"
           SKIP_RETURN_CODE 77)
 
         add_test(NAME zen_d3d12_addn_parity COMMAND zen_d3d12_addn_parity)
