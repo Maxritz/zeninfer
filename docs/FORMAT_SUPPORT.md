@@ -42,6 +42,16 @@ blocks must fit within each row (dimension 0), not just the whole tensor.
   For example, on Windows PowerShell set `$env:ZEN_GGUF_Q8_1_LAYOUT = "fp32"`
   before launching ZenInfer; on Linux use `export ZEN_GGUF_Q8_1_LAYOUT=fp32`.
   Use `fp16` instead only for a verified 36-byte layout.
+* **Prism legacy Q2_0 is also ambiguous:** older Prism files used type ID 42
+  for a 128-value layout, while ZenInfer interprets ID 42 as the current
+  upstream 64-value layout. The old layout is not supported and is **not
+  reliably detected**; it may be misdecoded. Verify the source and use the
+  official group-64 file. The fork's separate PQ2_0 type 142 is not implemented
+  here. See [Prism model formats](https://github.com/PrismML-Eng/Bonsai-demo/blob/de058d0bfcb846cf0d8374eae8623376708673ed/MODEL-FORMATS.md).
+* PTQ1_0 now uses the Prism source's 16-byte then 8-byte staging. Older
+  ZenInfer builds and synthetic fixtures used a different ordering and could
+  silently misdecode real Prism PTQ1_0 weights. IQ2_XXS was also corrected to
+  advance through its u16 words at the correct byte stride.
 * I32/I64/F64 tensors are converted to FP32 for inference and can lose
   precision; F64 can overflow to infinity. F8_E4M3 preserves signed zero and
   decodes both NaN codes as NaN. Non-finite model weights may fail runtime
@@ -51,8 +61,9 @@ blocks must fit within each row (dimension 0), not just the whole tensor.
   generic row-decode/dot or GEMM path for others. In particular, the five
   Q1_0, Q2_0, current and legacy Q8_1, NVFP4 and F8_E4M3 now have AVX2 GEMV
   and batched GEMM paths; F8 GEMM falls back for columns not divisible by 8.
-  Many other formats still use generic paths. There is no claim of uniform
-  performance or full optimization.
+  All nine registered IQ variants and PTQ1_0 also have AVX2 GEMV and panel
+  GEMM paths (`ZEN_CPU_FAST_IQ_PTQ=0` opts out). Many other formats still use
+  generic paths. There is no claim of uniform performance or full optimization.
   Supported matrices are mapped; generic paths use bounded scratch rather than
   expanding the entire matrix. Vector/non-matrix tensors can be decoded to RAM.
 * This work adds **no GPU support**; GPU format support is a separate question.
@@ -81,5 +92,7 @@ independent element formulas over tail shapes, unaligned weights, worker counts,
 token counts and padded output strides. The broader CPU sweep covers all registry formats,
 but mostly compares matmul with ZenInfer's own decoder. See
 `docs/CPU_QUANT_PROGRESS.md` for earlier independent checks and benchmark
-limits. Real checkpoints for these new types and Windows/target-CPU performance
-have not been validated by these tests.
+limits. Real checkpoints and target-CPU performance have not been validated by
+these tests. IQ2_XXS and PTQ1_0 now additionally use golden records generated
+from actual upstream decoders, and IQ/PTQ matrix tests use independent decoded
+weights; see `docs/CPU_QUANT_PROGRESS.md` for provenance and remaining limits.

@@ -106,7 +106,8 @@ def iq2_xxs(block):
     qs = block[2:66]
     out = []
     for ib in range(8):
-        aux = struct.unpack_from('<II', qs, 4 * ib)
+        # The source array is uint16_t: 4 * ib words, i.e. 8 * ib bytes.
+        aux = struct.unpack_from('<II', qs, 8 * ib)
         aux8 = list(struct.pack('<II', *aux))
         db = d * (0.5 + (aux[1] >> 28)) * 0.25
         for l in range(4):
@@ -241,7 +242,31 @@ def iq1_m(block):
     return out
 
 
+def iq4_nl(block):
+    out = []
+    for start in range(0, 144, 18):
+        d = f16(struct.unpack_from('<H', block, start)[0])
+        qs = block[start + 2:start + 18]
+        out.extend(d * IQLUT[v & 15] for v in qs)
+        out.extend(d * IQLUT[v >> 4] for v in qs)
+    return out
+
+
+def ptq1_0(block):
+    out = []
+    for start in (0, 28):
+        d = f16(struct.unpack_from('<H', block, start + 26)[0])
+        for section, count in ((block[start:start + 16], 5), (block[start + 16:start + 24], 5),
+                               (block[start + 24:start + 26], 4)):
+            for n in range(count):
+                for byte in section:
+                    q = (byte * (3 ** n)) & 255
+                    out.append((((q * 3) >> 8) - 1) * d)
+    return out
+
+
 FORMATS = {
+    'IQ4_NL': (144, iq4_nl), 'PTQ1_0': (56, ptq1_0),
     'Q8_K': (292, q8_k), 'TQ1_0': (54, tq1_0), 'TQ2_0': (66, tq2_0),
     'IQ4_XS': (136, iq4_xs), 'IQ2_XXS': (66, iq2_xxs), 'IQ2_XS': (74, iq2_xs),
     'IQ2_S': (82, iq2_s), 'IQ3_XXS': (98, iq3_xxs), 'IQ3_S': (110, iq3_s),
@@ -257,7 +282,11 @@ def rand_half():
 def make_block(name):
     size = FORMATS[name][0]
     block = bytearray(rng.randrange(256) for _ in range(size))
-    if name == 'Q8_K':
+    if name in ('IQ4_NL', 'PTQ1_0'):
+        stride, offset = (18, 0) if name == 'IQ4_NL' else (28, 26)
+        for start in range(0, size, stride):
+            block[start + offset:start + offset + 2] = struct.pack('<H', rand_half())
+    elif name == 'Q8_K':
         block[0:4] = struct.pack('<f', rng.uniform(-2, 2))
     else:
         d_off = {'TQ1_0': 52, 'TQ2_0': 64}.get(name, 0)
@@ -267,7 +296,7 @@ def make_block(name):
     return bytes(block)
 
 
-def write(path, per_format=6):
+def write(path, per_format=6, golden_paths=()):
     rows = []
     for name, (size, decode) in FORMATS.items():
         for _ in range(per_format):
@@ -275,15 +304,38 @@ def write(path, per_format=6):
             values = [float(v) for v in decode(block)]
             assert len(values) == 256, (name, len(values))
             rows.append((name, block, values))
+    # Upstream layout anchor: eight non-overlapping pairs of u32 words.
+    # Grid index zero is eight 8s; choose zero signs and a distinct scale
+    # nibble in every group. This catches a byte/uint16 pointer-stride error.
+    anchor = bytearray(66)
+    anchor[:2] = struct.pack('<H', 0x3c00)
+    for ib in range(8):
+        struct.pack_into('<I', anchor, 2 + ib * 8 + 4, ib << 28)
+    rows.append(('IQ2_XXS', bytes(anchor), [float(1 + 2 * ib) for ib in range(8) for _ in range(32)]))
+    golden = b''
+    golden_count = 0
+    for golden_path in golden_paths:
+        with open(golden_path, 'rb') as fh:
+            count = struct.unpack('<I', fh.read(4))[0]
+            data = fh.read()
+        pos = 0
+        for _ in range(count):
+            size = struct.unpack_from('<I', data, pos + 8)[0]
+            pos += 12 + size + 256 * 4
+        if pos != len(data):
+            raise ValueError(f'invalid golden corpus: {golden_path}')
+        golden += data
+        golden_count += count
     with open(path, 'wb') as fh:
-        fh.write(struct.pack('<I', len(rows)))
+        fh.write(struct.pack('<I', len(rows) + golden_count))
         for name, block, values in rows:
             fh.write(name.encode().ljust(8, b'\0'))
             fh.write(struct.pack('<I', len(block)))
             fh.write(block)
             fh.write(struct.pack('<%df' % len(values), *values))
-    print(f'wrote {len(rows)} records to {path}')
+        fh.write(golden)
+    print(f'wrote {len(rows) + golden_count} records to {path}')
 
 
 if __name__ == '__main__':
-    write(sys.argv[2] if len(sys.argv) > 2 else 'iq_ref.bin')
+    write(sys.argv[2] if len(sys.argv) > 2 else 'iq_ref.bin', golden_paths=sys.argv[3:])

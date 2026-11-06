@@ -17,7 +17,7 @@ void gemv_scalar(const float* a, const float* x, float* y,
 void gemm_scalar(const float* a, const float* b, float* c,
                  std::size_t m, std::size_t n, std::size_t k);
 
-enum class NewQuantKind : std::uint8_t { q1_0, q2_0, q8_1, q8_1_f32, nvfp4, f8_e4m3 };
+enum class NewQuantKind : std::uint8_t { q1_0, q2_0, q8_1, q8_1_f32, nvfp4, f8_e4m3, ptq1_0, iq4_nl, iq4_xs, iq2_xxs, iq2_xs, iq2_s, iq3_xxs, iq3_s, iq1_s, iq1_m };
 #ifdef ZEN_HAS_AVX2_KERNELS
 void gemv_avx2(const float* a, const float* x, float* y,
                std::size_t m, std::size_t k);
@@ -34,6 +34,17 @@ bool gemm_q8_1_kblk_avx2(const std::uint8_t*,const float*,float*,std::size_t,std
 bool gemm_q8_1_f32_kblk_avx2(const std::uint8_t*,const float*,float*,std::size_t,std::size_t,std::size_t,std::size_t);
 bool gemm_nvfp4_kblk_avx2(const std::uint8_t*,const float*,float*,std::size_t,std::size_t,std::size_t,std::size_t);
 bool gemm_f8_e4m3_kblk_avx2(const std::uint8_t*,const float*,float*,std::size_t,std::size_t,std::size_t,std::size_t);
+bool gemm_ptq1_0_kblk_avx2(const std::uint8_t*,const float*,float*,std::size_t,std::size_t,std::size_t,std::size_t);
+bool gemm_iq4_nl_kblk_avx2(const std::uint8_t*,const float*,float*,std::size_t,std::size_t,std::size_t,std::size_t);
+bool gemm_iq4_xs_kblk_avx2(const std::uint8_t*,const float*,float*,std::size_t,std::size_t,std::size_t,std::size_t);
+bool gemm_iq2_xxs_kblk_avx2(const std::uint8_t*,const float*,float*,std::size_t,std::size_t,std::size_t,std::size_t);
+bool gemm_iq2_xs_kblk_avx2(const std::uint8_t*,const float*,float*,std::size_t,std::size_t,std::size_t,std::size_t);
+bool gemm_iq2_s_kblk_avx2(const std::uint8_t*,const float*,float*,std::size_t,std::size_t,std::size_t,std::size_t);
+bool gemm_iq3_xxs_kblk_avx2(const std::uint8_t*,const float*,float*,std::size_t,std::size_t,std::size_t,std::size_t);
+bool gemm_iq3_s_kblk_avx2(const std::uint8_t*,const float*,float*,std::size_t,std::size_t,std::size_t,std::size_t);
+bool gemm_iq1_s_kblk_avx2(const std::uint8_t*,const float*,float*,std::size_t,std::size_t,std::size_t,std::size_t);
+bool gemm_iq1_m_kblk_avx2(const std::uint8_t*,const float*,float*,std::size_t,std::size_t,std::size_t,std::size_t);
+
 // Fused GGML Q4_K/Q5_K decode dot product; K must be a multiple of 256.
 bool gemv_q4k_q5k_avx2(const std::uint8_t* weights, const float* x, float* y,
                         std::size_t rows, std::size_t columns, bool q5);
@@ -104,7 +115,7 @@ float dot_f32_avx2(const float* a, const float* b, std::size_t n) noexcept;
 void axpy_f32_avx2(float a, const float* x, float* y, std::size_t n) noexcept;
 // Non-Q8 K-blocked batched GEMM. F16/Q4_K/BF16 are enabled unless the
 // corresponding ZEN_CPU_FAST_* variable starts with 0; Q6_K is ungated and
-// IQ uses the generic path. 4-row x 2-token micro-tile, K-panel Kc for
+// IQ/PTQ also have specialized paths. 4-row x 2-token micro-tile, K-panel Kc for
 // F16 and Q4_K from ZEN_CPU_F16_KC /
 // ZEN_CPU_Q4K_KC (64/128/256, default 128). The fp32 weight panel [4, Kc]
 // is dequantised once per panel and reused across every token from L1;

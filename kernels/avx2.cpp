@@ -1,4 +1,5 @@
 #include "zen/kernels.h"
+#include "../src/iq_tables.h"
 #include <immintrin.h>
 #include <cstdint>
 #include <cstdlib>
@@ -117,6 +118,92 @@ static const std::array<float,256>& f8_e4m3_table(){
         out[x]=(x&128u)?-v:v;
     }return out;}();return values;
 }
+static inline std::uint16_t iq_read16(const std::uint8_t* p){return std::uint16_t(p[0])|(std::uint16_t(p[1])<<8);}
+static inline std::uint32_t iq_read32(const std::uint8_t* p){return std::uint32_t(iq_read16(p))|(std::uint32_t(iq_read16(p+2))<<16);}
+// Decode one eight-value group directly from the stored codebooks and scales.
+template<NewQuantKind kind>
+static inline __m256 iq_ptq_decode8(const std::uint8_t* p, std::size_t offset){
+    if(kind==NewQuantKind::ptq1_0){
+        const float d=q8_half_to_float(iq_read16(p+26));
+        __m256i q, mult;
+        if(offset<120){
+            // Prism stages 16 bytes for the first 80 values, then 8 bytes
+            // for the next 40 (not a single 24-byte plane).
+            const unsigned pos=unsigned(offset<80?offset:offset-80);
+            const unsigned width=offset<80?16:8;
+            const unsigned start=offset<80?0:16;
+            std::uint64_t bytes;std::memcpy(&bytes,p+start+pos%width,8);
+            q=_mm256_cvtepu8_epi32(_mm_cvtsi64_si128(static_cast<long long>(bytes)));
+            static constexpr int pow3[]={1,3,9,27,81};mult=_mm256_set1_epi32(pow3[pos/width]);
+        }else{
+            q=_mm256_setr_epi32(p[24],p[25],p[24],p[25],p[24],p[25],p[24],p[25]);
+            mult=_mm256_setr_epi32(1,1,3,3,9,9,27,27);
+        }
+        q=_mm256_and_si256(_mm256_mullo_epi32(q,mult),_mm256_set1_epi32(255));
+        q=_mm256_sub_epi32(_mm256_srli_epi32(_mm256_mullo_epi32(q,_mm256_set1_epi32(3)),8),_mm256_set1_epi32(1));
+        return _mm256_mul_ps(_mm256_cvtepi32_ps(q),_mm256_set1_ps(d));
+    }
+    if(kind==NewQuantKind::iq4_nl || kind==NewQuantKind::iq4_xs){
+        float d=q8_half_to_float(iq_read16(p));const std::uint8_t* qs;
+        if(kind==NewQuantKind::iq4_nl)qs=p+2;
+        else {
+            const unsigned ib=unsigned(offset/32), sh=iq_read16(p+2);
+            const unsigned scale=((p[4+ib/2]>>(4*(ib%2)))&15u)|(((sh>>(2*ib))&3u)<<4);
+            d*=float(int(scale)-32);qs=p+8+16*ib;offset%=32;
+        }
+        std::uint64_t raw;std::memcpy(&raw,qs+(offset%16),8);
+        __m128i code=_mm_cvtsi64_si128(static_cast<long long>(raw));
+        if(offset>=16)code=_mm_srli_epi16(code,4);
+        code=_mm_and_si128(code,_mm_set1_epi8(15));
+        const __m128i lut=_mm_setr_epi8(-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113);
+        return _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_shuffle_epi8(lut,code))),_mm256_set1_ps(d));
+    }
+    const unsigned ib=unsigned(offset/32), l=unsigned(offset%32/8);
+    std::uint64_t grid=0;unsigned signs=0;float d=0,delta=0;bool signed_grid=false;
+    if(kind==NewQuantKind::iq1_m){
+        const auto* sc=p+48;const unsigned scale=(iq_read16(sc)>>12)|((iq_read16(sc+2)>>8)&0xf0u)|((iq_read16(sc+4)>>4)&0xf00u)|(iq_read16(sc+6)&0xf000u);
+        const unsigned sub=(iq_read16(sc+2*(ib/2))>>(6*(ib%2)+3*(l/2)))&7u;
+        d=q8_half_to_float(std::uint16_t(scale))*float(2*sub+1);
+        const unsigned h=p[32+2*ib+l/2], shift=(l%2)*4;
+        const unsigned idx=p[4*ib+l]|(((h>>shift)&7u)<<8);
+        delta=(h&(8u<<shift))?-0.125f:0.125f;grid=detail::iq1s_grid[idx];signed_grid=true;
+    }else{
+        d=q8_half_to_float(iq_read16(p));
+        if(kind==NewQuantKind::iq1_s){
+            const unsigned h=iq_read16(p+34+2*ib);
+            d*=float(2*((h>>12)&7u)+1);delta=(h&0x8000u)?-0.125f:0.125f;
+            grid=detail::iq1s_grid[p[2+4*ib+l]|(((h>>(3*l))&7u)<<8)];signed_grid=true;
+        }else if(kind==NewQuantKind::iq2_xxs){
+            const auto* qs=p+2+8*ib;const unsigned aux=iq_read32(qs+4);
+            d*= (0.5f+float(aux>>28))*0.25f;grid=detail::iq2xxs_grid[qs[l]];signs=detail::ksigns_iq2xs[(aux>>(7*l))&127u];
+        }else if(kind==NewQuantKind::iq2_xs){
+            const unsigned idx=iq_read16(p+2+2*(4*ib+l));const unsigned scale=(p[66+ib]>>(4*(l/2)))&15u;
+            d*=(0.5f+float(scale))*0.25f;grid=detail::iq2xs_grid[idx&511u];signs=detail::ksigns_iq2xs[idx>>9];
+        }else if(kind==NewQuantKind::iq2_s){
+            const unsigned scale=(p[74+ib]>>(4*(l/2)))&15u;
+            d*=(0.5f+float(scale))*0.25f;grid=detail::iq2s_grid[p[2+4*ib+l]|((p[66+ib]<<(8-2*l))&0x300u)];signs=p[34+4*ib+l];
+        }else if(kind==NewQuantKind::iq3_xxs){
+            const unsigned aux=iq_read32(p+66+4*ib);d*=(0.5f+float(aux>>28))*0.5f;
+            grid=std::uint64_t(detail::iq3xxs_grid[p[2+8*ib+2*l]])|(std::uint64_t(detail::iq3xxs_grid[p[3+8*ib+2*l]])<<32);
+            signs=detail::ksigns_iq2xs[(aux>>(7*l))&127u];
+        }else { // iq3_s
+            const unsigned h=p[66+ib], a=p[2+8*ib+2*l]|((h<<(8-2*l))&256u), b=p[3+8*ib+2*l]|((h<<(7-2*l))&256u);
+            d*=float(1+2*((p[106+ib/2]>>(4*(ib%2)))&15u));
+            grid=std::uint64_t(detail::iq3s_grid[a])|(std::uint64_t(detail::iq3s_grid[b])<<32);signs=p[74+4*ib+l];
+        }
+    }
+    const __m128i bytes=_mm_cvtsi64_si128(static_cast<long long>(grid));
+    if(signed_grid){
+        auto q=_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(bytes));
+        return _mm256_mul_ps(_mm256_add_ps(q,_mm256_set1_ps(delta)),_mm256_set1_ps(d));
+    }
+    auto q=_mm256_cvtepu8_epi32(bytes);
+    const auto bits=_mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32(int(signs)),_mm256_setr_epi32(0,1,2,3,4,5,6,7)),_mm256_set1_epi32(1));
+    const auto mask=_mm256_sub_epi32(_mm256_setzero_si256(),bits);
+    q=_mm256_sub_epi32(_mm256_xor_si256(q,mask),mask);
+    return _mm256_mul_ps(_mm256_cvtepi32_ps(q),_mm256_set1_ps(d));
+}
+
 // Eight decoded elements from compact Q1_0/Q2_0, NVFP4, FP8 and Q8_1 layouts.
 // The callers only pass whole, block-aligned panels (Kc=256).
 static inline __m256 new_quant_decode8(const std::uint8_t* p, std::size_t offset, NewQuantKind kind) {
@@ -155,13 +242,63 @@ static inline __m256 new_quant_decode8(const std::uint8_t* p, std::size_t offset
     }
     return _mm256_mul_ps(_mm256_cvtepi32_ps(q),_mm256_set1_ps(d));
 }
-static inline std::size_t new_quant_elements(NewQuantKind kind){return kind==NewQuantKind::f8_e4m3?1:kind==NewQuantKind::q1_0?128:kind==NewQuantKind::q2_0||kind==NewQuantKind::nvfp4?64:32;}
-static inline std::size_t new_quant_bytes(NewQuantKind kind){return kind==NewQuantKind::f8_e4m3?1:kind==NewQuantKind::q1_0||kind==NewQuantKind::q2_0?18:kind==NewQuantKind::q8_1||kind==NewQuantKind::nvfp4?36:40;}
+static inline std::size_t new_quant_elements(NewQuantKind kind){
+    if(kind==NewQuantKind::f8_e4m3)return 1;
+    if(kind==NewQuantKind::q1_0||kind==NewQuantKind::ptq1_0)return 128;
+    if(kind==NewQuantKind::q2_0||kind==NewQuantKind::nvfp4)return 64;
+    if(kind>=NewQuantKind::iq4_xs)return 256;
+    return 32;
+}
+static inline std::size_t new_quant_bytes(NewQuantKind kind){
+    switch(kind){
+    case NewQuantKind::f8_e4m3:return 1;
+    case NewQuantKind::q1_0:case NewQuantKind::q2_0:case NewQuantKind::iq4_nl:return 18;
+    case NewQuantKind::q8_1:case NewQuantKind::nvfp4:return 36;
+    case NewQuantKind::q8_1_f32:return 40;
+    case NewQuantKind::ptq1_0:return 28;
+    case NewQuantKind::iq4_xs:return 136;
+    case NewQuantKind::iq2_xxs:return 66;
+    case NewQuantKind::iq2_xs:return 74;
+    case NewQuantKind::iq2_s:return 82;
+    case NewQuantKind::iq3_xxs:return 98;
+    case NewQuantKind::iq3_s:return 110;
+    case NewQuantKind::iq1_s:return 50;
+    case NewQuantKind::iq1_m:return 56;
+    }return 0;
+}
+
+template<NewQuantKind Kind>
+static bool gemv_iq_ptq(const std::uint8_t* weights,const float* x,float* y,std::size_t rows,std::size_t columns){
+    const auto block=new_quant_elements(Kind), bytes=new_quant_bytes(Kind);
+    if(!weights||!x||!y||!rows||!columns||columns%block)return false;
+    const auto blocks=columns/block;
+    for(std::size_t r=0;r<rows;++r){
+        __m256 acc=_mm256_setzero_ps();
+        for(std::size_t b=0;b<blocks;++b){
+            const auto* p=weights+(r*blocks+b)*bytes;
+            for(unsigned j=0;j<block;j+=8)acc=_mm256_fmadd_ps(iq_ptq_decode8<Kind>(p,j),_mm256_loadu_ps(x+b*block+j),acc);
+        }
+        y[r]=hsum_ps256(acc);
+    }
+    return true;
+}
 
 bool gemv_new_quant_avx2(const std::uint8_t* weights,const float* x,float* y,
                           std::size_t rows,std::size_t columns,NewQuantKind kind){
-    if(kind!=NewQuantKind::q1_0 && kind!=NewQuantKind::q2_0 && kind!=NewQuantKind::q8_1 &&
-       kind!=NewQuantKind::q8_1_f32 && kind!=NewQuantKind::nvfp4 && kind!=NewQuantKind::f8_e4m3)return false;
+    if(!new_quant_bytes(kind))return false;
+    switch(kind){
+    case NewQuantKind::ptq1_0:return gemv_iq_ptq<NewQuantKind::ptq1_0>(weights,x,y,rows,columns);
+    case NewQuantKind::iq4_nl:return gemv_iq_ptq<NewQuantKind::iq4_nl>(weights,x,y,rows,columns);
+    case NewQuantKind::iq4_xs:return gemv_iq_ptq<NewQuantKind::iq4_xs>(weights,x,y,rows,columns);
+    case NewQuantKind::iq2_xxs:return gemv_iq_ptq<NewQuantKind::iq2_xxs>(weights,x,y,rows,columns);
+    case NewQuantKind::iq2_xs:return gemv_iq_ptq<NewQuantKind::iq2_xs>(weights,x,y,rows,columns);
+    case NewQuantKind::iq2_s:return gemv_iq_ptq<NewQuantKind::iq2_s>(weights,x,y,rows,columns);
+    case NewQuantKind::iq3_xxs:return gemv_iq_ptq<NewQuantKind::iq3_xxs>(weights,x,y,rows,columns);
+    case NewQuantKind::iq3_s:return gemv_iq_ptq<NewQuantKind::iq3_s>(weights,x,y,rows,columns);
+    case NewQuantKind::iq1_s:return gemv_iq_ptq<NewQuantKind::iq1_s>(weights,x,y,rows,columns);
+    case NewQuantKind::iq1_m:return gemv_iq_ptq<NewQuantKind::iq1_m>(weights,x,y,rows,columns);
+    default:break;
+    }
     const auto block=new_quant_elements(kind), bytes=new_quant_bytes(kind);
     if(!weights||!x||!y||!rows||!columns||columns%block)return false;
     if(kind==NewQuantKind::f8_e4m3){
@@ -1266,7 +1403,9 @@ void dequant_new_quant_panel(const std::uint8_t* wrow,std::size_t k0,std::size_t
     const auto block=new_quant_elements(Kind), bytes=new_quant_bytes(Kind);
     for(std::size_t i=0;i<kc;i+=8){
         const auto col=k0+i;
-        _mm256_storeu_ps(dst+i,new_quant_decode8(wrow+(col/block)*bytes,unsigned(col%block),Kind));
+        if constexpr(Kind>=NewQuantKind::ptq1_0)
+            _mm256_storeu_ps(dst+i,iq_ptq_decode8<Kind>(wrow+(col/block)*bytes,unsigned(col%block)));
+        else _mm256_storeu_ps(dst+i,new_quant_decode8(wrow+(col/block)*bytes,unsigned(col%block),Kind));
     }
 }
 
@@ -1362,6 +1501,17 @@ bool gemm_q8_1_kblk_avx2(const std::uint8_t* w,const float* x,float* y,std::size
 bool gemm_q8_1_f32_kblk_avx2(const std::uint8_t* w,const float* x,float* y,std::size_t t,std::size_t r,std::size_t c,std::size_t s){return gemm_new_quant_kblk<NewQuantKind::q8_1_f32>(w,x,y,t,r,c,s);}
 bool gemm_nvfp4_kblk_avx2(const std::uint8_t* w,const float* x,float* y,std::size_t t,std::size_t r,std::size_t c,std::size_t s){return gemm_new_quant_kblk<NewQuantKind::nvfp4>(w,x,y,t,r,c,s);}
 bool gemm_f8_e4m3_kblk_avx2(const std::uint8_t* w,const float* x,float* y,std::size_t t,std::size_t r,std::size_t c,std::size_t s){return gemm_new_quant_kblk<NewQuantKind::f8_e4m3>(w,x,y,t,r,c,s);}
+bool gemm_ptq1_0_kblk_avx2(const std::uint8_t* w,const float* x,float* y,std::size_t t,std::size_t r,std::size_t c,std::size_t s){return gemm_new_quant_kblk<NewQuantKind::ptq1_0>(w,x,y,t,r,c,s);}
+bool gemm_iq4_nl_kblk_avx2(const std::uint8_t* w,const float* x,float* y,std::size_t t,std::size_t r,std::size_t c,std::size_t s){return gemm_new_quant_kblk<NewQuantKind::iq4_nl>(w,x,y,t,r,c,s);}
+bool gemm_iq4_xs_kblk_avx2(const std::uint8_t* w,const float* x,float* y,std::size_t t,std::size_t r,std::size_t c,std::size_t s){return gemm_new_quant_kblk<NewQuantKind::iq4_xs>(w,x,y,t,r,c,s);}
+bool gemm_iq2_xxs_kblk_avx2(const std::uint8_t* w,const float* x,float* y,std::size_t t,std::size_t r,std::size_t c,std::size_t s){return gemm_new_quant_kblk<NewQuantKind::iq2_xxs>(w,x,y,t,r,c,s);}
+bool gemm_iq2_xs_kblk_avx2(const std::uint8_t* w,const float* x,float* y,std::size_t t,std::size_t r,std::size_t c,std::size_t s){return gemm_new_quant_kblk<NewQuantKind::iq2_xs>(w,x,y,t,r,c,s);}
+bool gemm_iq2_s_kblk_avx2(const std::uint8_t* w,const float* x,float* y,std::size_t t,std::size_t r,std::size_t c,std::size_t s){return gemm_new_quant_kblk<NewQuantKind::iq2_s>(w,x,y,t,r,c,s);}
+bool gemm_iq3_xxs_kblk_avx2(const std::uint8_t* w,const float* x,float* y,std::size_t t,std::size_t r,std::size_t c,std::size_t s){return gemm_new_quant_kblk<NewQuantKind::iq3_xxs>(w,x,y,t,r,c,s);}
+bool gemm_iq3_s_kblk_avx2(const std::uint8_t* w,const float* x,float* y,std::size_t t,std::size_t r,std::size_t c,std::size_t s){return gemm_new_quant_kblk<NewQuantKind::iq3_s>(w,x,y,t,r,c,s);}
+bool gemm_iq1_s_kblk_avx2(const std::uint8_t* w,const float* x,float* y,std::size_t t,std::size_t r,std::size_t c,std::size_t s){return gemm_new_quant_kblk<NewQuantKind::iq1_s>(w,x,y,t,r,c,s);}
+bool gemm_iq1_m_kblk_avx2(const std::uint8_t* w,const float* x,float* y,std::size_t t,std::size_t r,std::size_t c,std::size_t s){return gemm_new_quant_kblk<NewQuantKind::iq1_m>(w,x,y,t,r,c,s);}
+
 
 bool gemm_f16_kblk_avx2(const std::uint8_t* weights, const float* input, float* output,
                         std::size_t tokens, std::size_t rows, std::size_t columns,
