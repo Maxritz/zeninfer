@@ -1079,11 +1079,9 @@ static bool gemm_q8_0_parallel(const std::uint8_t* w,const float* input,float* o
     });
     return success.load();
 }
-// Non-Q8 K-blocked batched GEMM (opt-in, default off). Same row-parallel
-// shape as the Q8 path; counted under cpu_avx2 because cpu_kblk tracks the
-// Q8 K-blocked kernel specifically (see RouteCounters). ZEN_CPU_FAST_F16=1
-// enables F16, ZEN_CPU_FAST_Q4K=1 enables Q4_K; Q6_K/IQ stay on the generic
-// path below.
+// Non-Q8 K-blocked GEMM uses the same row-parallel shape as Q8 and is
+// counted under cpu_avx2. F16/Q4_K/BF16 are enabled unless their respective
+// ZEN_CPU_FAST_* variable starts with 0. Q6_K is ungated; IQ uses generic GEMM.
 static bool f16_fast_enabled() {
     static const bool v=[](){
         const char* e=std::getenv("ZEN_CPU_FAST_F16");
@@ -1312,9 +1310,8 @@ bool gemm(const Format& f,const std::uint8_t*w,const float*input,float*output,
         else g_gemm_routes.cpu_avx2.fetch_add(1,std::memory_order_relaxed);
         if(gemm_q8_0_parallel(w,input,output,tokens,rows,cols,rb,requested_workers))return true;
     }
-    // Non-Q8 fast path (F16 first, then Q4_K). Env-gated, default off;
-    // falls back to the generic path below whenever the gate, the shape,
-    // or the kernel itself fails. Q6_K/IQ deliberately have no gate here.
+    // Non-Q8 fast paths fall back to generic GEMM if the gate, shape, or
+    // kernel fails. Q6_K is ungated; the IQ formats use the generic path.
     if(tokens>=2&&zen::cpu_has_avx2_fma()&&cols%32==0){
         if(f.encoding==Encoding::fp16&&f16_fast_enabled()){
             g_gemm_routes.cpu_avx2.fetch_add(1,std::memory_order_relaxed);

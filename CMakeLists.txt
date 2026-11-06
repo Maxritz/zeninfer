@@ -530,6 +530,10 @@ if(ZEN_BUILD_TESTS)
   target_link_libraries(zen_core_tests PRIVATE zen_model_adapters)
   add_test(NAME zen_core_tests COMMAND zen_core_tests)
   set_tests_properties(zen_core_tests PROPERTIES TIMEOUT 120)
+  add_executable(zen_q6k_gemm_tests tests/q6k_gemm_tests.cpp)
+  target_link_libraries(zen_q6k_gemm_tests PRIVATE zen_core)
+  add_test(NAME zen_q6k_gemm_tests COMMAND zen_q6k_gemm_tests)
+  set_tests_properties(zen_q6k_gemm_tests PROPERTIES LABELS "quant;parity;q6_k" TIMEOUT 120)
   # Independent differential check: the C++ decoders vs the Python reference
   # (iq_reference.py) over randomly generated Q8_K/TQ/IQ blocks and their GEMV.
   add_executable(zen_iq_check tests/iq_check.cpp)
