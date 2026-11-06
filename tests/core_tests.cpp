@@ -622,6 +622,13 @@ int main(){
     CHECK(ids.size()==3&&ids[0]==1&&ids[1]==5&&ids[2]==6);
     std::string decoded_text;CHECK(tok.decode(ids,decoded_text));CHECK(decoded_text=="a b");
     // GPT-2/Qwen byte-level BPE: byte symbols are merged by token rank and decoded back to bytes.
+    // Multiple SentencePiece space markers in one token retain their order,
+    // including adjacent markers and the existing single leading-space trim.
+    auto spaced=tc;spaced.tokenizer_tokens.push_back("\xE2\x96\x81" "a" "\xE2\x96\x81" "\xE2\x96\x81" "b");
+    spaced.tokenizer_scores.push_back(0);spaced.tokenizer_token_types.push_back(1);
+    tokenizer::ModelTokenizer spaced_tokenizer;CHECK(spaced_tokenizer.load(spaced,&tok_error));
+    std::string spaced_output;CHECK(spaced_tokenizer.decode({7},spaced_output));CHECK(spaced_output=="a  b");
+
     model::ModelConfig gc;gc.metadata["tokenizer.ggml.model"]="gpt2";gc.bos_token_id=1;gc.eos_token_id=2;gc.unknown_token_id=0;gc.add_space_prefix=false;
     gc.tokenizer_tokens={"<unk>","<s>","</s>","a","b","ab","\xC4\xA0","\xC4\xA0" "b","a" "\xC4\xA0" "b"};gc.tokenizer_scores={0,0,0,0,0,0,0,0,0};gc.tokenizer_token_types={3,3,3,1,1,1,1,1,1};
     tokenizer::ModelTokenizer gpt;CHECK(gpt.load(gc,&tok_error));std::vector<std::uint32_t> gpt_ids;CHECK(gpt.encode("ab",gpt_ids,false,false));CHECK(gpt_ids.size()==1&&gpt_ids[0]==5);std::string gpt_text;CHECK(gpt.decode(gpt_ids,gpt_text));CHECK(gpt_text=="ab");
@@ -672,7 +679,7 @@ int main(){
     auto check_ggml_type=[&](std::uint32_t type,std::uint64_t elements,std::uint64_t expected){
         const auto file=std::filesystem::temp_directory_path()/("zeninfer-type-"+std::to_string(type)+".gguf");
         {std::ofstream o(file,std::ios::binary);o.write("GGUF",4);w32(o,3);w64(o,1);w64(o,1);ws(o,"general.architecture");w32(o,8);ws(o,"llama");ws(o,"weight");w32(o,1);w64(o,elements);w32(o,type);w64(o,0);const auto pos=static_cast<std::uint64_t>(o.tellp());for(std::uint64_t i=pos;i<((pos+31)&~std::uint64_t(31));++i)o.put('\0');if(expected){std::vector<char> payload(static_cast<std::size_t>(expected));o.write(payload.data(),static_cast<std::streamsize>(payload.size()));}}
-        const auto result=gguf::inspect(file);if(expected){CHECK(result.ok);if(result.ok)CHECK(result.tensors[0].byte_size==expected);}else CHECK(!result.ok);
+        const auto result=gguf::inspect(file,{gguf::Q8_1Layout::fp16_36});if(expected){CHECK(result.ok);if(result.ok)CHECK(result.tensors[0].byte_size==expected);}else CHECK(!result.ok);
         std::filesystem::remove(file);
     };
     check_ggml_type(16,256,66);check_ggml_type(17,256,74);check_ggml_type(18,256,98);check_ggml_type(19,256,50);check_ggml_type(20,32,18);

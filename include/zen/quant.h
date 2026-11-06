@@ -7,7 +7,7 @@
 namespace zen::quant {
 enum class Encoding : std::uint8_t { fp32, fp16, bf16, q4_0, q4_1, q5_0, q5_1, q8_0, q3_k, q6_k, iq4_nl, signed_uniform, ternary, tq1_0, tq2_0,
                                      q2_k, q4_k, q5_k, q8_k, iq1_s, iq1_m, iq2_xxs, iq2_xs, iq2_s, iq3_xxs, iq3_s, iq4_xs, mxfp4, rocmfp4, rocmfp4_fast, ptq1_0,
-                                     fp64, fp8_e4m3, i8, i16, i32, i64, q1_0, q2_0, q8_1, nvfp4 };
+                                     fp64, fp8_e4m3, i8, i16, i32, i64, q1_0, q2_0, q8_1, q8_1_f32, nvfp4 };
 struct Format {
     std::string name;
     Encoding encoding{};

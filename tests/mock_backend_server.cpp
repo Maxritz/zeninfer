@@ -21,7 +21,7 @@ public:
             if (cancelled.load()) break;
             emit(answer.substr(i, 8));
         }
-        zen::http::GenerationResult result{answer, 8u, static_cast<std::uint32_t>((answer.size() + 3) / 4), "stop"};
+        zen::http::GenerationResult result{answer, 8u, static_cast<std::uint32_t>((answer.size() + 3) / 4), "stop", {}};
         if(request.compaction.enabled){
             result.compaction.requested=true; result.compaction.applied=true;
             result.compaction.original_prompt_tokens=request.compaction.trigger_tokens;

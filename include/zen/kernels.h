@@ -17,6 +17,7 @@ void gemv_scalar(const float* a, const float* x, float* y,
 void gemm_scalar(const float* a, const float* b, float* c,
                  std::size_t m, std::size_t n, std::size_t k);
 
+enum class NewQuantKind : std::uint8_t { q1_0, q2_0, q8_1, q8_1_f32, nvfp4, f8_e4m3 };
 #ifdef ZEN_HAS_AVX2_KERNELS
 void gemv_avx2(const float* a, const float* x, float* y,
                std::size_t m, std::size_t k);
@@ -25,6 +26,14 @@ void gemm_avx2(const float* a, const float* b, float* c,
 // Fused GGML Q8_0 matrix-vector kernel. Rows must be block-aligned (K % 32 == 0).
 bool gemv_q8_0_avx2(const std::uint8_t* weights, const float* x, float* y,
                     std::size_t rows, std::size_t columns);
+// Explicit Q1_0/Q2_0, NVFP4 and current/legacy Q8_1 CPU kernels.
+bool gemv_new_quant_avx2(const std::uint8_t*, const float*, float*, std::size_t, std::size_t, NewQuantKind);
+bool gemm_q1_0_kblk_avx2(const std::uint8_t*,const float*,float*,std::size_t,std::size_t,std::size_t,std::size_t);
+bool gemm_q2_0_kblk_avx2(const std::uint8_t*,const float*,float*,std::size_t,std::size_t,std::size_t,std::size_t);
+bool gemm_q8_1_kblk_avx2(const std::uint8_t*,const float*,float*,std::size_t,std::size_t,std::size_t,std::size_t);
+bool gemm_q8_1_f32_kblk_avx2(const std::uint8_t*,const float*,float*,std::size_t,std::size_t,std::size_t,std::size_t);
+bool gemm_nvfp4_kblk_avx2(const std::uint8_t*,const float*,float*,std::size_t,std::size_t,std::size_t,std::size_t);
+bool gemm_f8_e4m3_kblk_avx2(const std::uint8_t*,const float*,float*,std::size_t,std::size_t,std::size_t,std::size_t);
 // Fused GGML Q4_K/Q5_K decode dot product; K must be a multiple of 256.
 bool gemv_q4k_q5k_avx2(const std::uint8_t* weights, const float* x, float* y,
                         std::size_t rows, std::size_t columns, bool q5);

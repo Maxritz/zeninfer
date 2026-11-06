@@ -246,6 +246,7 @@ const std::vector<Format>& registry() {
             {"Q1_0",Encoding::q1_0,1,128,18,true,"GGML Q1_0: fp16 scale plus 128 packed signs"},
             {"Q2_0",Encoding::q2_0,2,64,18,true,"GGML Q2_0: fp16 scale plus 64 packed 2-bit codes"},
             {"Q8_1",Encoding::q8_1,8,32,36,true,"Current GGML Q8_1: fp16 scale and sum plus 32 signed quants"},
+            {"Q8_1_F32",Encoding::q8_1_f32,8,32,40,true,"Legacy GGML Q8_1: fp32 scale and sum plus 32 signed quants"},
             {"NVFP4",Encoding::nvfp4,4,64,36,true,"GGML NVFP4: four UE4M3 scales and E2M1 nibbles"},
             {"Q4_0",Encoding::q4_0,4,32,18,true,"GGML Q4_0 block: fp16 scale plus 16 packed bytes"},
             {"Q4_1",Encoding::q4_1,4,32,20,true,"GGML Q4_1 block: fp16 scale, fp16 minimum and 16 packed bytes"},
@@ -261,7 +262,8 @@ const std::vector<Format>& registry() {
         };
         for(unsigned b=1;b<=18;++b) {
             const unsigned bytes=(32*b+7)/8;
-            v.push_back({"Q"+std::to_string(b)+"_SIGNED",Encoding::signed_uniform,
+            std::string name="Q";name+=std::to_string(b);name+="_SIGNED";
+            v.push_back({std::move(name),Encoding::signed_uniform,
                          static_cast<std::uint8_t>(b),32,static_cast<std::uint16_t>(bytes),true,
                          "Generic signed bit-packed block; one caller-supplied scale"});
         }
@@ -347,6 +349,11 @@ bool dequantize(const Format& f,const std::uint8_t* src,std::size_t n,float* dst
         if(n%32)return false;
         for(std::size_t b=0;b<n/32;++b){const auto* p=src+b*36;const float d=half_to_float(read16(p));
             for(unsigned j=0;j<32;++j){const auto v=p[4+j];dst[b*32+j]=float(v<128?int(v):int(v)-256)*d;}}
+        return true;
+    case Encoding::q8_1_f32:
+        if(n%32)return false;
+        for(std::size_t b=0;b<n/32;++b){const auto* p=src+b*40;const auto bits=read32_le(p);float d;std::memcpy(&d,&bits,4);
+            for(unsigned j=0;j<32;++j){const auto v=p[8+j];dst[b*32+j]=float(v<128?int(v):int(v)-256)*d;}}
         return true;
     case Encoding::nvfp4: {
         if(n%64)return false;
@@ -880,6 +887,7 @@ std::size_t row_bytes(const Format& f,std::size_t columns) noexcept {
     case Encoding::q1_0:return blocks(128,18);
     case Encoding::q2_0:return blocks(64,18);
     case Encoding::q8_1:return blocks(32,36);
+    case Encoding::q8_1_f32:return blocks(32,40);
     case Encoding::nvfp4:return blocks(64,36);
     case Encoding::q4_0:return blocks(32,18);
     case Encoding::q4_1:return blocks(32,20);
@@ -983,6 +991,19 @@ bool gemv(const Format& f,const std::uint8_t*w,const float*x,float*y,
             if(!fn(w+first*rb,x,y+first,last-first,cols))success.store(false,std::memory_order_relaxed);
         });
         return success.load();
+    }
+    static const bool new_quant_fast=[](){const char* e=std::getenv("ZEN_CPU_FAST_NEWQUANT");return !(e&&e[0]=='0');}();
+    if(new_quant_fast && (f.encoding==Encoding::q1_0||f.encoding==Encoding::q2_0||f.encoding==Encoding::q8_1||f.encoding==Encoding::q8_1_f32||f.encoding==Encoding::nvfp4||f.encoding==Encoding::fp8_e4m3) && zen::cpu_has_avx2_fma()){
+        const auto kind=f.encoding==Encoding::q1_0?zen::NewQuantKind::q1_0:f.encoding==Encoding::q2_0?zen::NewQuantKind::q2_0:f.encoding==Encoding::q8_1?zen::NewQuantKind::q8_1:f.encoding==Encoding::q8_1_f32?zen::NewQuantKind::q8_1_f32:f.encoding==Encoding::nvfp4?zen::NewQuantKind::nvfp4:zen::NewQuantKind::f8_e4m3;
+        const unsigned workers=requested_workers?requested_workers:zen::ResourceGovernor{}.current_policy().worker_threads;
+        const unsigned count=rows>=64&&workers>1?std::min<unsigned>(workers,static_cast<unsigned>(rows)):1;
+        g_gemv_routes.cpu_avx2.fetch_add(1,std::memory_order_relaxed);
+        if(count==1)return zen::gemv_new_quant_avx2(w,x,y,rows,cols,kind);
+        std::atomic<bool> ok{true};
+        zen::ComputePool::instance().parallel_for(rows,count,[&](std::size_t first,std::size_t last){
+            if(!zen::gemv_new_quant_avx2(w+first*rb,x,y+first,last-first,cols,kind))ok.store(false,std::memory_order_relaxed);
+        });
+        return ok.load();
     }
     if(f.encoding==Encoding::q8_0 && scale==1.0f && zen::cpu_has_avx2_fma()) {
         g_gemv_routes.cpu_avx2.fetch_add(1,std::memory_order_relaxed);
@@ -1292,6 +1313,7 @@ bool gemv_batch(const Format& format,const std::uint8_t* const* weights,const fl
 // with ZEN_D3D12_DP4A=1 the batch attempt is skipped and the caller falls
 // back to the single path (which does honour DP4A). V2/V3 tiling is shared
 // between the single and batch paths, so those gates remain bit-identical.
+#if defined(ZEN_HAS_D3D12)
 static bool d3d12_batch_enabled() {
     static const bool v=[](){
         const char* e=std::getenv("ZEN_D3D12_BATCH");
@@ -1303,6 +1325,7 @@ static bool dp4a_enabled_for_batch() {
     const char* e=std::getenv("ZEN_D3D12_DP4A");
     return (e&&e[0]=='1');
 }
+#endif
 bool gemm_batch(const Format& format,const std::uint8_t* const* weights,const float* input,
                 float* const* outputs,const std::size_t* rows,std::size_t tokens,
                 std::size_t columns,std::size_t count,float scale,unsigned workers){
@@ -1444,6 +1467,19 @@ bool gemm(const Format& f,const std::uint8_t*w,const float*input,float*output,
         if(q8_use_kblk(tokens,cols)) g_gemm_routes.cpu_kblk.fetch_add(1,std::memory_order_relaxed);
         else g_gemm_routes.cpu_avx2.fetch_add(1,std::memory_order_relaxed);
         if(gemm_q8_0_parallel(w,input,output,tokens,rows,cols,rb,requested_workers))return true;
+    }
+    static const bool new_quant_fast=[](){const char* e=std::getenv("ZEN_CPU_FAST_NEWQUANT");return !(e&&e[0]=='0');}();
+    if(tokens>=2&&new_quant_fast&&zen::cpu_has_avx2_fma()){
+        auto fn=f.encoding==Encoding::q1_0?zen::gemm_q1_0_kblk_avx2:
+                f.encoding==Encoding::q2_0?zen::gemm_q2_0_kblk_avx2:
+                f.encoding==Encoding::q8_1?zen::gemm_q8_1_kblk_avx2:
+                f.encoding==Encoding::q8_1_f32?zen::gemm_q8_1_f32_kblk_avx2:
+                f.encoding==Encoding::nvfp4?zen::gemm_nvfp4_kblk_avx2:
+                f.encoding==Encoding::fp8_e4m3&&cols%8==0?zen::gemm_f8_e4m3_kblk_avx2:nullptr;
+        if(fn){
+            g_gemm_routes.cpu_avx2.fetch_add(1,std::memory_order_relaxed);
+            if(gemm_fast_parallel(fn,w,input,output,tokens,rows,cols,rb,requested_workers))return true;
+        }
     }
     // Non-Q8 fast paths fall back to generic GEMM if the gate, shape, or
     // kernel fails. Q6_K is ungated; the IQ formats use the generic path.

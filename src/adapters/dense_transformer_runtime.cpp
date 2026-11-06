@@ -241,22 +241,20 @@ void rope_table(std::uint32_t rotary_dim,std::uint32_t pos,float base,const std:
 // then attended over a cache that had been silently emptied, which is why two
 // identically seeded generations diverged. A request larger than this falls back
 // to the CPU path instead of resizing.
+#if defined(ZEN_HAS_D3D12)
 constexpr std::size_t kDeviceKvTokens = 8192;
 
 // True when decode can run its attention block on the device for this model. Set once
 // by the runtime after the KV cache is configured; requires a D3D12 device, no ALiBi
 // (the kernel has no bias term) and a cache that matches the model's shape.
 bool device_attention_available(std::uint32_t layers,std::size_t needed,std::uint32_t kv_heads,std::uint32_t head_dim,float epsilon){
-#if defined(ZEN_HAS_D3D12)
     (void)epsilon;
     if(!needed)return false;
     if(needed>kDeviceKvTokens)return false;
     if(!zen::d3d12::enabled())return false;
     return zen::d3d12::kv_cache_configure(layers,kDeviceKvTokens,kv_heads,head_dim);
-#else
-    (void)layers;(void)needed;(void)kv_heads;(void)head_dim;(void)epsilon;return false;
-#endif
 }
+#endif
 
 void rope(float* x,std::uint32_t heads,std::uint32_t head_dim,std::uint32_t rotary_dim,
           std::uint32_t pos,float base,const std::string& scaling_type,float scaling_factor,std::uint32_t original_context,float low_freq_factor,float high_freq_factor,float yarn_beta_fast,float yarn_beta_slow,
@@ -377,14 +375,14 @@ std::uint32_t sample_logits(const std::vector<float>& logits,const GenerationOpt
     const auto probabilities=sampling_distribution(logits,o);
     return sample_distribution(probabilities,rng);
 }
-const quant::Format* format_for_ggml(std::uint32_t id){
+const quant::Format* format_for_ggml(std::uint32_t id,gguf::Q8_1Layout q8_1_layout){
     // Complete map of the runtime-decodable GGML storage types. A type missing
     // here silently degrades a raw-mapped weight to a full-file FP32 read (or
     // a load failure), even when quant.cpp has a working decoder.
     const char* name=nullptr;switch(id){
         case 0:name="F32";break; case 1:name="F16";break; case 30:name="BF16";break;
         case 2:name="Q4_0";break; case 3:name="Q4_1";break; case 6:name="Q5_0";break;
-        case 7:name="Q5_1";break; case 8:name="Q8_0";break; case 9:name="Q8_1";break;
+        case 7:name="Q5_1";break; case 8:name="Q8_0";break; case 9:name=q8_1_layout==gguf::Q8_1Layout::fp32_40?"Q8_1_F32":"Q8_1";break;
         case 10:name="Q2_K";break; case 11:name="Q3_K";break; case 12:name="Q4_K";break;
         case 13:name="Q5_K";break; case 14:name="Q6_K";break; case 15:name="Q8_K";break;
         case 16:name="IQ2_XXS";break; case 17:name="IQ2_XS";break; case 18:name="IQ3_XXS";break;
@@ -811,7 +809,7 @@ bool DenseTransformerRuntime::load(const std::filesystem::path& path,std::string
         // folded token table, which is only valid because the inverse is undone first.
         if(hadamard_.tied_output&&!report.config.hadamard_tied_output)return fail("Invalid prism.hadamard.tied_output");
     }
-    for(const auto& d:report.tensors){Tensor t;t.dims=d.dimensions;t.elements=1;for(auto dim:d.dimensions)t.elements*=static_cast<std::size_t>(dim);t.raw_bytes=static_cast<std::size_t>(d.byte_size);t.format=format_for_ggml(d.ggml_type);
+    for(const auto& d:report.tensors){Tensor t;t.dims=d.dimensions;t.elements=1;for(auto dim:d.dimensions)t.elements*=static_cast<std::size_t>(dim);t.raw_bytes=static_cast<std::size_t>(d.byte_size);t.format=format_for_ggml(d.ggml_type,report.q8_1_layout);
         const bool matrix=d.name.find(".bias")==std::string::npos&&(d.role==model::TensorRole::token_embedding||d.role==model::TensorRole::output||d.role==model::TensorRole::query||d.role==model::TensorRole::key||d.role==model::TensorRole::value||d.role==model::TensorRole::attention_output||d.role==model::TensorRole::ffn_gate||d.role==model::TensorRole::ffn_up||d.role==model::TensorRole::ffn_down);
         // Per-tensor map trace. Flushed per line: the point of this trace is that it
         // survives a crash, and an abort on the next tensor discards a buffered
@@ -1337,9 +1335,11 @@ bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& to
     //   ZEN_D3D12_ROPE_PREFILL_MIN_T=N  minimum T for GPU (default 4; the
     //                              crossover bench sets the shippable value).
     // ALiBi models skip RoPE entirely (no tables, neither path runs).
+#if defined(ZEN_HAS_D3D12)
     static const bool rope_prefill_gpu_on = []{const char* e=std::getenv("ZEN_D3D12_ROPE_PREFILL");return e&&e[0]=='1';}();
-    static const bool rope_cpu_disallowed = []{const char* e=std::getenv("ZEN_CPU_ROPE");return e&&e[0]=='0';}();
     static const std::size_t rope_prefill_min_t = []{const char* e=std::getenv("ZEN_D3D12_ROPE_PREFILL_MIN_T");if(e){int v=std::atoi(e);if(v>=1)return static_cast<std::size_t>(v);}return std::size_t(4);}();
+#endif
+    static const bool rope_cpu_disallowed = []{const char* e=std::getenv("ZEN_CPU_ROPE");return e&&e[0]=='0';}();
     // Prefill elementwise on the GPU (RMSNorm, SiLU, residuals, device-resident
     // FFN). Default OFF: the CPU path below is unchanged when unset.
     //   ZEN_D3D12_PREFILL_GPU=1   opt in: attn/output RMSNorm via
@@ -1354,8 +1354,10 @@ bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& to
     // working buffers only amortise over multi-token prefills.
     // Any GPU failure (backend absent, non-Q8 weights, BitNet subln, shape
     // guards) falls back to the host path below per layer, never fails.
+#if defined(ZEN_HAS_D3D12)
     static const bool prefill_gpu_on = []{const char* e=std::getenv("ZEN_D3D12_PREFILL_GPU");return e&&e[0]=='1';}();
     const bool use_prefill_gpu = prefill_gpu_on&&T>=16;
+#endif
     std::vector<float> prefill_cos,prefill_sin;
     std::size_t prefill_pairs=0;
     bool prefill_tables_built=false;
@@ -1494,9 +1496,9 @@ bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& to
 #endif
         }
         // FlashAttention for prefill: try GPU first, fallback to CPU
-        const float inv_scale = 1.0f / std::sqrt(float(D));
         bool flash_ok = false;
         #if defined(ZEN_HAS_D3D12)
+        const float inv_scale = 1.0f / std::sqrt(float(D));
         // ZEN_D3D12_FLASH=0 forces the CPU attention path. The GPU kernel is
         // numerically verified against the CPU reference by zen_d3d12_flash_parity,
         // so this exists to A/B a suspected interaction, not as a normal switch.
@@ -1769,11 +1771,13 @@ bool DenseTransformerRuntime::forward(std::uint32_t token,std::uint32_t pos,
     // every site the same table. Bit-identical: it is the same deterministic
     // function with the same arguments the per-layer calls used, and every
     // consumer takes it read-only (const float*).
+#if defined(ZEN_HAS_D3D12)
     std::vector<float> rope_cos,rope_sin;
     auto device_rope_table=[&](){
         if(rope_cos.empty())
             rope_table(config_.rope_dim,pos,config_.rope_base,config_.rope_scaling_type,config_.rope_scaling_factor,config_.rope_original_context,config_.rope_low_freq_factor,config_.rope_high_freq_factor,config_.rope_yarn_beta_fast,config_.rope_yarn_beta_slow,rope_cos,rope_sin);
     };
+#endif
     bool pipeline_completed=false;
     bool lm_head_fused=false;
     double setup_us = 0.0, pipeline_us = 0.0;

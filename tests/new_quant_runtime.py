@@ -46,29 +46,41 @@ def main():
         name, dims, _, _ = writer.tensors[ix]
         cols, rows = dims
         assert cols == 128 and rows == 256
-        env = dict(os.environ, ZEN_MAP_TRACE='1')
+        env = dict(os.environ, ZEN_MAP_TRACE='1', ZEN_GGUF_Q8_1_LAYOUT='fp16')
         for fmt, block, blockbytes, index in [('Q1_0',128,18,6),('Q2_0',64,18,6),
-                                               ('Q8_1',32,36,6),('NVFP4',64,36,32),
+                                               ('Q8_1',32,36,6),('Q8_1_F32',32,36,6),('NVFP4',64,36,32),
                                                ('F8_E4M3',1,1,0x20), ('I8',1,1,1), ('I16',1,2,1),
                                                ('I32',1,4,1), ('I64',1,8,1), ('F64',1,8,0)]:
-            typ, raw, ref = golden[fmt]
+            typ, raw, ref = golden['Q8_1' if fmt == 'Q8_1_F32' else fmt]
             chunk = bytearray(raw[index*blockbytes:(index+1)*blockbytes])
             decoded = ref[index*block:(index+1)*block].copy()
             if fmt in ('Q1_0','Q2_0','Q8_1'):
                 # Reduce half scale by 2^8 to keep the fixture well-conditioned.
                 d = struct.unpack_from('<H', chunk)[0]; struct.pack_into('<H', chunk, 0, d-0x2000)
                 decoded /= 256
+            if fmt == 'Q8_1_F32':
+                # Legacy layout: independent fp32 scale/sum plus signed bytes.
+                d = 1.0 / 1024.0
+                decoded = np.frombuffer(chunk[4:], dtype=np.int8).astype(np.float32) * d
+                chunk = bytearray(struct.pack('<ff', d, 0.0) + chunk[4:])
             row_payload = chunk * (cols//block)
             row_float = np.tile(decoded, cols//block).astype('<f4').tobytes()
             qfile, ffile = root/(fmt+'.gguf'), root/(fmt+'-f32.gguf')
             writer.tensors[ix] = (name, dims, typ, row_payload * rows); orig_write(writer, qfile)
             writer.tensors[ix] = (name, dims, 0, row_float * rows); orig_write(writer, ffile)
+            case_env = dict(env, ZEN_GGUF_Q8_1_LAYOUT='fp32' if fmt == 'Q8_1_F32' else 'fp16')
+            if fmt in ('Q8_1', 'Q8_1_F32'):
+                unspecified_env = dict(env); unspecified_env.pop('ZEN_GGUF_Q8_1_LAYOUT')
+                failed = subprocess.run([str(probe), str(qfile), '--prompt-ids', '7', str(root/'logits.bin')],
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=unspecified_env, text=True)
+                if failed.returncode == 0 or 'ambiguous' not in failed.stderr:
+                    raise AssertionError(f'{fmt}: unspecified Q8_1 layout was not rejected: {failed.stderr}')
             for prompt in ('7','7,42,99'):
                 outputs = []
                 for path in (qfile, ffile):
                     outfile = root/'logits.bin'
                     proc = subprocess.run([str(probe), str(path), '--prompt-ids', prompt, str(outfile)],
-                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True)
+                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=case_env, text=True)
                     if proc.returncode:
                         raise RuntimeError(f'{fmt} {prompt}: {proc.stderr}')
                     if path == qfile:
