@@ -1,0 +1,915 @@
+Synthetic quant kernel traces; Linux Xeon VM; 256x1024, T=8, 1 worker.
+Each format in a separate process; timing warmup + 5 samples precedes one traced operation per phase.
+These isolated traces are not whole-model profiles.
+
+=== F32 ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+F32,93.970,257.365
+F32 GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%         96.02        96.02        96.02        96.02           96.02
+instrumented scope sum: 96.02 us
+F32 GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%        301.73       301.73       301.73       301.73          301.73
+instrumented scope sum: 301.73 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+
+=== F16 ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+F16,202.226,232.461
+F16 GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%        142.39       142.39       142.39       142.39          142.39
+instrumented scope sum: 142.39 us
+F16 GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%        293.78       293.78       293.78       293.78          293.78
+instrumented scope sum: 293.78 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=7 cpu_plain=0 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=7 cpu_plain=0 cpu_kblk=0
+
+=== BF16 ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+BF16,79.765,125.822
+BF16 GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%         83.05        83.05        83.05        83.05           83.05
+instrumented scope sum: 83.05 us
+BF16 GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%        146.01       146.01       146.01       146.01          146.01
+instrumented scope sum: 146.01 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=7 cpu_plain=0 cpu_kblk=0
+
+=== Q4_0 ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+Q4_0,99.585,262.540
+Q4_0 GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%        141.04       141.04       141.04       141.04          141.04
+instrumented scope sum: 141.04 us
+Q4_0 GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%        259.00       259.00       259.00       259.00          259.00
+instrumented scope sum: 259.00 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+
+=== Q4_1 ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+Q4_1,110.764,273.137
+Q4_1 GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%        111.19       111.19       111.19       111.19          111.19
+instrumented scope sum: 111.19 us
+Q4_1 GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%        293.07       293.07       293.07       293.07          293.07
+instrumented scope sum: 293.07 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+
+=== Q5_0 ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+Q5_0,341.742,509.990
+Q5_0 GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%        344.10       344.10       344.10       344.10          344.10
+instrumented scope sum: 344.10 us
+Q5_0 GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%        496.56       496.56       496.56       496.56          496.56
+instrumented scope sum: 496.56 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+
+=== Q5_1 ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+Q5_1,366.336,536.830
+Q5_1 GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%        365.92       365.92       365.92       365.92          365.92
+instrumented scope sum: 365.92 us
+Q5_1 GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%        571.88       571.88       571.88       571.88          571.88
+instrumented scope sum: 571.88 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+
+=== Q8_0 ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+Q8_0,62.345,180.857
+Q8_0 GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%         62.71        62.71        62.71        62.71           62.71
+instrumented scope sum: 62.71 us
+Q8_0 GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%        141.50       141.50       141.50       141.50          141.50
+instrumented scope sum: 141.50 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=7 cpu_plain=0 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=7 cpu_plain=0 cpu_kblk=0
+
+=== Q3_K ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+Q3_K,108.428,177.098
+Q3_K GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%        101.42       101.42       101.42       101.42          101.42
+instrumented scope sum: 101.42 us
+Q3_K GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%        194.95       194.95       194.95       194.95          194.95
+instrumented scope sum: 194.95 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=7 cpu_plain=0 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=7 cpu_plain=0 cpu_kblk=0
+
+=== Q6_K ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+Q6_K,90.440,241.564
+Q6_K GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%         94.11        94.11        94.11        94.11           94.11
+instrumented scope sum: 94.11 us
+Q6_K GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%        273.90       273.90       273.90       273.90          273.90
+instrumented scope sum: 273.90 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=7 cpu_plain=0 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=7 cpu_plain=0 cpu_kblk=0
+
+=== IQ4_NL ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+IQ4_NL,246.408,395.309
+IQ4_NL GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%        287.97       287.97       287.97       287.97          287.97
+instrumented scope sum: 287.97 us
+IQ4_NL GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%        398.06       398.06       398.06       398.06          398.06
+instrumented scope sum: 398.06 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+
+=== TERNARY2 ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+TERNARY2,1909.792,2105.125
+TERNARY2 GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%       1892.82      1892.82      1892.82      1892.82         1892.82
+instrumented scope sum: 1892.82 us
+TERNARY2 GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%       2101.25      2101.25      2101.25      2101.25         2101.25
+instrumented scope sum: 2101.25 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+
+=== TQ1_0 ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+TQ1_0,320.492,527.326
+TQ1_0 GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%        346.85       346.85       346.85       346.85          346.85
+instrumented scope sum: 346.85 us
+TQ1_0 GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%        527.76       527.76       527.76       527.76          527.76
+instrumented scope sum: 527.76 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+
+=== TQ2_0 ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+TQ2_0,61.374,228.524
+TQ2_0 GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%         64.67        64.67        64.67        64.67           64.67
+instrumented scope sum: 64.67 us
+TQ2_0 GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%        223.93       223.93       223.93       223.93          223.93
+instrumented scope sum: 223.93 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=7 cpu_plain=0 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=7 cpu_plain=0 cpu_kblk=0
+
+=== Q1_SIGNED ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+Q1_SIGNED,1569.315,1768.717
+Q1_SIGNED GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%       1795.63      1795.63      1795.63      1795.63         1795.63
+instrumented scope sum: 1795.63 us
+Q1_SIGNED GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%       1749.61      1749.61      1749.61      1749.61         1749.61
+instrumented scope sum: 1749.61 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+
+=== Q2_SIGNED ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+Q2_SIGNED,1523.741,1725.970
+Q2_SIGNED GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%       1569.74      1569.74      1569.74      1569.74         1569.74
+instrumented scope sum: 1569.74 us
+Q2_SIGNED GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%       1746.19      1746.19      1746.19      1746.19         1746.19
+instrumented scope sum: 1746.19 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+
+=== Q3_SIGNED ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+Q3_SIGNED,1588.395,1734.594
+Q3_SIGNED GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%       1617.81      1617.81      1617.81      1617.81         1617.81
+instrumented scope sum: 1617.81 us
+Q3_SIGNED GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%       1770.13      1770.13      1770.13      1770.13         1770.13
+instrumented scope sum: 1770.13 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+
+=== Q4_SIGNED ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+Q4_SIGNED,1527.275,1807.500
+Q4_SIGNED GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%       1568.46      1568.46      1568.46      1568.46         1568.46
+instrumented scope sum: 1568.46 us
+Q4_SIGNED GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%       1718.12      1718.12      1718.12      1718.12         1718.12
+instrumented scope sum: 1718.12 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+
+=== Q5_SIGNED ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+Q5_SIGNED,1579.467,1686.216
+Q5_SIGNED GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%       1555.96      1555.96      1555.96      1555.96         1555.96
+instrumented scope sum: 1555.96 us
+Q5_SIGNED GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%       1720.61      1720.61      1720.61      1720.61         1720.61
+instrumented scope sum: 1720.61 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+
+=== Q6_SIGNED ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+Q6_SIGNED,1568.112,1716.471
+Q6_SIGNED GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%       1627.16      1627.16      1627.16      1627.16         1627.16
+instrumented scope sum: 1627.16 us
+Q6_SIGNED GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%       1757.13      1757.13      1757.13      1757.13         1757.13
+instrumented scope sum: 1757.13 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+
+=== Q7_SIGNED ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+Q7_SIGNED,1609.881,1743.156
+Q7_SIGNED GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%       1582.28      1582.28      1582.28      1582.28         1582.28
+instrumented scope sum: 1582.28 us
+Q7_SIGNED GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%       1703.41      1703.41      1703.41      1703.41         1703.41
+instrumented scope sum: 1703.41 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+
+=== Q8_SIGNED ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+Q8_SIGNED,1557.733,1702.356
+Q8_SIGNED GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%       1501.72      1501.72      1501.72      1501.72         1501.72
+instrumented scope sum: 1501.72 us
+Q8_SIGNED GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%       1752.67      1752.67      1752.67      1752.67         1752.67
+instrumented scope sum: 1752.67 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+
+=== Q9_SIGNED ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+Q9_SIGNED,1530.615,1701.289
+Q9_SIGNED GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%       1585.87      1585.87      1585.87      1585.87         1585.87
+instrumented scope sum: 1585.87 us
+Q9_SIGNED GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%       1687.67      1687.67      1687.67      1687.67         1687.67
+instrumented scope sum: 1687.67 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+
+=== Q10_SIGNED ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+Q10_SIGNED,1562.965,1731.112
+Q10_SIGNED GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%       1521.19      1521.19      1521.19      1521.19         1521.19
+instrumented scope sum: 1521.19 us
+Q10_SIGNED GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%       1721.31      1721.31      1721.31      1721.31         1721.31
+instrumented scope sum: 1721.31 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+
+=== Q11_SIGNED ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+Q11_SIGNED,1645.811,1789.123
+Q11_SIGNED GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%       1656.77      1656.77      1656.77      1656.77         1656.77
+instrumented scope sum: 1656.77 us
+Q11_SIGNED GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%       1759.78      1759.78      1759.78      1759.78         1759.78
+instrumented scope sum: 1759.78 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+
+=== Q12_SIGNED ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+Q12_SIGNED,1566.053,1743.382
+Q12_SIGNED GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%       1593.88      1593.88      1593.88      1593.88         1593.88
+instrumented scope sum: 1593.88 us
+Q12_SIGNED GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%       1688.82      1688.82      1688.82      1688.82         1688.82
+instrumented scope sum: 1688.82 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+
+=== Q13_SIGNED ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+Q13_SIGNED,1701.986,1781.918
+Q13_SIGNED GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%       1634.30      1634.30      1634.30      1634.30         1634.30
+instrumented scope sum: 1634.30 us
+Q13_SIGNED GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%       1782.89      1782.89      1782.89      1782.89         1782.89
+instrumented scope sum: 1782.89 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+
+=== Q14_SIGNED ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+Q14_SIGNED,1627.718,1809.323
+Q14_SIGNED GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%       1669.30      1669.30      1669.30      1669.30         1669.30
+instrumented scope sum: 1669.30 us
+Q14_SIGNED GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%       1858.46      1858.46      1858.46      1858.46         1858.46
+instrumented scope sum: 1858.46 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+
+=== Q15_SIGNED ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+Q15_SIGNED,1854.812,2012.453
+Q15_SIGNED GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%       1750.27      1750.27      1750.27      1750.27         1750.27
+instrumented scope sum: 1750.27 us
+Q15_SIGNED GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%       1987.84      1987.84      1987.84      1987.84         1987.84
+instrumented scope sum: 1987.84 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+
+=== Q16_SIGNED ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+Q16_SIGNED,1512.564,1738.606
+Q16_SIGNED GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%       1651.60      1651.60      1651.60      1651.60         1651.60
+instrumented scope sum: 1651.60 us
+Q16_SIGNED GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%       1735.92      1735.92      1735.92      1735.92         1735.92
+instrumented scope sum: 1735.92 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+
+=== Q17_SIGNED ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+Q17_SIGNED,2251.844,2389.479
+Q17_SIGNED GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%       2538.62      2538.62      2538.62      2538.62         2538.62
+instrumented scope sum: 2538.62 us
+Q17_SIGNED GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%       2932.28      2932.28      2932.28      2932.28         2932.28
+instrumented scope sum: 2932.28 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+
+=== Q18_SIGNED ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+Q18_SIGNED,2055.233,2411.568
+Q18_SIGNED GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%       2147.69      2147.69      2147.69      2147.69         2147.69
+instrumented scope sum: 2147.69 us
+Q18_SIGNED GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%       2501.50      2501.50      2501.50      2501.50         2501.50
+instrumented scope sum: 2501.50 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+
+=== Q2_K ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+Q2_K,492.832,697.653
+Q2_K GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%        296.79       296.79       296.79       296.79          296.79
+instrumented scope sum: 296.79 us
+Q2_K GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%        789.90       789.90       789.90       789.90          789.90
+instrumented scope sum: 789.90 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+
+=== Q4_K ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+Q4_K,140.634,259.211
+Q4_K GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%        192.89       192.89       192.89       192.89          192.89
+instrumented scope sum: 192.89 us
+Q4_K GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%        249.20       249.20       249.20       249.20          249.20
+instrumented scope sum: 249.20 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=7 cpu_plain=0 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=7 cpu_plain=0 cpu_kblk=0
+
+=== Q5_K ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+Q5_K,161.434,373.260
+Q5_K GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%        149.40       149.40       149.40       149.40          149.40
+instrumented scope sum: 149.40 us
+Q5_K GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%        390.95       390.95       390.95       390.95          390.95
+instrumented scope sum: 390.95 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=7 cpu_plain=0 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=7 cpu_plain=0 cpu_kblk=0
+
+=== Q8_K ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+Q8_K,90.847,247.277
+Q8_K GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%         88.40        88.40        88.40        88.40           88.40
+instrumented scope sum: 88.40 us
+Q8_K GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%        244.99       244.99       244.99       244.99          244.99
+instrumented scope sum: 244.99 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+
+=== IQ1_S ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+IQ1_S,317.496,585.689
+IQ1_S GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%        343.75       343.75       343.75       343.75          343.75
+instrumented scope sum: 343.75 us
+IQ1_S GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%        646.24       646.24       646.24       646.24          646.24
+instrumented scope sum: 646.24 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+
+=== IQ1_M ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+IQ1_M,444.812,722.358
+IQ1_M GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%        467.04       467.04       467.04       467.04          467.04
+instrumented scope sum: 467.04 us
+IQ1_M GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%        804.92       804.92       804.92       804.92          804.92
+instrumented scope sum: 804.92 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+
+=== IQ2_XXS ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+IQ2_XXS,1273.358,1603.591
+IQ2_XXS GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%       1346.62      1346.62      1346.62      1346.62         1346.62
+instrumented scope sum: 1346.62 us
+IQ2_XXS GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%       1676.30      1676.30      1676.30      1676.30         1676.30
+instrumented scope sum: 1676.30 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+
+=== IQ2_XS ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+IQ2_XS,1448.491,1529.708
+IQ2_XS GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%       1188.38      1188.38      1188.38      1188.38         1188.38
+instrumented scope sum: 1188.38 us
+IQ2_XS GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%       1270.75      1270.75      1270.75      1270.75         1270.75
+instrumented scope sum: 1270.75 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+
+=== IQ2_S ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+IQ2_S,1052.144,1245.209
+IQ2_S GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%       1044.57      1044.57      1044.57      1044.57         1044.57
+instrumented scope sum: 1044.57 us
+IQ2_S GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%       1247.45      1247.45      1247.45      1247.45         1247.45
+instrumented scope sum: 1247.45 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+
+=== IQ3_XXS ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+IQ3_XXS,1078.039,1250.040
+IQ3_XXS GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%       1095.46      1095.46      1095.46      1095.46         1095.46
+instrumented scope sum: 1095.46 us
+IQ3_XXS GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%       1253.59      1253.59      1253.59      1253.59         1253.59
+instrumented scope sum: 1253.59 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+
+=== IQ3_S ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+IQ3_S,1083.495,1489.953
+IQ3_S GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%       1275.09      1275.09      1275.09      1275.09         1275.09
+instrumented scope sum: 1275.09 us
+IQ3_S GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%       1267.53      1267.53      1267.53      1267.53         1267.53
+instrumented scope sum: 1267.53 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+
+=== IQ4_XS ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+IQ4_XS,227.456,390.354
+IQ4_XS GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%        246.15       246.15       246.15       246.15          246.15
+instrumented scope sum: 246.15 us
+IQ4_XS GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%        393.50       393.50       393.50       393.50          393.50
+instrumented scope sum: 393.50 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+
+=== MXFP4 ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+MXFP4,218.893,374.921
+MXFP4 GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%        236.12       236.12       236.12       236.12          236.12
+instrumented scope sum: 236.12 us
+MXFP4 GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%        374.15       374.15       374.15       374.15          374.15
+instrumented scope sum: 374.15 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+
+=== Q4_0_ROCMFP4 ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+Q4_0_ROCMFP4,228.247,420.189
+Q4_0_ROCMFP4 GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%        272.69       272.69       272.69       272.69          272.69
+instrumented scope sum: 272.69 us
+Q4_0_ROCMFP4 GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%        412.36       412.36       412.36       412.36          412.36
+instrumented scope sum: 412.36 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+
+=== Q4_0_ROCMFP4_FAST ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+Q4_0_ROCMFP4_FAST,222.472,445.828
+Q4_0_ROCMFP4_FAST GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%        275.14       275.14       275.14       275.14          275.14
+instrumented scope sum: 275.14 us
+Q4_0_ROCMFP4_FAST GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%        385.15       385.15       385.15       385.15          385.15
+instrumented scope sum: 385.15 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+
+=== PTQ1_0 ===
+rows=256 cols=1024 tokens=8 workers=1
+format,gemv_us,gemm_us
+PTQ1_0,353.172,685.503
+PTQ1_0 GEMV Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemv            compute           1   100.0%        562.90       562.90       562.90       562.90          562.90
+instrumented scope sum: 562.90 us
+PTQ1_0 GEMM Sherlock trace
+
+Sherlock CPU trace (instrumented scope time; not device time)
+component             phase           ops   %total      total us       avg us       min us       max us    inclusive us
+quant.gemm            compute           1   100.0%        684.37       684.37       684.37       684.37          684.37
+instrumented scope sum: 684.37 us
+[qgemm] gemv gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0
+[qgemm] gemm gpu_try=0 gpu_ok=0 cpu_avx2=0 cpu_plain=7 cpu_kblk=0

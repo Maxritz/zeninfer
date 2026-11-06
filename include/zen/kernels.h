@@ -28,6 +28,15 @@ bool gemv_q8_0_avx2(const std::uint8_t* weights, const float* x, float* y,
 // Fused GGML Q4_K/Q5_K decode dot product; K must be a multiple of 256.
 bool gemv_q4k_q5k_avx2(const std::uint8_t* weights, const float* x, float* y,
                         std::size_t rows, std::size_t columns, bool q5);
+// Fused Q6_K and IEEE binary16 decode GEMV.
+bool gemv_q3k_avx2(const std::uint8_t* weights, const float* x, float* y,
+                   std::size_t rows, std::size_t columns);
+bool gemv_q6k_avx2(const std::uint8_t* weights, const float* x, float* y,
+                   std::size_t rows, std::size_t columns);
+bool gemv_tq2_avx2(const std::uint8_t* weights, const float* x, float* y,
+                   std::size_t rows, std::size_t columns);
+bool gemv_f16_avx2(const std::uint8_t* weights, const float* x, float* y,
+                   std::size_t rows, std::size_t columns);
 // ZI-P5 batched Q8_0 kernel: dequantise one row, then feed each weight vector to
 // up to 8 token accumulators. output points at the first row of this range and
 // is advanced by output_row_stride per token, matching the row-major
@@ -100,6 +109,15 @@ void axpy_f32_avx2(float a, const float* x, float* y, std::size_t n) noexcept;
 bool gemm_f16_kblk_avx2(const std::uint8_t* weights, const float* input, float* output,
                         std::size_t tokens, std::size_t rows, std::size_t columns,
                         std::size_t output_row_stride);
+bool gemm_q3k_kblk_avx2(const std::uint8_t* weights, const float* input, float* output,
+                        std::size_t tokens, std::size_t rows, std::size_t columns,
+                        std::size_t output_row_stride);
+bool gemm_tq2_kblk_avx2(const std::uint8_t* weights, const float* input, float* output,
+                        std::size_t tokens, std::size_t rows, std::size_t columns,
+                        std::size_t output_row_stride);
+bool gemm_q5k_kblk_avx2(const std::uint8_t* weights, const float* input, float* output,
+                         std::size_t tokens, std::size_t rows, std::size_t columns,
+                         std::size_t output_row_stride);
 bool gemm_q4k_kblk_avx2(const std::uint8_t* weights, const float* input, float* output,
                          std::size_t tokens, std::size_t rows, std::size_t columns,
                          std::size_t output_row_stride);

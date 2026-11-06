@@ -150,6 +150,126 @@ bool gemv_q4k_q5k_avx2(const std::uint8_t* weights, const float* x, float* y,
     return true;
 }
 
+// Decode eight Q6_K values at the same group/lane offset. A 16-value
+// scale group is never crossed by a chunk. Keep the same (d * scale) * q
+// ordering as the scalar GGML decoder.
+static inline __m256 q6k_decode8(const std::uint8_t* p, unsigned half,
+                                  unsigned group, unsigned lane, float d) {
+    std::uint64_t low_bytes, high_bytes;
+    std::memcpy(&low_bytes, p + half * 64 + (group % 2) * 32 + lane, 8);
+    std::memcpy(&high_bytes, p + 128 + half * 32 + lane, 8);
+    __m256i lo = _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(static_cast<long long>(low_bytes)));
+    __m256i hi = _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(static_cast<long long>(high_bytes)));
+    if (group >= 2) lo = _mm256_srli_epi32(lo, 4);
+    hi = _mm256_srlv_epi32(hi, _mm256_set1_epi32(group * 2));
+    __m256i q = _mm256_or_si256(_mm256_and_si256(lo, _mm256_set1_epi32(15)),
+        _mm256_slli_epi32(_mm256_and_si256(hi, _mm256_set1_epi32(3)), 4));
+    q = _mm256_sub_epi32(q, _mm256_set1_epi32(32));
+    const auto* scales = reinterpret_cast<const std::int8_t*>(p + 192);
+    const float ds = d * float(scales[half * 8 + group * 2 + lane / 16]);
+    return _mm256_mul_ps(_mm256_set1_ps(ds), _mm256_cvtepi32_ps(q));
+}
+
+bool gemv_q6k_avx2(const std::uint8_t* weights, const float* x, float* y,
+                   std::size_t rows, std::size_t columns) {
+    if (!weights || !x || !y || !rows || !columns || columns % 256) return false;
+    const std::size_t blocks = columns / 256;
+    for (std::size_t r = 0; r < rows; ++r) {
+        __m256 sums[4] = {_mm256_setzero_ps(), _mm256_setzero_ps(),
+                          _mm256_setzero_ps(), _mm256_setzero_ps()};
+        for (std::size_t b = 0; b < blocks; ++b) {
+            const auto* p = weights + (r * blocks + b) * 210;
+            const float d = q8_half_to_float(std::uint16_t(p[208]) | (std::uint16_t(p[209]) << 8));
+            for (unsigned half = 0; half < 2; ++half)
+                for (unsigned group = 0; group < 4; ++group)
+                    for (unsigned lane = 0; lane < 32; lane += 8) {
+                        const __m256 w = q6k_decode8(p, half, group, lane, d);
+                        const __m256 xv = _mm256_loadu_ps(x + b * 256 + half * 128 + group * 32 + lane);
+                        sums[lane / 8] = _mm256_fmadd_ps(w, xv, sums[lane / 8]);
+                    }
+        }
+        y[r] = hsum_ps256(_mm256_add_ps(_mm256_add_ps(sums[0], sums[1]),
+                                         _mm256_add_ps(sums[2], sums[3])));
+    }
+    return true;
+}
+
+// Unpack GGML Q3_K's sixteen six-bit scale fields, as in the scalar
+// decoder. The resulting bytes are 0..63, with 32 subtracted per group.
+static inline void q3k_scales(const std::uint8_t* p, std::uint8_t* scales) {
+    std::uint32_t aux[4]{};std::memcpy(aux,p+96,12);const std::uint32_t tmp=aux[2];
+    aux[2]=((aux[0]>>4)&0x0f0f0f0fu)|(((tmp>>4)&0x03030303u)<<4);
+    aux[3]=((aux[1]>>4)&0x0f0f0f0fu)|(((tmp>>6)&0x03030303u)<<4);
+    aux[0]=(aux[0]&0x0f0f0f0fu)|(((tmp>>0)&0x03030303u)<<4);
+    aux[1]=(aux[1]&0x0f0f0f0fu)|(((tmp>>2)&0x03030303u)<<4);
+    std::memcpy(scales,aux,16);
+}
+static inline __m256 q3k_decode8(const std::uint8_t* p, const std::uint8_t* scales,
+                                  unsigned half, unsigned group, unsigned lane, float d) {
+    std::uint64_t low,high;
+    std::memcpy(&low,p+32+half*32+lane,8);std::memcpy(&high,p+lane,8);
+    __m256i q=_mm256_cvtepu8_epi32(_mm_cvtsi64_si128(static_cast<long long>(low)));
+    q=_mm256_srlv_epi32(q,_mm256_set1_epi32(group*2));
+    q=_mm256_and_si256(q,_mm256_set1_epi32(3));
+    __m256i h=_mm256_cvtepu8_epi32(_mm_cvtsi64_si128(static_cast<long long>(high)));
+    h=_mm256_srlv_epi32(h,_mm256_set1_epi32(half*4+group));
+    h=_mm256_and_si256(h,_mm256_set1_epi32(1));
+    q=_mm256_sub_epi32(q,_mm256_slli_epi32(_mm256_sub_epi32(_mm256_set1_epi32(1),h),2));
+    const float ds=d*float(int(scales[half*8+group*2+lane/16])-32);
+    return _mm256_mul_ps(_mm256_set1_ps(ds),_mm256_cvtepi32_ps(q));
+}
+bool gemv_q3k_avx2(const std::uint8_t* weights,const float* x,float* y,
+                   std::size_t rows,std::size_t columns){
+    if(!weights||!x||!y||!rows||!columns||columns%256)return false;
+    const std::size_t blocks=columns/256;
+    for(std::size_t r=0;r<rows;++r){
+        __m256 sums[4]={_mm256_setzero_ps(),_mm256_setzero_ps(),_mm256_setzero_ps(),_mm256_setzero_ps()};
+        for(std::size_t b=0;b<blocks;++b){
+            const auto*p=weights+(r*blocks+b)*110;std::uint8_t scales[16];q3k_scales(p,scales);
+            const float d=q8_half_to_float(std::uint16_t(p[108])|(std::uint16_t(p[109])<<8));
+            for(unsigned h=0;h<2;++h)for(unsigned g=0;g<4;++g)for(unsigned l=0;l<32;l+=8){
+                const auto w=q3k_decode8(p,scales,h,g,l,d);
+                const auto xv=_mm256_loadu_ps(x+b*256+h*128+g*32+l);
+                sums[l/8]=_mm256_fmadd_ps(w,xv,sums[l/8]);
+            }
+        }
+        y[r]=hsum_ps256(_mm256_add_ps(_mm256_add_ps(sums[0],sums[1]),_mm256_add_ps(sums[2],sums[3])));
+    }
+    return true;
+}
+
+// TQ2_0 block: two groups of 32 packed bytes; each group emits four
+// planes of 32 values, with codes 0..3 mapping to -1..2.
+static inline __m256 tq2_decode8(const std::uint8_t* p, unsigned group,
+                                  unsigned plane, unsigned lane, float d) {
+    std::uint64_t bytes; std::memcpy(&bytes, p + group * 32 + lane, 8);
+    __m256i q = _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(static_cast<long long>(bytes)));
+    q = _mm256_srlv_epi32(q, _mm256_set1_epi32(plane * 2));
+    q = _mm256_sub_epi32(_mm256_and_si256(q, _mm256_set1_epi32(3)), _mm256_set1_epi32(1));
+    return _mm256_mul_ps(_mm256_cvtepi32_ps(q), _mm256_set1_ps(d));
+}
+
+bool gemv_tq2_avx2(const std::uint8_t* weights, const float* x, float* y,
+                   std::size_t rows, std::size_t columns) {
+    if (!weights || !x || !y || !rows || !columns || columns % 256) return false;
+    const std::size_t blocks=columns/256;
+    for(std::size_t r=0;r<rows;++r){
+        __m256 sums[4]={_mm256_setzero_ps(),_mm256_setzero_ps(),_mm256_setzero_ps(),_mm256_setzero_ps()};
+        for(std::size_t b=0;b<blocks;++b){
+            const auto* p=weights+(r*blocks+b)*66;
+            const float d=q8_half_to_float(std::uint16_t(p[64])|(std::uint16_t(p[65])<<8));
+            for(unsigned group=0;group<2;++group)for(unsigned plane=0;plane<4;++plane)
+                for(unsigned lane=0;lane<32;lane+=8){
+                    auto w=tq2_decode8(p,group,plane,lane,d);
+                    auto xv=_mm256_loadu_ps(x+b*256+group*128+plane*32+lane);
+                    sums[lane/8]=_mm256_fmadd_ps(w,xv,sums[lane/8]);
+                }
+        }
+        y[r]=hsum_ps256(_mm256_add_ps(_mm256_add_ps(sums[0],sums[1]),_mm256_add_ps(sums[2],sums[3])));
+    }
+    return true;
+}
+
 // Quantise one activation vector to Q8_0 form: 32 int8 per block plus a scale.
 // Used only by the opt-in int8 path below.
 static void quantise_acts_q8_0(const float* x, std::size_t columns,
@@ -916,6 +1036,31 @@ inline void dequant_f16_panel(const std::uint8_t* wrow, std::size_t k0,
     for (; i < kc; ++i) dst[i] = half_to_float_local(read16_local(srcp + 2 * i));
 }
 
+} // namespace
+
+bool gemv_f16_avx2(const std::uint8_t* weights, const float* x, float* y,
+                   std::size_t rows, std::size_t columns) {
+    if (!weights || !x || !y || !rows || !columns) return false;
+    for (std::size_t r = 0; r < rows; ++r) {
+        const auto* row = weights + r * columns * 2;
+        __m256 sums[4] = {_mm256_setzero_ps(), _mm256_setzero_ps(),
+                          _mm256_setzero_ps(), _mm256_setzero_ps()};
+        std::size_t c = 0;
+        alignas(32) float values[8];
+        for (; c + 8 <= columns; c += 8) {
+            f16x8_to_f32(row + 2 * c, values);
+            const auto w = _mm256_load_ps(values);
+            sums[(c / 8) % 4] = _mm256_fmadd_ps(w, _mm256_loadu_ps(x + c), sums[(c / 8) % 4]);
+        }
+        float result = hsum_ps256(_mm256_add_ps(_mm256_add_ps(sums[0], sums[1]),
+                                                 _mm256_add_ps(sums[2], sums[3])));
+        for (; c < columns; ++c) result += half_to_float_local(read16_local(row + 2 * c)) * x[c];
+        y[r] = result;
+    }
+    return true;
+}
+
+namespace {
 // Dequantise one 64-element Q4_K sub-block (32 packed bytes) into 64 floats
 // with two scale/min pairs. Low nibbles fill dst[0..31], high nibbles
 // dst[32..63]. Uses mul+sub (not FMA) so each weight is bit-identical to
@@ -975,6 +1120,54 @@ inline void dequant_q4k_panel(const std::uint8_t* wrow, std::size_t k0,
         const std::uint8_t byte = block[16 + within * 32 + (e % 32)];
         const float qf = float(e < 32 ? (byte & 15u) : (byte >> 4));
         dst[i] = ds * qf - ms;
+    }
+}
+
+// Q5_K uses the Q4_K nibbles plus a shared high-bit plane.
+inline void dequant_q5k_panel(const std::uint8_t* wrow, std::size_t k0,
+                              std::size_t kc, float* dst) {
+    for (std::size_t i = 0; i < kc; i += 8) {
+        const std::size_t col = k0 + i;
+        const auto* p = wrow + (col / 256) * 176;
+        const unsigned group = unsigned((col % 256) / 32);
+        const unsigned lane = unsigned(col % 32);
+        std::uint8_t sc{}, mn{};
+        k_scale_min_local(group, p + 4, sc, mn);
+        const float d = half_to_float_local(read16_local(p)) * float(sc);
+        const float m = half_to_float_local(read16_local(p + 2)) * float(mn);
+        std::uint64_t low, high;
+        std::memcpy(&low, p + 48 + (group / 2) * 32 + lane, 8);
+        std::memcpy(&high, p + 16 + lane, 8);
+        __m256i q = _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(static_cast<long long>(low)));
+        if (group & 1) q = _mm256_srli_epi32(q, 4);
+        q = _mm256_and_si256(q, _mm256_set1_epi32(15));
+        __m256i h = _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(static_cast<long long>(high)));
+        h = _mm256_srlv_epi32(h, _mm256_set1_epi32(group));
+        q = _mm256_or_si256(q, _mm256_slli_epi32(_mm256_and_si256(h, _mm256_set1_epi32(1)), 4));
+        _mm256_storeu_ps(dst + i, _mm256_sub_ps(_mm256_mul_ps(_mm256_set1_ps(d),
+                           _mm256_cvtepi32_ps(q)), _mm256_set1_ps(m)));
+    }
+}
+
+inline void dequant_q3k_panel(const std::uint8_t* wrow, std::size_t k0,
+                               std::size_t kc, float* dst) {
+    // Both the Kc=256 panel and tail are super-block aligned.
+    for(std::size_t i=0;i<kc;i+=256){
+        const auto* p=wrow+((k0+i)/256)*110;std::uint8_t scales[16];q3k_scales(p,scales);
+        const float d=half_to_float_local(read16_local(p+108));
+        for(unsigned h=0;h<2;++h)for(unsigned g=0;g<4;++g)for(unsigned l=0;l<32;l+=8)
+            _mm256_storeu_ps(dst+i+h*128+g*32+l,q3k_decode8(p,scales,h,g,l,d));
+    }
+}
+
+inline void dequant_tq2_panel(const std::uint8_t* wrow, std::size_t k0,
+                               std::size_t kc, float* dst) {
+    for(std::size_t i=0;i<kc;i+=8){
+        const std::size_t col=k0+i;
+        const auto* p=wrow+(col/256)*66;
+        const float d=half_to_float_local(read16_local(p+64));
+        const unsigned in=unsigned(col%256);
+        _mm256_storeu_ps(dst+i,tq2_decode8(p,in/128,(in%128)/32,in%32,d));
     }
 }
 
@@ -1073,6 +1266,30 @@ bool gemm_f16_kblk_avx2(const std::uint8_t* weights, const float* input, float* 
     }();
     return gemm_kblk_impl(weights, input, output, tokens, rows, columns,
                          output_row_stride, columns * 2, kKc, &dequant_f16_panel);
+}
+
+bool gemm_q3k_kblk_avx2(const std::uint8_t* weights,const float* input,float* output,
+                        std::size_t tokens,std::size_t rows,std::size_t columns,
+                        std::size_t output_row_stride){
+    if(!weights||!input||!output||!tokens||!rows||!columns||columns%256)return false;
+    return gemm_kblk_impl(weights,input,output,tokens,rows,columns,output_row_stride,
+                          (columns/256)*110,256,&dequant_q3k_panel);
+}
+
+bool gemm_tq2_kblk_avx2(const std::uint8_t* weights, const float* input, float* output,
+                        std::size_t tokens, std::size_t rows, std::size_t columns,
+                        std::size_t output_row_stride) {
+    if(!weights||!input||!output||!tokens||!rows||!columns||columns%256)return false;
+    return gemm_kblk_impl(weights,input,output,tokens,rows,columns,output_row_stride,
+                          (columns/256)*66,256,&dequant_tq2_panel);
+}
+
+bool gemm_q5k_kblk_avx2(const std::uint8_t* weights, const float* input, float* output,
+                         std::size_t tokens, std::size_t rows, std::size_t columns,
+                         std::size_t output_row_stride) {
+    if (!weights || !input || !output || !tokens || !rows || !columns || columns % 256) return false;
+    return gemm_kblk_impl(weights, input, output, tokens, rows, columns,
+                          output_row_stride, (columns / 256) * 176, 256, &dequant_q5k_panel);
 }
 
 bool gemm_q4k_kblk_avx2(const std::uint8_t* weights, const float* input, float* output,
@@ -1202,7 +1419,14 @@ inline void dequant_q6k_panel(const std::uint8_t* wrow, std::size_t k0,
         const auto* scales = reinterpret_cast<const std::int8_t*>(p + 192);
         const float d = half_to_float_local(read16_local(p + 208));
         const std::size_t count = std::min(kc - off, 256 - in_sb);
-        for (std::size_t i = 0; i < count; ++i) {
+        std::size_t i = 0;
+        for (; i + 8 <= count && (in_sb + i) % 8 == 0; i += 8) {
+            const std::size_t idx = in_sb + i;
+            const __m256 v = q6k_decode8(p, unsigned(idx / 128), unsigned((idx % 128) / 32),
+                                          unsigned(idx % 32), d);
+            _mm256_storeu_ps(dst + off + i, v);
+        }
+        for (; i < count; ++i) {
             const std::size_t idx = in_sb + i;
             const std::size_t half = idx / 128;
             const std::size_t group = (idx % 128) / 32;

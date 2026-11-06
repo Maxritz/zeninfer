@@ -47,10 +47,9 @@ with the D3D12 define on Linux, but this is not an MSVC build or GPU test.
 - Qwen3 Q/K normalization prevents using the existing fully fused Q8_0 decode
   layer pipeline. Its low reported prefill score has not been reproduced or
   diagnosed; it needs per-stage and per-shape measurement on the 9070 XT.
-- Q4_K/Q5_K prefill GEMM remains separate from the new decode kernel. The
-  existing Q4_K prefill optimization is opt-in (`ZEN_CPU_FAST_Q4K=1`); Q5_K
-  still uses generic CPU prefill. More formats, real-model parity and
-  end-to-end tuning remain necessary.
+- Q4_K/Q5_K prefill GEMM remains separate from decode; both AVX2 prefill
+  paths are enabled by default. More formats, real-model parity and end-to-end
+  tuning remain necessary; see [CPU quant progress](CPU_QUANT_PROGRESS.md).
 
 ## Windows A/B and diagnostics
 
