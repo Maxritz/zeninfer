@@ -83,6 +83,10 @@ selected from prefill logits.
 ./build/zen_server --model model.gguf --host 127.0.0.1 --port 8000
 ```
 
+Opt-in lossy chat history compaction is available via the `context_compaction`
+request extension; it has important latency and quality limitations. See
+[chat compaction](docs/CHAT_COMPACTION.md).
+
 Supported request controls include `max_tokens`, `temperature`, `top_k`, `top_p`, `seed`, `stop`, `logit_bias`, `allowed_token_ids` and `speculative_tokens`. Set `--draft-model draft.gguf` on the server to enable speculative decoding. Stochastic speculative decoding uses the target/draft probability ratio and residual correction; it is not a greedy-only comparison. Chat messages accept `system`, `user` and `assistant` roles. Common Llama 2, Llama 3 and ChatML prompt layouts are selected from the GGUF chat-template markers. Arbitrary Jinja templates are not interpreted.
 
 ## Architecture micro-models and throughput
