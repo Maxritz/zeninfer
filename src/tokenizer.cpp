@@ -204,9 +204,11 @@ bool ModelTokenizer::decode(const std::vector<std::uint32_t>& ids,std::string& o
         if(type==6){if(tokens_[id].size()==6){unsigned byte{};auto r=std::from_chars(tokens_[id].data()+3,tokens_[id].data()+5,byte,16);if(r.ec==std::errc{}&&byte<256)result.push_back(static_cast<char>(byte));}continue;}
         if(gpt2_bpe_){if((type==3||type==2)&&skip_special)continue;const auto& piece=tokens_[id];for(std::size_t p=0;p<piece.size();){const auto n=std::min(utf8_len(static_cast<unsigned char>(piece[p])),piece.size()-p);std::uint32_t cp=0;for(std::size_t j=0;j<n;++j){const auto c=static_cast<unsigned char>(piece[p+j]);if(j==0){if(n==1)cp=c;else if(n==2)cp=c&0x1f;else if(n==3)cp=c&0x0f;else cp=c&7;}else cp=(cp<<6)|(c&0x3f);}auto it=gpt2_decoder_.find(cp);if(it!=gpt2_decoder_.end())result.push_back(static_cast<char>(it->second));else result.append(piece,p,n);p+=n;}continue;}
         if((type==3||type==2)&&skip_special)continue;
-        std::string piece=tokens_[id];std::size_t pos=0;
-        while((pos=piece.find(escaped,pos))!=std::string::npos){piece.replace(pos,escaped.size()," ");++pos;}
-        result+=piece;
+        const std::string& piece=tokens_[id];std::size_t start=0,pos=0;
+        while((pos=piece.find(escaped,start))!=std::string::npos){
+            result.append(piece,start,pos-start);result.push_back(' ');start=pos+escaped.size();
+        }
+        result.append(piece,start,std::string::npos);
     }
     if(!result.empty()&&result.front()==' ')result.erase(result.begin());
     out.swap(result);return true;

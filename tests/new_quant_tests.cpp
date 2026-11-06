@@ -42,7 +42,7 @@ int main(int argc,char** argv){
          string(o,"general.architecture");write32(o,8);string(o,"llama");
          string(o,"test.weight");write32(o,1);write64(o,n);write32(o,type);write64(o,0);
          auto p=static_cast<std::uint64_t>(o.tellp());for(;p%32;++p)o.put('\0');o.write(reinterpret_cast<const char*>(raw.data()+1),bytes);}
-        auto report=zen::gguf::inspect(path);std::vector<float> loaded;std::string error;
+        auto report=zen::gguf::inspect(path,{zen::gguf::Q8_1Layout::fp16_36});std::vector<float> loaded;std::string error;
         if(!report.ok||report.tensors.size()!=1||report.tensors[0].byte_size!=bytes||!zen::gguf::read_tensor_f32(path,report,"test.weight",loaded,&error)||loaded.size()!=n){
             std::cerr<<name<<": GGUF load failed "<<report.error<<" "<<error<<'\n';++failures;
         }else for(std::size_t i=0;i<n;++i)if(!same(loaded[i],ref[i])){std::cerr<<name<<": GGUF mismatch at "<<i<<'\n';++failures;break;}
@@ -55,7 +55,7 @@ int main(int argc,char** argv){
              string(o,"test.weight");write32(o,2);write64(o,block/2);write64(o,2);write32(o,type);write64(o,0);
              auto p=static_cast<std::uint64_t>(o.tellp());for(;p%32;++p)o.put('\0');
              o.write(reinterpret_cast<const char*>(raw.data()+1),f->block_bytes);}
-            if(zen::gguf::inspect(path).ok){std::cerr<<name<<": misaligned GGUF rows accepted\n";++failures;}
+            if(zen::gguf::inspect(path,{zen::gguf::Q8_1Layout::fp16_36}).ok){std::cerr<<name<<": misaligned GGUF rows accepted\n";++failures;}
         }
         // Restore a valid one-dimensional file before testing truncation.
         {std::ofstream o(path,std::ios::binary);o.write("GGUF",4);write32(o,3);write64(o,1);write64(o,1);
@@ -63,7 +63,7 @@ int main(int argc,char** argv){
          string(o,"test.weight");write32(o,1);write64(o,n);write32(o,type);write64(o,0);
          auto p=static_cast<std::uint64_t>(o.tellp());for(;p%32;++p)o.put('\0');o.write(reinterpret_cast<const char*>(raw.data()+1),bytes);}
         std::error_code ec;auto filebytes=std::filesystem::file_size(path,ec);std::filesystem::resize_file(path,filebytes-1,ec);
-        if(ec||zen::gguf::inspect(path).ok){std::cerr<<name<<": truncated GGUF accepted\n";++failures;}
+        if(ec||zen::gguf::inspect(path,{zen::gguf::Q8_1Layout::fp16_36}).ok){std::cerr<<name<<": truncated GGUF accepted\n";++failures;}
         if(std::all_of(ref.begin(),ref.end(),[](float v){return std::isfinite(v);})){
             std::vector<float> x(n*3), y(3);for(std::size_t i=0;i<x.size();++i)x[i]=float(int(i%19)-9)/16.0f;
             for(unsigned tokens:{1u,3u}){

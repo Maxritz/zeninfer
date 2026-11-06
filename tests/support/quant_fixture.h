@@ -44,7 +44,7 @@ inline std::vector<std::uint8_t> quant_fixture(const zen::quant::Format& f,
             case E::ptq1_0:half(26);break;
             case E::iq1_m: // assembled half from four high nibbles: 0x3000
                 p[49]&=0x0f;p[51]&=0x0f;p[53]&=0x0f;p[55]=(p[55]&0x0f)|0x30;break;
-            case E::q8_k: {float d=0.125f;std::memcpy(p,&d,4);break;}
+            case E::q8_k: case E::q8_1_f32: {float d=0.125f;std::memcpy(p,&d,4);break;}
             case E::mxfp4:p[0]=127;break;
             case E::nvfp4:for(unsigned i=0;i<4;++i)p[i]=std::uint8_t(1+(rnd()%126));break;
             case E::rocmfp4:p[16]=48;p[17]=48;break;

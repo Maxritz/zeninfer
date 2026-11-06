@@ -108,11 +108,39 @@ real-model hybrid correctness or performance.
 ## CPU format-coverage follow-up
 
 The earlier 48-format sweep in this document predates the additional upstream GGML types.
-The current registry contains 58 formats, including scalar types. Q8_1,
-NVFP4, Q1_0, Q2_0 and F8_E4M3 have GGUF decoding and generic CPU GEMV/GEMM;
-I8/I16/I32/I64/F64 are also converted to FP32. These are functional fallback
-paths, not new fused SIMD implementations. Independent upstream-GGML golden
+The current registry contains 59 formats, including scalar types and the
+explicit legacy Q8_1 layout. Q8_1, NVFP4, Q1_0, Q2_0 and F8_E4M3 have GGUF
+decoding and specialized AVX2 CPU GEMV/GEMM paths; I8/I16/I32/I64/F64 are
+also converted to FP32, generally through fallback paths. Many other formats
+remain unoptimized. Independent upstream-GGML golden
 blocks and a synthetic mapped-weight runtime test were added. For the precise
 format inventory, Q8_1 legacy-layout warning and validation limits, see
 [FORMAT_SUPPORT.md](FORMAT_SUPPORT.md). No real-model or target-CPU throughput
 measurement was made for the new types.
+
+## New-format AVX2 follow-up
+
+Q1_0, Q2_0, NVFP4, F8_E4M3 and both Q8_1 layouts now decode eight values at a
+time in a fused AVX2 GEMV and a 256-column panel-based GEMM. Set
+`ZEN_CPU_FAST_NEWQUANT=0` before launch to compare against the prior generic
+route. F8 GEMM falls back for columns not divisible by eight; scalar-only builds
+keep the original portable code. Tests compare independent decoded weights and
+dots across short and long panels, unaligned weight pointers, 1/4 workers,
+1/2/3/8 tokens and padded output strides. Upstream golden data additionally
+covers all NVFP4 scale bytes and FP8 values. This is not full optimization of
+all CPU formats and is not target-CPU or model-level performance evidence.
+
+On a shared two-logical-CPU Intel Xeon Linux VM, Release AVX2, 512x4096,
+T=8, one worker, the range of two interleaved five-sample medians was:
+
+| Format | Fallback GEMV / GEMM (ms) | AVX2 GEMV / GEMM (ms) |
+|---|---:|---:|
+| Q1_0 | 12.16–12.27 / 13.03–13.42 | 0.71–0.76 / 1.47–1.61 |
+| Q2_0 | 2.35–2.46 / 3.55–3.78 | 0.77 / 1.48–1.54 |
+| Q8_1 | 9.72 / 10.66–10.95 | 0.74–0.80 / 1.14–1.28 |
+| Q8_1_F32 | 9.50–10.09 / 10.63–11.25 | 0.37 / 0.85–0.93 |
+| NVFP4 | 1.11–1.13 / 2.34–2.37 | 0.38–0.39 / 1.02–1.07 |
+| F8_E4M3 | 0.66–0.73 / 1.72–2.02 | 0.46 / 1.14–1.42 |
+
+These are synthetic matrix microbenchmarks on noisy shared hardware, not
+Windows/AMD target results, model tok/s, or a guarantee for every shape.

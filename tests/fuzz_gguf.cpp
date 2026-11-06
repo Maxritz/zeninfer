@@ -61,7 +61,7 @@ void append_gstr(std::vector<std::uint8_t>& v, const char* s, std::size_t n) {
 std::vector<std::uint8_t> build_case(const std::uint8_t* data, std::size_t size) {
     Cycler c{data, size};
     std::vector<std::uint8_t> img;
-    img.insert(img.end(), {'G', 'G', 'U', 'F'});
+    img.push_back('G');img.push_back('G');img.push_back('U');img.push_back('F');
     append_u32(img, 3);      // version
     append_u64(img, 1);      // one tensor
     append_u64(img, 3);      // three metadata entries

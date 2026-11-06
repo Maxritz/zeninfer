@@ -5,9 +5,13 @@
 #include <cstring>
 #include <cmath>
 #include <limits>
+#include <array>
 #include <vector>
 
 namespace zen {
+// A named, explicitly aligned wrapper avoids putting an attributed compiler
+// vector type directly in a standard-library template.
+struct alignas(32) VectorAccumulator { __m256 value; };
 void gemv_avx2(const float* a, const float* x, float* y,
                std::size_t m, std::size_t k) {
     for (std::size_t i=0; i<m; ++i) {
@@ -94,6 +98,92 @@ static inline float hsum_ps256(__m256 v) {
     s = _mm_hadd_ps(s, s);
     s = _mm_hadd_ps(s, s);
     return _mm_cvtss_f32(s);
+}
+
+// NVFP4 uses UE4M3 scales, interpreted with the upstream half-scale
+// convention (including the high-bit cases). Build the 256-value table once.
+static const std::array<float,256>& nvfp4_scale_table(){
+    static const auto values=[](){std::array<float,256> out{};for(unsigned x=0;x<256;++x){
+        if(x==0||x==0x7f){out[x]=0.f;continue;}
+        const unsigned exp=(x>>3)&15u,mant=x&7u;
+        out[x]=(exp==0?std::ldexp(float(mant),-9):std::ldexp(1.f+float(mant)/8.f,int(exp)-7))*0.5f;
+    }return out;}();return values;
+}
+static const std::array<float,256>& f8_e4m3_table(){
+    static const auto values=[](){std::array<float,256> out{};for(unsigned x=0;x<256;++x){
+        const unsigned a=x&127u,exp=(a>>3)&15u,mant=a&7u;
+        if(a==127){out[x]=std::numeric_limits<float>::quiet_NaN();continue;}
+        const float v=exp==0?std::ldexp(float(mant),-9):std::ldexp(1.f+float(mant)/8.f,int(exp)-7);
+        out[x]=(x&128u)?-v:v;
+    }return out;}();return values;
+}
+// Eight decoded elements from compact Q1_0/Q2_0, NVFP4, FP8 and Q8_1 layouts.
+// The callers only pass whole, block-aligned panels (Kc=256).
+static inline __m256 new_quant_decode8(const std::uint8_t* p, std::size_t offset, NewQuantKind kind) {
+    if(kind==NewQuantKind::f8_e4m3){
+        std::uint64_t bytes;std::memcpy(&bytes,p+offset,8);
+        const auto indices=_mm256_cvtepu8_epi32(_mm_cvtsi64_si128(static_cast<long long>(bytes)));
+        return _mm256_i32gather_ps(f8_e4m3_table().data(),indices,4);
+    }
+    if(kind==NewQuantKind::nvfp4){
+        const unsigned group=offset/16, lane=offset%16;
+        std::uint64_t bytes;std::memcpy(&bytes,p+4+group*8+(lane%8),8);
+        __m128i indices=_mm_cvtsi64_si128(static_cast<long long>(bytes));
+        if(lane>=8)indices=_mm_srli_epi16(indices,4);
+        indices=_mm_and_si128(indices,_mm_set1_epi8(15));
+        const __m128i table=_mm_setr_epi8(0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12);
+        const auto q=_mm256_cvtepi8_epi32(_mm_shuffle_epi8(table,indices));
+        return _mm256_mul_ps(_mm256_cvtepi32_ps(q),_mm256_set1_ps(nvfp4_scale_table()[p[group]]));
+    }
+    float d;
+    if(kind==NewQuantKind::q8_1_f32){std::uint32_t bits=std::uint32_t(p[0])|(std::uint32_t(p[1])<<8)|(std::uint32_t(p[2])<<16)|(std::uint32_t(p[3])<<24);std::memcpy(&d,&bits,4);}
+    else d=q8_half_to_float(std::uint16_t(p[0])|(std::uint16_t(p[1])<<8));
+    __m256i q;
+    if(kind==NewQuantKind::q1_0){
+        const int byte=p[2+offset/8];
+        const __m256i v=_mm256_set1_epi32(byte);
+        const __m256i shifts=_mm256_setr_epi32(0,1,2,3,4,5,6,7);
+        q=_mm256_sub_epi32(_mm256_slli_epi32(_mm256_and_si256(_mm256_srlv_epi32(v,shifts),_mm256_set1_epi32(1)),1),_mm256_set1_epi32(1));
+    }else if(kind==NewQuantKind::q2_0){
+        const int a=p[2+offset/4], b=p[3+offset/4];
+        const __m256i v=_mm256_setr_epi32(a,a,a,a,b,b,b,b);
+        const __m256i shifts=_mm256_setr_epi32(0,2,4,6,0,2,4,6);
+        q=_mm256_sub_epi32(_mm256_and_si256(_mm256_srlv_epi32(v,shifts),_mm256_set1_epi32(3)),_mm256_set1_epi32(1));
+    }else{
+        std::uint64_t bytes;std::memcpy(&bytes,p+(kind==NewQuantKind::q8_1_f32?8:4)+offset,8);
+        q=_mm256_cvtepi8_epi32(_mm_cvtsi64_si128(static_cast<long long>(bytes)));
+    }
+    return _mm256_mul_ps(_mm256_cvtepi32_ps(q),_mm256_set1_ps(d));
+}
+static inline std::size_t new_quant_elements(NewQuantKind kind){return kind==NewQuantKind::f8_e4m3?1:kind==NewQuantKind::q1_0?128:kind==NewQuantKind::q2_0||kind==NewQuantKind::nvfp4?64:32;}
+static inline std::size_t new_quant_bytes(NewQuantKind kind){return kind==NewQuantKind::f8_e4m3?1:kind==NewQuantKind::q1_0||kind==NewQuantKind::q2_0?18:kind==NewQuantKind::q8_1||kind==NewQuantKind::nvfp4?36:40;}
+
+bool gemv_new_quant_avx2(const std::uint8_t* weights,const float* x,float* y,
+                          std::size_t rows,std::size_t columns,NewQuantKind kind){
+    if(kind!=NewQuantKind::q1_0 && kind!=NewQuantKind::q2_0 && kind!=NewQuantKind::q8_1 &&
+       kind!=NewQuantKind::q8_1_f32 && kind!=NewQuantKind::nvfp4 && kind!=NewQuantKind::f8_e4m3)return false;
+    const auto block=new_quant_elements(kind), bytes=new_quant_bytes(kind);
+    if(!weights||!x||!y||!rows||!columns||columns%block)return false;
+    if(kind==NewQuantKind::f8_e4m3){
+        const auto& table=f8_e4m3_table();
+        for(std::size_t r=0;r<rows;++r){
+            __m256 acc=_mm256_setzero_ps();std::size_t c=0;
+            const auto* row=weights+r*columns;
+            for(;c+8<=columns;c+=8)acc=_mm256_fmadd_ps(new_quant_decode8(row,c,kind),_mm256_loadu_ps(x+c),acc);
+            float sum=hsum_ps256(acc);for(;c<columns;++c)sum+=table[row[c]]*x[c];y[r]=sum;
+        }
+        return true;
+    }
+    const auto blocks=columns/block;
+    for(std::size_t r=0;r<rows;++r){
+        __m256 acc=_mm256_setzero_ps();
+        for(std::size_t b=0;b<blocks;++b){
+            const auto* p=weights+(r*blocks+b)*bytes;
+            for(unsigned j=0;j<block;j+=8)acc=_mm256_fmadd_ps(new_quant_decode8(p,j,kind),_mm256_loadu_ps(x+b*block+j),acc);
+        }
+        y[r]=hsum_ps256(acc);
+    }
+    return true;
 }
 
 // Decode K-quant nibbles directly into vector registers.  Unlike the generic
@@ -631,7 +721,7 @@ bool gemm_q8_0_kblk_avx2(const std::uint8_t* weights, const float* input, float*
         return static_cast<std::size_t>(64);
     }();
     if(rows_main>0){
-        std::vector<__m256> partial(std::size_t(tokens)*kRB);
+        std::vector<VectorAccumulator> partial(std::size_t(tokens)*kRB);
         std::vector<float> wpanel(kMR*kKc);
         alignas(32) float lane[8];
         for(std::size_t r0=0;r0<rows_main;r0+=kRB){
@@ -689,7 +779,7 @@ bool gemm_q8_0_kblk_avx2(const std::uint8_t* weights, const float* input, float*
                     if(t+1<tokens){
                         const float* in1=input+(t+1)*columns+k0;
                         __m256 a00,a01,a10,a11,a20,a21,a30,a31;
-                        __m256* p;
+                        VectorAccumulator* p;
                         if(first_panel){
                             a00=_mm256_setzero_ps();a01=_mm256_setzero_ps();
                             a10=_mm256_setzero_ps();a11=_mm256_setzero_ps();
@@ -697,14 +787,14 @@ bool gemm_q8_0_kblk_avx2(const std::uint8_t* weights, const float* input, float*
                             a30=_mm256_setzero_ps();a31=_mm256_setzero_ps();
                         }else{
                             p=&partial[t*RBc+rl];
-                            a00=_mm256_loadu_ps(reinterpret_cast<const float*>(p+0*RBc));
-                            a01=_mm256_loadu_ps(reinterpret_cast<const float*>(p+1*RBc));
-                            a10=_mm256_loadu_ps(reinterpret_cast<const float*>(p+0*RBc+1));
-                            a11=_mm256_loadu_ps(reinterpret_cast<const float*>(p+1*RBc+1));
-                            a20=_mm256_loadu_ps(reinterpret_cast<const float*>(p+0*RBc+2));
-                            a21=_mm256_loadu_ps(reinterpret_cast<const float*>(p+1*RBc+2));
-                            a30=_mm256_loadu_ps(reinterpret_cast<const float*>(p+0*RBc+3));
-                            a31=_mm256_loadu_ps(reinterpret_cast<const float*>(p+1*RBc+3));
+                            a00=p[0*RBc].value;
+                            a01=p[1*RBc].value;
+                            a10=p[0*RBc+1].value;
+                            a11=p[1*RBc+1].value;
+                            a20=p[0*RBc+2].value;
+                            a21=p[1*RBc+2].value;
+                            a30=p[0*RBc+3].value;
+                            a31=p[1*RBc+3].value;
                         }
                         const float* w=wpanel.data();
                         for(std::size_t s=0;s<kc;s+=8){
@@ -720,26 +810,26 @@ bool gemm_q8_0_kblk_avx2(const std::uint8_t* weights, const float* input, float*
                             a30=_mm256_fmadd_ps(v3,x0,a30);a31=_mm256_fmadd_ps(v3,x1,a31);
                         }
                         p=&partial[t*RBc+rl];
-                        _mm256_storeu_ps(reinterpret_cast<float*>(p+0*RBc),a00);
-                        _mm256_storeu_ps(reinterpret_cast<float*>(p+1*RBc),a01);
-                        _mm256_storeu_ps(reinterpret_cast<float*>(p+0*RBc+1),a10);
-                        _mm256_storeu_ps(reinterpret_cast<float*>(p+1*RBc+1),a11);
-                        _mm256_storeu_ps(reinterpret_cast<float*>(p+0*RBc+2),a20);
-                        _mm256_storeu_ps(reinterpret_cast<float*>(p+1*RBc+2),a21);
-                        _mm256_storeu_ps(reinterpret_cast<float*>(p+0*RBc+3),a30);
-                        _mm256_storeu_ps(reinterpret_cast<float*>(p+1*RBc+3),a31);
+                        p[0*RBc].value=a00;
+                        p[1*RBc].value=a01;
+                        p[0*RBc+1].value=a10;
+                        p[1*RBc+1].value=a11;
+                        p[0*RBc+2].value=a20;
+                        p[1*RBc+2].value=a21;
+                        p[0*RBc+3].value=a30;
+                        p[1*RBc+3].value=a31;
                     }else{
                         __m256 a0,a1,a2,a3;
-                        __m256* p;
+                        VectorAccumulator* p;
                         if(first_panel){
                             a0=_mm256_setzero_ps();a1=_mm256_setzero_ps();
                             a2=_mm256_setzero_ps();a3=_mm256_setzero_ps();
                         }else{
                             p=&partial[t*RBc+rl];
-                            a0=_mm256_loadu_ps(reinterpret_cast<const float*>(p+0));
-                            a1=_mm256_loadu_ps(reinterpret_cast<const float*>(p+1));
-                            a2=_mm256_loadu_ps(reinterpret_cast<const float*>(p+2));
-                            a3=_mm256_loadu_ps(reinterpret_cast<const float*>(p+3));
+                            a0=p[0].value;
+                            a1=p[1].value;
+                            a2=p[2].value;
+                            a3=p[3].value;
                         }
                         const float* w=wpanel.data();
                         for(std::size_t s=0;s<kc;s+=8){
@@ -754,18 +844,18 @@ bool gemm_q8_0_kblk_avx2(const std::uint8_t* weights, const float* input, float*
                             a3=_mm256_fmadd_ps(v3,x0,a3);
                         }
                         p=&partial[t*RBc+rl];
-                        _mm256_storeu_ps(reinterpret_cast<float*>(p+0),a0);
-                        _mm256_storeu_ps(reinterpret_cast<float*>(p+1),a1);
-                        _mm256_storeu_ps(reinterpret_cast<float*>(p+2),a2);
-                        _mm256_storeu_ps(reinterpret_cast<float*>(p+3),a3);
+                        p[0].value=a0;
+                        p[1].value=a1;
+                        p[2].value=a2;
+                        p[3].value=a3;
                     }
                 }
             }
         }
         for(std::size_t t=0;t<tokens;++t){
-            const __m256* prow=&partial[t*RBc];
+            const VectorAccumulator* prow=&partial[t*RBc];
             for(std::size_t rl=0;rl<RBc;++rl){
-                _mm256_store_ps(lane,prow[rl]);
+                _mm256_store_ps(lane,prow[rl].value);
                 output[t*output_row_stride+r0+rl]=lane[0]+lane[1]+lane[2]+lane[3]+lane[4]+lane[5]+lane[6]+lane[7];
             }
         }
@@ -838,7 +928,7 @@ bool gemm_q8_0_kblk_repack_avx2(const std::uint8_t* repacked, std::size_t row_of
         }
     };
     if(rows_main>0){
-        std::vector<__m256> partial(std::size_t(tokens)*kRB);
+        std::vector<VectorAccumulator> partial(std::size_t(tokens)*kRB);
         std::vector<float> wpanel(kMR*kKc);
         alignas(32) float lane[8];
         for(std::size_t r0=0;r0<rows_main;r0+=kRB){
@@ -872,7 +962,7 @@ bool gemm_q8_0_kblk_repack_avx2(const std::uint8_t* repacked, std::size_t row_of
                     if(t+1<tokens){
                         const float* in1=input+(t+1)*columns+k0;
                         __m256 a00,a01,a10,a11,a20,a21,a30,a31;
-                        __m256* p;
+                        VectorAccumulator* p;
                         if(first_panel){
                             a00=_mm256_setzero_ps();a01=_mm256_setzero_ps();
                             a10=_mm256_setzero_ps();a11=_mm256_setzero_ps();
@@ -880,14 +970,14 @@ bool gemm_q8_0_kblk_repack_avx2(const std::uint8_t* repacked, std::size_t row_of
                             a30=_mm256_setzero_ps();a31=_mm256_setzero_ps();
                         }else{
                             p=&partial[t*RBc+rl];
-                            a00=_mm256_loadu_ps(reinterpret_cast<const float*>(p+0*RBc));
-                            a01=_mm256_loadu_ps(reinterpret_cast<const float*>(p+1*RBc));
-                            a10=_mm256_loadu_ps(reinterpret_cast<const float*>(p+0*RBc+1));
-                            a11=_mm256_loadu_ps(reinterpret_cast<const float*>(p+1*RBc+1));
-                            a20=_mm256_loadu_ps(reinterpret_cast<const float*>(p+0*RBc+2));
-                            a21=_mm256_loadu_ps(reinterpret_cast<const float*>(p+1*RBc+2));
-                            a30=_mm256_loadu_ps(reinterpret_cast<const float*>(p+0*RBc+3));
-                            a31=_mm256_loadu_ps(reinterpret_cast<const float*>(p+1*RBc+3));
+                            a00=p[0*RBc].value;
+                            a01=p[1*RBc].value;
+                            a10=p[0*RBc+1].value;
+                            a11=p[1*RBc+1].value;
+                            a20=p[0*RBc+2].value;
+                            a21=p[1*RBc+2].value;
+                            a30=p[0*RBc+3].value;
+                            a31=p[1*RBc+3].value;
                         }
                         const float* w=wpanel.data();
                         for(std::size_t s=0;s<kc;s+=8){
@@ -903,26 +993,26 @@ bool gemm_q8_0_kblk_repack_avx2(const std::uint8_t* repacked, std::size_t row_of
                             a30=_mm256_fmadd_ps(v3,x0,a30);a31=_mm256_fmadd_ps(v3,x1,a31);
                         }
                         p=&partial[t*RBc+rl];
-                        _mm256_storeu_ps(reinterpret_cast<float*>(p+0*RBc),a00);
-                        _mm256_storeu_ps(reinterpret_cast<float*>(p+1*RBc),a01);
-                        _mm256_storeu_ps(reinterpret_cast<float*>(p+0*RBc+1),a10);
-                        _mm256_storeu_ps(reinterpret_cast<float*>(p+1*RBc+1),a11);
-                        _mm256_storeu_ps(reinterpret_cast<float*>(p+0*RBc+2),a20);
-                        _mm256_storeu_ps(reinterpret_cast<float*>(p+1*RBc+2),a21);
-                        _mm256_storeu_ps(reinterpret_cast<float*>(p+0*RBc+3),a30);
-                        _mm256_storeu_ps(reinterpret_cast<float*>(p+1*RBc+3),a31);
+                        p[0*RBc].value=a00;
+                        p[1*RBc].value=a01;
+                        p[0*RBc+1].value=a10;
+                        p[1*RBc+1].value=a11;
+                        p[0*RBc+2].value=a20;
+                        p[1*RBc+2].value=a21;
+                        p[0*RBc+3].value=a30;
+                        p[1*RBc+3].value=a31;
                     }else{
                         __m256 a0,a1,a2,a3;
-                        __m256* p;
+                        VectorAccumulator* p;
                         if(first_panel){
                             a0=_mm256_setzero_ps();a1=_mm256_setzero_ps();
                             a2=_mm256_setzero_ps();a3=_mm256_setzero_ps();
                         }else{
                             p=&partial[t*RBc+rl];
-                            a0=_mm256_loadu_ps(reinterpret_cast<const float*>(p+0));
-                            a1=_mm256_loadu_ps(reinterpret_cast<const float*>(p+1));
-                            a2=_mm256_loadu_ps(reinterpret_cast<const float*>(p+2));
-                            a3=_mm256_loadu_ps(reinterpret_cast<const float*>(p+3));
+                            a0=p[0].value;
+                            a1=p[1].value;
+                            a2=p[2].value;
+                            a3=p[3].value;
                         }
                         const float* w=wpanel.data();
                         for(std::size_t s=0;s<kc;s+=8){
@@ -937,18 +1027,18 @@ bool gemm_q8_0_kblk_repack_avx2(const std::uint8_t* repacked, std::size_t row_of
                             a3=_mm256_fmadd_ps(v3,x0,a3);
                         }
                         p=&partial[t*RBc+rl];
-                        _mm256_storeu_ps(reinterpret_cast<float*>(p+0),a0);
-                        _mm256_storeu_ps(reinterpret_cast<float*>(p+1),a1);
-                        _mm256_storeu_ps(reinterpret_cast<float*>(p+2),a2);
-                        _mm256_storeu_ps(reinterpret_cast<float*>(p+3),a3);
+                        p[0].value=a0;
+                        p[1].value=a1;
+                        p[2].value=a2;
+                        p[3].value=a3;
                     }
                 }
             }
         }
         for(std::size_t t=0;t<tokens;++t){
-            const __m256* prow=&partial[t*RBc];
+            const VectorAccumulator* prow=&partial[t*RBc];
             for(std::size_t rl=0;rl<RBc;++rl){
-                _mm256_store_ps(lane,prow[rl]);
+                _mm256_store_ps(lane,prow[rl].value);
                 output[t*output_row_stride+r0+rl]=lane[0]+lane[1]+lane[2]+lane[3]+lane[4]+lane[5]+lane[6]+lane[7];
             }
         }
@@ -1171,6 +1261,15 @@ inline void dequant_tq2_panel(const std::uint8_t* wrow, std::size_t k0,
     }
 }
 
+template<NewQuantKind Kind>
+void dequant_new_quant_panel(const std::uint8_t* wrow,std::size_t k0,std::size_t kc,float* dst){
+    const auto block=new_quant_elements(Kind), bytes=new_quant_bytes(Kind);
+    for(std::size_t i=0;i<kc;i+=8){
+        const auto col=k0+i;
+        _mm256_storeu_ps(dst+i,new_quant_decode8(wrow+(col/block)*bytes,unsigned(col%block),Kind));
+    }
+}
+
 using DequantPanelFn = void (*)(const std::uint8_t*, std::size_t, std::size_t, float*);
 
 bool gemm_kblk_impl(const std::uint8_t* weights, const float* input, float* output,
@@ -1180,23 +1279,23 @@ bool gemm_kblk_impl(const std::uint8_t* weights, const float* input, float* outp
     constexpr std::size_t kMR = 4, kNR = 2;
     if (!weights || !input || !output || !tokens || !rows || !columns) return false;
     const std::size_t rows_main = (rows / kMR) * kMR;
-    std::vector<__m256> partial(std::size_t(tokens) * kMR);
+    std::vector<VectorAccumulator> partial(std::size_t(tokens) * kMR);
     std::vector<float> wpanel(std::size_t(kMR) * kKc);
     alignas(32) float lane[8];
     for (std::size_t r0 = 0; r0 < rows_main; r0 += kMR) {
-        for (auto& p : partial) p = _mm256_setzero_ps();
+        for (auto& p : partial) p.value = _mm256_setzero_ps();
         for (std::size_t k0 = 0; k0 < columns; k0 += kKc) {
             const std::size_t kc = std::size_t((kKc < columns - k0) ? kKc : (columns - k0));
             for (std::size_t dr = 0; dr < kMR; ++dr)
                 dequant_panel(weights + (r0 + dr) * row_bytes, k0, kc, wpanel.data() + dr * kKc);
             for (std::size_t t = 0; t < tokens; t += kNR) {
                 const float* in0 = input + t * columns + k0;
-                __m256* base = &partial[t * kMR];
+                VectorAccumulator* base = &partial[t * kMR];
                 if (t + 1 < tokens) {
                     const float* in1 = input + (t + 1) * columns + k0;
-                    __m256* base1 = &partial[(t + 1) * kMR];
-                    __m256 b0t = base[0], b1t = base[1], b2t = base[2], b3t = base[3];
-                    __m256 b0u = base1[0], b1u = base1[1], b2u = base1[2], b3u = base1[3];
+                    VectorAccumulator* base1 = &partial[(t + 1) * kMR];
+                    __m256 b0t = base[0].value, b1t = base[1].value, b2t = base[2].value, b3t = base[3].value;
+                    __m256 b0u = base1[0].value, b1u = base1[1].value, b2u = base1[2].value, b3u = base1[3].value;
                     const float* w = wpanel.data();
                     for (std::size_t s = 0; s < kc; s += 8) {
                         const __m256 x0 = _mm256_loadu_ps(in0 + s);
@@ -1210,10 +1309,10 @@ bool gemm_kblk_impl(const std::uint8_t* weights, const float* input, float* outp
                         b2t = _mm256_fmadd_ps(v2, x0, b2t); b2u = _mm256_fmadd_ps(v2, x1, b2u);
                         b3t = _mm256_fmadd_ps(v3, x0, b3t); b3u = _mm256_fmadd_ps(v3, x1, b3u);
                     }
-                    base[0] = b0t; base[1] = b1t; base[2] = b2t; base[3] = b3t;
-                    base1[0] = b0u; base1[1] = b1u; base1[2] = b2u; base1[3] = b3u;
+                    base[0].value = b0t; base[1].value = b1t; base[2].value = b2t; base[3].value = b3t;
+                    base1[0].value = b0u; base1[1].value = b1u; base1[2].value = b2u; base1[3].value = b3u;
                 } else {
-                    __m256 b0 = base[0], b1 = base[1], b2 = base[2], b3 = base[3];
+                    __m256 b0 = base[0].value, b1 = base[1].value, b2 = base[2].value, b3 = base[3].value;
                     const float* w = wpanel.data();
                     for (std::size_t s = 0; s < kc; s += 8) {
                         const __m256 x0 = _mm256_loadu_ps(in0 + s);
@@ -1226,14 +1325,14 @@ bool gemm_kblk_impl(const std::uint8_t* weights, const float* input, float* outp
                         b2 = _mm256_fmadd_ps(v2, x0, b2);
                         b3 = _mm256_fmadd_ps(v3, x0, b3);
                     }
-                    base[0] = b0; base[1] = b1; base[2] = b2; base[3] = b3;
+                    base[0].value = b0; base[1].value = b1; base[2].value = b2; base[3].value = b3;
                 }
             }
         }
         for (std::size_t t = 0; t < tokens; ++t) {
-            const __m256* prow = &partial[t * kMR];
+            const VectorAccumulator* prow = &partial[t * kMR];
             for (std::size_t dr = 0; dr < kMR; ++dr) {
-                _mm256_store_ps(lane, prow[dr]);
+                _mm256_store_ps(lane, prow[dr].value);
                 output[t * output_row_stride + r0 + dr] =
                     lane[0] + lane[1] + lane[2] + lane[3] + lane[4] + lane[5] + lane[6] + lane[7];
             }
@@ -1250,6 +1349,19 @@ bool gemm_kblk_impl(const std::uint8_t* weights, const float* input, float* outp
     return true;
 }
 }  // namespace
+
+template<NewQuantKind Kind>
+bool gemm_new_quant_kblk(const std::uint8_t* w,const float* x,float* y,std::size_t tokens,std::size_t rows,std::size_t cols,std::size_t stride){
+    const auto block=new_quant_elements(Kind);
+    if(!w||!x||!y||!tokens||!rows||!cols||cols%block||(Kind==NewQuantKind::f8_e4m3 && cols%8))return false;
+    return gemm_kblk_impl(w,x,y,tokens,rows,cols,stride,(cols/block)*new_quant_bytes(Kind),256,&dequant_new_quant_panel<Kind>);
+}
+bool gemm_q1_0_kblk_avx2(const std::uint8_t* w,const float* x,float* y,std::size_t t,std::size_t r,std::size_t c,std::size_t s){return gemm_new_quant_kblk<NewQuantKind::q1_0>(w,x,y,t,r,c,s);}
+bool gemm_q2_0_kblk_avx2(const std::uint8_t* w,const float* x,float* y,std::size_t t,std::size_t r,std::size_t c,std::size_t s){return gemm_new_quant_kblk<NewQuantKind::q2_0>(w,x,y,t,r,c,s);}
+bool gemm_q8_1_kblk_avx2(const std::uint8_t* w,const float* x,float* y,std::size_t t,std::size_t r,std::size_t c,std::size_t s){return gemm_new_quant_kblk<NewQuantKind::q8_1>(w,x,y,t,r,c,s);}
+bool gemm_q8_1_f32_kblk_avx2(const std::uint8_t* w,const float* x,float* y,std::size_t t,std::size_t r,std::size_t c,std::size_t s){return gemm_new_quant_kblk<NewQuantKind::q8_1_f32>(w,x,y,t,r,c,s);}
+bool gemm_nvfp4_kblk_avx2(const std::uint8_t* w,const float* x,float* y,std::size_t t,std::size_t r,std::size_t c,std::size_t s){return gemm_new_quant_kblk<NewQuantKind::nvfp4>(w,x,y,t,r,c,s);}
+bool gemm_f8_e4m3_kblk_avx2(const std::uint8_t* w,const float* x,float* y,std::size_t t,std::size_t r,std::size_t c,std::size_t s){return gemm_new_quant_kblk<NewQuantKind::f8_e4m3>(w,x,y,t,r,c,s);}
 
 bool gemm_f16_kblk_avx2(const std::uint8_t* weights, const float* input, float* output,
                         std::size_t tokens, std::size_t rows, std::size_t columns,
@@ -1356,7 +1468,6 @@ void gdn_update_avx2(float* sh, const float* kh, const float* delta, std::size_t
 
 void gdn_output_avx2(const float* sh, const float* qh, float* oh,
                      float scale, std::size_t S) {
-    const __m256 sv = _mm256_set1_ps(scale);
     for (std::size_t j = 0; j < S; ++j) {
         __m256 acc = _mm256_setzero_ps();
         std::size_t i = 0;

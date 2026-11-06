@@ -9,6 +9,7 @@
 #include <type_traits>
 #include <bit>
 #include <sstream>
+#include <cstdlib>
 namespace zen::gguf { namespace {
 class Reader {
     std::ifstream f_;
@@ -45,7 +46,11 @@ bool skip_value(R&r,std::uint32_t t,std::string* str=nullptr,std::uint64_t* numb
     default:return false;
     }
 }
-std::uint64_t tensor_bytes(std::uint32_t type,std::uint64_t elements){
+std::uint64_t tensor_bytes(std::uint32_t type,std::uint64_t elements,Q8_1Layout layout){
+    if(type==9 && layout==Q8_1Layout::fp32_40){
+        if(elements%32 || elements/32>std::numeric_limits<std::uint64_t>::max()/40)return 0;
+        return (elements/32)*40;
+    }
     // Canonical GGML type IDs. This table validates storage size only; it does
     // not imply that ZenInfer has a decoder for every listed quantisation.
     struct T{std::uint32_t id,block,bytes;};
@@ -81,8 +86,16 @@ std::uint64_t tensor_bytes(std::uint32_t type,std::uint64_t elements){
  *         malformed, truncated or hostile input.
  */
 template<class R>
-LoadReport parse_gguf(R& r,std::uint64_t file_size){
+LoadReport parse_gguf(R& r,std::uint64_t file_size,InspectOptions options){
     LoadReport out;
+    // Explicit per-call options take precedence over the process-wide override.
+    // Unspecified (or an invalid environment value) never implies a layout.
+    out.q8_1_layout=options.q8_1_layout;
+    const char* layout_env=std::getenv("ZEN_GGUF_Q8_1_LAYOUT");
+    if(out.q8_1_layout==Q8_1Layout::unspecified && layout_env){
+        if(std::strcmp(layout_env,"fp16")==0)out.q8_1_layout=Q8_1Layout::fp16_36;
+        else if(std::strcmp(layout_env,"fp32")==0)out.q8_1_layout=Q8_1Layout::fp32_40;
+    }
     char magic[4];if(!r.bytes(magic,4)||std::memcmp(magic,"GGUF",4)!=0){out.error="Invalid GGUF magic";return out;}
     std::uint64_t tensors{},metadata{};if(!r.read(out.version)||out.version<2||out.version>3||!r.read(tensors)||!r.read(metadata)){out.error="Unsupported or truncated GGUF header (supports v2/v3)";return out;}
     if(tensors>1000000||metadata>1000000){out.error="GGUF directory count exceeds safety limit";return out;}
@@ -202,9 +215,13 @@ LoadReport parse_gguf(R& r,std::uint64_t file_size){
         d.dimensions.resize(nd);std::uint64_t elements=1;
         for(auto&dim:d.dimensions){if(!r.read(dim)||dim==0||elements>std::numeric_limits<std::uint64_t>::max()/dim){out.error="Invalid tensor dimensions";return out;}elements*=dim;}
         if(!r.read(d.ggml_type)||!r.read(d.offset)){out.error="Truncated tensor descriptor";return out;}
+        if(d.ggml_type==9 && out.q8_1_layout!=Q8_1Layout::fp16_36 && out.q8_1_layout!=Q8_1Layout::fp32_40){
+            out.error="Q8_1 layout is ambiguous (36-byte fp16 or 40-byte fp32): explicitly set ZEN_GGUF_Q8_1_LAYOUT=fp16 or fp32 after verifying the file, or use InspectOptions";
+            return out;
+        }
         // GGML blocks are row-local, not allowed to straddle dimension 0.
         // A total element count divisible by the block is not sufficient.
-        d.byte_size=tensor_bytes(d.ggml_type,d.dimensions[0]) ? tensor_bytes(d.ggml_type,elements) : 0;
+        d.byte_size=tensor_bytes(d.ggml_type,d.dimensions[0],out.q8_1_layout) ? tensor_bytes(d.ggml_type,elements,out.q8_1_layout) : 0;
         d.role=model::infer_tensor_role(d.name);out.tensors.push_back(std::move(d));
     }
     std::uint32_t alignment=32;auto it=out.config.metadata.find("general.alignment");
@@ -270,16 +287,16 @@ public:
     std::uint64_t position()const{return static_cast<std::uint64_t>(off_);}
     bool string(std::string& s){std::uint64_t n{};if(!read(n)||n>(1ull<<24))return false;s.resize(static_cast<std::size_t>(n));return bytes(s.data(),s.size());}
 };
-LoadReport inspect(const std::filesystem::path&path){
+LoadReport inspect(const std::filesystem::path&path,InspectOptions options){
     Reader r(path);
     if(!r.good()){LoadReport out;out.error="Cannot open GGUF file";return out;}
     std::error_code file_ec;const auto file_size=std::filesystem::file_size(path,file_ec);
     if(file_ec){LoadReport out;out.error="Cannot determine GGUF file size";return out;}
-    return parse_gguf(r,file_size);
+    return parse_gguf(r,file_size,options);
 }
-LoadReport inspect_bytes(const std::uint8_t* data,std::size_t size){
+LoadReport inspect_bytes(const std::uint8_t* data,std::size_t size,InspectOptions options){
     BufferReader r(data,size);
-    return parse_gguf(r,static_cast<std::uint64_t>(size));
+    return parse_gguf(r,static_cast<std::uint64_t>(size),options);
 }
 bool read_tensor_f32(const std::filesystem::path& path,const LoadReport& report,
                      std::string_view tensor_name,std::vector<float>& output,std::string* error){
@@ -293,12 +310,14 @@ bool read_tensor_f32(const std::filesystem::path& path,const LoadReport& report,
     for(auto d:desc->dimensions){if(!d||elements>std::numeric_limits<std::uint64_t>::max()/d)return fail("Tensor element count overflow");elements*=d;}
     if(elements>std::numeric_limits<std::size_t>::max()||desc->byte_size>std::numeric_limits<std::size_t>::max()||
        desc->byte_size>static_cast<std::uint64_t>(std::numeric_limits<std::streamsize>::max()))return fail("Tensor exceeds addressable memory");
+    if(desc->ggml_type==9 && report.q8_1_layout!=Q8_1Layout::fp16_36 && report.q8_1_layout!=Q8_1Layout::fp32_40)
+        return fail("Q8_1 layout was not explicitly selected");
     const char* format_name=nullptr;
     switch(desc->ggml_type){
         case 0:format_name="F32";break; case 1:format_name="F16";break;
         case 2:format_name="Q4_0";break; case 3:format_name="Q4_1";break;
         case 6:format_name="Q5_0";break; case 7:format_name="Q5_1";break;
-        case 8:format_name="Q8_0";break; case 9:format_name="Q8_1";break; case 10:format_name="Q2_K";break;
+        case 8:format_name="Q8_0";break; case 9:format_name=report.q8_1_layout==Q8_1Layout::fp32_40?"Q8_1_F32":"Q8_1";break; case 10:format_name="Q2_K";break;
         case 11:format_name="Q3_K";break; case 12:format_name="Q4_K";break;
         case 13:format_name="Q5_K";break; case 14:format_name="Q6_K";break;
         case 15:format_name="Q8_K";break; case 16:format_name="IQ2_XXS";break;
