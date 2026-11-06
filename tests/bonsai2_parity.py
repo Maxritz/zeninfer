@@ -162,11 +162,11 @@ def main():
         if not (gguf.is_file() and npz.is_file()):
             subprocess.run([sys.executable, str(generator), str(gguf), str(npz), *extra], check=True,
                            stdout=subprocess.DEVNULL)
-        data = np.load(npz)
-        ref = data["ref_logits"].astype(np.float32)
-        prompt = data["prompt"]
+        with np.load(npz) as data:
+            ref = data["ref_logits"].astype(np.float32)
+            prompt = data["prompt"]
         results.append(run_case(probe, gguf, ref, prompt, label,
-                                keep_dir=str(workdir) if args.keep else None,
+                                keep_dir=str(workdir),
                                 numeric=args.numeric))
 
     if not args.keep and not args.fixture_dir:
