@@ -108,6 +108,11 @@ inline bool rms_avx2_enabled() noexcept {
     static const bool enabled=[](){const char* e=std::getenv("ZEN_CPU_RMS_AVX2");return !(e&&e[0]=='0');}();
     return enabled;
 }
+// GDN AVX2 gate: ZEN_CPU_GDN_AVX2=0 forces scalar (default on when AVX2/FMA).
+inline bool gdn_avx2_enabled() noexcept {
+    static const bool enabled=[](){const char* e=std::getenv("ZEN_CPU_GDN_AVX2");return !(e&&e[0]=='0');}();
+    return enabled;
+}
 void rms_norm(const float* x,const float* weight,float* y,std::size_t n,float eps){
 #ifdef ZEN_HAS_AVX2_KERNELS
     static const bool avx2=zen::cpu_has_avx2_fma();
@@ -1049,6 +1054,16 @@ bool DenseTransformerRuntime::forward_q35_batch(const std::vector<std::uint32_t>
                     const float* vh=conv_out.data()+t*conv_dim+qk_span+h*S;
                     float* sh=state.data()+h*S*S;
                     const float g=std::exp(a_gate[h]);
+#ifdef ZEN_HAS_AVX2_KERNELS
+                    if (gdn_avx2_enabled()) {
+                        zen::gdn_decay_avx2(sh, g, S*S);
+                        zen::gdn_delta_avx2(sh, kh_, vh, delta.data(), beta[t*NV+h], S);
+                        zen::gdn_update_avx2(sh, kh_, delta.data(), S);
+                        float* oh=gdn_out.data()+t*value_dim+h*S;
+                        zen::gdn_output_avx2(sh, qh, oh, scale, S);
+                    } else
+#endif
+                    {
                     for(std::size_t p=0;p<S*S;++p)sh[p]*=g;
                     for(std::size_t j=0;j<S;++j){
                         float sum=0.0f;for(std::size_t i=0;i<S;++i)sum+=sh[i*S+j]*kh_[i];
@@ -1060,6 +1075,7 @@ bool DenseTransformerRuntime::forward_q35_batch(const std::vector<std::uint32_t>
                     for(std::size_t j=0;j<S;++j){
                         float sum=0.0f;for(std::size_t i=0;i<S;++i)sum+=sh[i*S+j]*qh[i];
                         oh[j]=sum*scale;
+                    }
                     }
                 }
             }

@@ -1037,4 +1037,69 @@ bool gemm_q4k_kblk_avx2(const std::uint8_t* weights, const float* input, float* 
     return gemm_kblk_impl(weights, input, output, tokens, rows, columns,
                          output_row_stride, (columns / 256) * 144, kKc, &dequant_q4k_panel);
 }
+
+// GDN (gated delta net) recurrence AVX2 helpers. State layout row-major S x S:
+// sh[i*S + j]. All operate in-place where noted.
+void gdn_decay_avx2(float* sh, float g, std::size_t n) {
+    const __m256 gv = _mm256_set1_ps(g);
+    std::size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 v = _mm256_loadu_ps(sh + i);
+        v = _mm256_mul_ps(v, gv);
+        _mm256_storeu_ps(sh + i, v);
+    }
+    for (; i < n; ++i) sh[i] *= g;
+}
+
+void gdn_delta_avx2(const float* sh, const float* kh, const float* vh,
+                    float* delta, float beta, std::size_t S) {
+    for (std::size_t j = 0; j < S; ++j) {
+        __m256 acc = _mm256_setzero_ps();
+        std::size_t i = 0;
+        for (; i + 8 <= S; i += 8) {
+            __m256 v = _mm256_set_ps(
+                sh[(i+7)*S + j], sh[(i+6)*S + j], sh[(i+5)*S + j], sh[(i+4)*S + j],
+                sh[(i+3)*S + j], sh[(i+2)*S + j], sh[(i+1)*S + j], sh[(i+0)*S + j]);
+            __m256 k = _mm256_loadu_ps(kh + i);
+            acc = _mm256_fmadd_ps(v, k, acc);
+        }
+        float sum = hsum_ps256(acc);
+        for (; i < S; ++i) sum += sh[i*S + j] * kh[i];
+        delta[j] = (vh[j] - sum) * beta;
+    }
+}
+
+void gdn_update_avx2(float* sh, const float* kh, const float* delta, std::size_t S) {
+    for (std::size_t i = 0; i < S; ++i) {
+        const __m256 kv = _mm256_set1_ps(kh[i]);
+        std::size_t j = 0;
+        for (; j + 8 <= S; j += 8) {
+            __m256 v = _mm256_loadu_ps(sh + i*S + j);
+            __m256 d = _mm256_loadu_ps(delta + j);
+            v = _mm256_fmadd_ps(kv, d, v);
+            _mm256_storeu_ps(sh + i*S + j, v);
+        }
+        for (; j < S; ++j) sh[i*S + j] += kh[i] * delta[j];
+    }
+}
+
+void gdn_output_avx2(const float* sh, const float* qh, float* oh,
+                     float scale, std::size_t S) {
+    const __m256 sv = _mm256_set1_ps(scale);
+    for (std::size_t j = 0; j < S; ++j) {
+        __m256 acc = _mm256_setzero_ps();
+        std::size_t i = 0;
+        for (; i + 8 <= S; i += 8) {
+            __m256 v = _mm256_set_ps(
+                sh[(i+7)*S + j], sh[(i+6)*S + j], sh[(i+5)*S + j], sh[(i+4)*S + j],
+                sh[(i+3)*S + j], sh[(i+2)*S + j], sh[(i+1)*S + j], sh[(i+0)*S + j]);
+            __m256 q = _mm256_loadu_ps(qh + i);
+            acc = _mm256_fmadd_ps(v, q, acc);
+        }
+        float sum = hsum_ps256(acc);
+        for (; i < S; ++i) sum += sh[i*S + j] * qh[i];
+        oh[j] = sum * scale;
+    }
+}
+
 }  // namespace zen

@@ -66,6 +66,19 @@ void silu_mul_avx2(const float* gate, const float* up, float* out, std::size_t n
 // The sum of squares is accumulated in double via __m256d accumulators
 // (see kernels/avx2.cpp for the reduction-order note vs the scalar loop).
 void rms_norm_avx2(const float* x, const float* weight, float* y, std::size_t n, float eps);
+
+// Qwen3.5 GDN (gated delta net) recurrence AVX2 helpers. State layout is
+// row-major S x S per head: sh[i*S + j]. All operate in-place where noted.
+// gdn_decay_avx2: sh[p] *= g for p in [0, n).
+// gdn_delta_avx2: delta[j] = (vh[j] - sum_i sh[i*S+j]*kh[i]) * beta, j in [0,S).
+// gdn_update_avx2: sh[i*S+j] += kh[i]*delta[j].
+// gdn_output_avx2: oh[j] = sum_i sh[i*S+j]*qh[i] * scale.
+void gdn_decay_avx2(float* sh, float g, std::size_t n);
+void gdn_delta_avx2(const float* sh, const float* kh, const float* vh,
+                    float* delta, float beta, std::size_t S);
+void gdn_update_avx2(float* sh, const float* kh, const float* delta, std::size_t S);
+void gdn_output_avx2(const float* sh, const float* qh, float* oh,
+                     float scale, std::size_t S);
 float dot_f32_avx2(const float* a, const float* b, std::size_t n) noexcept;
 void axpy_f32_avx2(float a, const float* x, float* y, std::size_t n) noexcept;
 // Non-Q8 K-blocked batched GEMM (F16, Q4_K). Opt-in via ZEN_CPU_FAST_F16 /
