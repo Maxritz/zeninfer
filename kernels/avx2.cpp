@@ -96,6 +96,60 @@ static inline float hsum_ps256(__m256 v) {
     return _mm_cvtss_f32(s);
 }
 
+// Decode K-quant nibbles directly into vector registers.  Unlike the generic
+// path this does not materialize a 256-float scratch block or horizontally
+// reduce after every block. Q5_K adds a shared high-bit plane to the Q4 layout.
+bool gemv_q4k_q5k_avx2(const std::uint8_t* weights, const float* x, float* y,
+                        std::size_t rows, std::size_t columns, bool q5) {
+    if (!weights || !x || !y || !rows || !columns || columns % 256) return false;
+    const std::size_t block_bytes = q5 ? 176 : 144;
+    const std::size_t blocks = columns / 256;
+    const __m256i mask15 = _mm256_set1_epi32(15);
+    for (std::size_t r = 0; r < rows; ++r) {
+        __m256 acc[4] = {_mm256_setzero_ps(), _mm256_setzero_ps(),
+                         _mm256_setzero_ps(), _mm256_setzero_ps()};
+        for (std::size_t b = 0; b < blocks; ++b) {
+            const std::uint8_t* p = weights + (r * blocks + b) * block_bytes;
+            const float d = q8_half_to_float(std::uint16_t(p[0]) | (std::uint16_t(p[1]) << 8));
+            const float dm = q8_half_to_float(std::uint16_t(p[2]) | (std::uint16_t(p[3]) << 8));
+            const std::uint8_t* scales = p + 4;
+            const std::uint8_t* qh = p + 16;
+            const std::uint8_t* ql = p + (q5 ? 48 : 16);
+            for (unsigned group = 0; group < 8; ++group) {
+                unsigned sc, mn;
+                if (group < 4) { sc = scales[group] & 63u; mn = scales[group + 4] & 63u; }
+                else {
+                    sc = (scales[group + 4] & 15u) | ((scales[group - 4] >> 6) << 4);
+                    mn = (scales[group + 4] >> 4) | ((scales[group] >> 6) << 4);
+                }
+                const __m256 ds = _mm256_set1_ps(d * float(sc));
+                const __m256 ms = _mm256_set1_ps(dm * float(mn));
+                const unsigned shift = (group & 1u) * 4;
+                const unsigned high_bit = group;
+                for (unsigned chunk = 0; chunk < 4; ++chunk) {
+                    std::uint64_t bytes;
+                    std::memcpy(&bytes, ql + (group / 2) * 32 + chunk * 8, 8);
+                    __m256i q = _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(static_cast<long long>(bytes)));
+                    if (shift) q = _mm256_srli_epi32(q, 4);
+                    q = _mm256_and_si256(q, mask15);
+                    if (q5) {
+                        std::memcpy(&bytes, qh + chunk * 8, 8);
+                        __m256i h = _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(static_cast<long long>(bytes)));
+                        h = _mm256_and_si256(_mm256_srlv_epi32(h, _mm256_set1_epi32(high_bit)), _mm256_set1_epi32(1));
+                        q = _mm256_or_si256(q, _mm256_slli_epi32(h, 4));
+                    }
+                    const __m256 w = _mm256_sub_ps(_mm256_mul_ps(ds, _mm256_cvtepi32_ps(q)), ms);
+                    const __m256 xv = _mm256_loadu_ps(x + b * 256 + group * 32 + chunk * 8);
+                    acc[chunk] = _mm256_fmadd_ps(w, xv, acc[chunk]);
+                }
+            }
+        }
+        y[r] = hsum_ps256(_mm256_add_ps(_mm256_add_ps(acc[0], acc[1]),
+                                        _mm256_add_ps(acc[2], acc[3])));
+    }
+    return true;
+}
+
 // Quantise one activation vector to Q8_0 form: 32 int8 per block plus a scale.
 // Used only by the opt-in int8 path below.
 static void quantise_acts_q8_0(const float* x, std::size_t columns,

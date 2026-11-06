@@ -827,6 +827,25 @@ bool gemv(const Format& f,const std::uint8_t*w,const float*x,float*y,
        zen::hip::gemv_q8_0(w,x,y,rows,cols))return true;
 #endif
 #ifdef ZEN_HAS_AVX2_KERNELS
+    // Keep the previous dequantize-then-dot route available for A/B and
+    // numerical triage; K-quant scales are embedded in each GGML block.
+    static const bool kquant_gemv_enabled=[](){
+        const char* e=std::getenv("ZEN_CPU_KQUANT_GEMV");
+        return !(e&&e[0]=='0');
+    }();
+    if (kquant_gemv_enabled && (f.encoding==Encoding::q4_k || f.encoding==Encoding::q5_k) &&
+        cols%256==0 && zen::cpu_has_avx2_fma()) {
+        const bool q5=f.encoding==Encoding::q5_k;
+        const unsigned workers=requested_workers ? requested_workers : zen::ResourceGovernor{}.current_policy().worker_threads;
+        const unsigned count=(rows>=64 && workers>1) ? std::min<unsigned>(workers,static_cast<unsigned>(rows)) : 1;
+        g_gemv_routes.cpu_avx2.fetch_add(1,std::memory_order_relaxed);
+        if(count==1)return zen::gemv_q4k_q5k_avx2(w,x,y,rows,cols,q5);
+        std::atomic<bool> success{true};
+        zen::ComputePool::instance().parallel_for(rows,count,[&](std::size_t first,std::size_t last){
+            if(!zen::gemv_q4k_q5k_avx2(w+first*rb,x,y+first,last-first,cols,q5))success.store(false,std::memory_order_relaxed);
+        });
+        return success.load();
+    }
     if(f.encoding==Encoding::q8_0 && scale==1.0f && zen::cpu_has_avx2_fma()) {
         g_gemv_routes.cpu_avx2.fetch_add(1,std::memory_order_relaxed);
         zen::ResourceGovernor governor;const unsigned workers=requested_workers?requested_workers:governor.current_policy().worker_threads;

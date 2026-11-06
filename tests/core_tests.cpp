@@ -58,7 +58,7 @@ int main(){
         CHECK(!chat::format_legacy_chat("","llama",bad,prompt,&format_error));
     }
     planner::ExecutionPlanner planner;auto prefill_plan=planner.select(planner::Phase::prefill,true,8,512,1024);auto decode_plan=planner.select(planner::Phase::decode,true,1,512,1024);
-    CHECK(prefill_plan.kernel==planner::Kernel::quantized_gemm);CHECK(decode_plan.kernel==planner::Kernel::quantized_gemv);CHECK(prefill_plan.workers>=1&&decode_plan.workers>=1);
+    CHECK(prefill_plan.kernel==planner::Kernel::quantized_gemm);CHECK(decode_plan.kernel==planner::Kernel::quantized_gemv);CHECK(prefill_plan.workers>=1&&decode_plan.workers>=1);CHECK(decode_plan.workers<=prefill_plan.workers);
     CHECK(quant::find("Q1_SIGNED") && quant::find("Q18_SIGNED"));
     CHECK(quant::find("F16")->implemented);
     // ZI-012 GREEN: every GGML storage format must now be executable, not
@@ -197,6 +197,37 @@ int main(){
     check_super_gemv("Q2_K",84);
     check_super_gemv("Q4_K",144);
     check_super_gemv("Q5_K",176);
+    // Realistic multi-block rows and randomized packed scale/high-bit fields.
+    // Compare dispatch (single and parallel) with the scalar dequantizer and
+    // a double-precision dot; also exercise unaligned matrix addresses.
+    for(const char* name : {"Q4_K", "Q5_K"}) {
+        const auto* fmt=quant::find(name);
+        for(std::size_t cols : {std::size_t(256),std::size_t(768),std::size_t(4096)}) {
+            const std::size_t rows=67, rb=quant::row_bytes(*fmt,cols);
+            std::vector<std::uint8_t> storage(rows*rb+1); auto* w=storage.data()+1;
+            std::uint32_t rng=12345;
+            for(std::size_t i=0;i<rows*rb;++i){rng=rng*1664525u+1013904223u;w[i]=std::uint8_t(rng>>24);}
+            for(std::size_t r=0;r<rows;++r)for(std::size_t b=0;b<cols/256;++b){
+                auto* p=w+r*rb+b*fmt->block_bytes;
+                // Finite positive/negative scales and FP16 subnormals.
+                const std::uint16_t ds=(b%3==0?0x0001u:(r%2?0xa800u:0x2800u));
+                const std::uint16_t dm=(b%2?0x2000u:0x1800u);
+                p[0]=std::uint8_t(ds);p[1]=std::uint8_t(ds>>8);
+                p[2]=std::uint8_t(dm);p[3]=std::uint8_t(dm>>8);
+            }
+            std::vector<float> x(cols),decoded(cols),single(rows),parallel(rows);
+            for(std::size_t c=0;c<cols;++c)x[c]=float(int((c*17)%101)-50)*0.013f;
+            CHECK(quant::gemv(*fmt,w,x.data(),single.data(),rows,cols,1.0f,1));
+            CHECK(quant::gemv(*fmt,w,x.data(),parallel.data(),rows,cols,1.0f,4));
+            for(std::size_t r=0;r<rows;++r){
+                CHECK(quant::dequantize(*fmt,w+r*rb,cols,decoded.data()));
+                double ref=0, magnitude=0;
+                for(std::size_t c=0;c<cols;++c){double term=double(decoded[c])*x[c];ref+=term;magnitude+=std::abs(term);}
+                CHECK(std::abs(double(single[r])-ref)<=2e-5*std::max(1.0,magnitude));
+                CHECK(single[r]==parallel[r]);
+            }
+        }
+    }
     check_super_gemv("Q8_K",292);
     check_super_gemv("IQ4_XS",136);
     check_super_gemv("IQ3_XXS",98);
@@ -415,6 +446,8 @@ int main(){
         }
         }
     }
+#ifdef ZEN_HAS_AVX2_KERNELS
+    if(zen::cpu_has_avx2_fma()) {
     // Sequential K-block repack (candidate (a)): repack_q8_0_kblk +
     // gemm_q8_0_kblk_repack_avx2 / gemm_q8_0_kblk_repack_parallel vs the
     // double-precision naive reference, plus bit-identity vs the raw kblk
@@ -467,6 +500,8 @@ int main(){
         }
         }
     }
+    }
+#endif
     // Non-Q8 K-blocked batched GEMM (F16, Q4_K): direct kernel + quant::gemm
     // (process default = plain path; ZEN_CPU_FAST_*=1 steers quant::gemm onto
     // the kernels, and running this binary with the flags covers that route)

@@ -46,6 +46,8 @@ void run_shape(std::size_t T, std::size_t hidden, int reps) {
     const float eps = 1e-5f;
     for (std::size_t t = 0; t < T; ++t)
         rms_scalar(x.data() + t * hidden, w.data(), out_s.data() + t * hidden, hidden, eps);
+    const double scalar_us = bench_best_us(
+        [&]() { for (std::size_t t = 0; t < T; ++t) rms_scalar(x.data() + t * hidden, w.data(), out_s.data() + t * hidden, hidden, eps); }, 2, reps);
 #ifdef ZEN_HAS_AVX2_KERNELS
     for (std::size_t t = 0; t < T; ++t)
         zen::rms_norm_avx2(x.data() + t * hidden, w.data(), out_v.data() + t * hidden, hidden, eps);
@@ -54,8 +56,6 @@ void run_shape(std::size_t T, std::size_t hidden, int reps) {
         const double e = std::abs(double(out_v[i]) - double(out_s[i]));
         if (e > maxerr) maxerr = e;
     }
-    const double scalar_us = bench_best_us(
-        [&]() { for (std::size_t t = 0; t < T; ++t) rms_scalar(x.data() + t * hidden, w.data(), out_s.data() + t * hidden, hidden, eps); }, 2, reps);
     const double avx2_us = bench_best_us(
         [&]() { for (std::size_t t = 0; t < T; ++t) zen::rms_norm_avx2(x.data() + t * hidden, w.data(), out_v.data() + t * hidden, hidden, eps); }, 2, reps);
     const double elems = double(T) * double(hidden);
@@ -72,7 +72,9 @@ void run_shape(std::size_t T, std::size_t hidden, int reps) {
 int main(int argc, char** argv) {
     int reps = 20;
     if (argc > 1) reps = std::max(1, std::atoi(argv[1]));
+#ifdef ZEN_HAS_AVX2_KERNELS
     if (!zen::cpu_has_avx2_fma()) { std::printf("no AVX2+FMA\n"); return 2; }
+#endif
     // Llama-3.2-1B: hidden=2048. Also head_dim=64 (qk norm) and a large slab.
     for (const std::size_t T : {std::size_t(128), std::size_t(171), std::size_t(512), std::size_t(1024)})
         run_shape(T, 2048, reps);
