@@ -591,7 +591,7 @@ bool dequantize(const Format& f,const std::uint8_t* src,std::size_t n,float* dst
             const auto* p=src+b*66; const float d=half_to_float(read16(p)); const auto* qs=p+2;
             unsigned out=0;
             for(std::size_t ib=0;ib<8;++ib){
-                std::uint32_t aux[2];std::memcpy(aux,qs+4*ib,8);
+                std::uint32_t aux[2];std::memcpy(aux,qs+8*ib,8);
                 const auto* aux8=reinterpret_cast<const std::uint8_t*>(aux);
                 const float db=d*(0.5f+float(aux[1]>>28))*0.25f;
                 for(std::size_t l=0;l<4;++l){
@@ -819,8 +819,8 @@ bool dequantize(const Format& f,const std::uint8_t* src,std::size_t n,float* dst
     case Encoding::ptq1_0: {
         // Prism PTQ1_0 (GGUF type 143, block_ptq1_0 = { qs[24]; qh[2]; f16 d; },
         // 28 B): the upstream TQ1_0 base-3 trit packing applied at group size
-        // 128. 24 qs bytes carry 5 trits each (120 values), 2 qh bytes carry 4
-        // trits each (8 values). Digit decode identical to TQ1_0: q = byte*3^n
+        // 128. The 24 qs bytes are staged as 16 then 8 bytes, each emitting
+        // five planes; 2 qh bytes carry the last 8 values. Digit decode: q = byte*3^n
         // truncated to 8 bits, xi = (q*3)>>8, value = (xi-1)*d.
         if(n%128)return false;
         static constexpr unsigned pow3[6]={1,3,9,27,81,243};
@@ -833,7 +833,10 @@ bool dequantize(const Format& f,const std::uint8_t* src,std::size_t n,float* dst
                 return float(int(static_cast<unsigned>(q)*3u>>8)-1)*d;
             };
             unsigned out=0;
-            for(unsigned nn=0;nn<5;++nn)for(unsigned m=0;m<24;++m)dst[b*128+out++]=digit(qs[m],nn);
+            for(unsigned width:{16u,8u}){
+                for(unsigned nn=0;nn<5;++nn)for(unsigned m=0;m<width;++m)dst[b*128+out++]=digit(qs[m],nn);
+                qs+=width;
+            }
             for(unsigned nn=0;nn<4;++nn)for(unsigned j=0;j<2;++j)dst[b*128+out++]=digit(qh[j],nn);
         }
         return true;
@@ -920,6 +923,24 @@ std::size_t row_bytes(const Format& f,std::size_t columns) noexcept {
     }
     return 0;
 }
+#ifdef ZEN_HAS_AVX2_KERNELS
+static bool iq_ptq_fast_enabled(){static const bool enabled=[](){const char* e=std::getenv("ZEN_CPU_FAST_IQ_PTQ");return !(e&&e[0]=='0');}();return enabled;}
+static bool iq_ptq_kind(Encoding encoding,zen::NewQuantKind& kind){
+    switch(encoding){
+    case Encoding::ptq1_0:kind=zen::NewQuantKind::ptq1_0;return true;
+    case Encoding::iq4_nl:kind=zen::NewQuantKind::iq4_nl;return true;
+    case Encoding::iq4_xs:kind=zen::NewQuantKind::iq4_xs;return true;
+    case Encoding::iq2_xxs:kind=zen::NewQuantKind::iq2_xxs;return true;
+    case Encoding::iq2_xs:kind=zen::NewQuantKind::iq2_xs;return true;
+    case Encoding::iq2_s:kind=zen::NewQuantKind::iq2_s;return true;
+    case Encoding::iq3_xxs:kind=zen::NewQuantKind::iq3_xxs;return true;
+    case Encoding::iq3_s:kind=zen::NewQuantKind::iq3_s;return true;
+    case Encoding::iq1_s:kind=zen::NewQuantKind::iq1_s;return true;
+    case Encoding::iq1_m:kind=zen::NewQuantKind::iq1_m;return true;
+    default:return false;
+    }
+}
+#endif
 bool gemv(const Format& f,const std::uint8_t*w,const float*x,float*y,
           std::size_t rows,std::size_t cols,float scale,unsigned requested_workers) {
     zen::diag::Scope trace("quant.gemv",zen::diag::Phase::compute);
@@ -991,6 +1012,18 @@ bool gemv(const Format& f,const std::uint8_t*w,const float*x,float*y,
             if(!fn(w+first*rb,x,y+first,last-first,cols))success.store(false,std::memory_order_relaxed);
         });
         return success.load();
+    }
+    zen::NewQuantKind iq_kind{};
+    if(iq_ptq_fast_enabled() && iq_ptq_kind(f.encoding,iq_kind) && zen::cpu_has_avx2_fma()){
+        const unsigned workers=requested_workers?requested_workers:zen::ResourceGovernor{}.current_policy().worker_threads;
+        const unsigned count=rows>=64&&workers>1?std::min<unsigned>(workers,static_cast<unsigned>(rows)):1;
+        g_gemv_routes.cpu_avx2.fetch_add(1,std::memory_order_relaxed);
+        if(count==1)return zen::gemv_new_quant_avx2(w,x,y,rows,cols,iq_kind);
+        std::atomic<bool> ok{true};
+        zen::ComputePool::instance().parallel_for(rows,count,[&](std::size_t first,std::size_t last){
+            if(!zen::gemv_new_quant_avx2(w+first*rb,x,y+first,last-first,cols,iq_kind))ok.store(false,std::memory_order_relaxed);
+        });
+        return ok.load();
     }
     static const bool new_quant_fast=[](){const char* e=std::getenv("ZEN_CPU_FAST_NEWQUANT");return !(e&&e[0]=='0');}();
     if(new_quant_fast && (f.encoding==Encoding::q1_0||f.encoding==Encoding::q2_0||f.encoding==Encoding::q8_1||f.encoding==Encoding::q8_1_f32||f.encoding==Encoding::nvfp4||f.encoding==Encoding::fp8_e4m3) && zen::cpu_has_avx2_fma()){
@@ -1468,6 +1501,22 @@ bool gemm(const Format& f,const std::uint8_t*w,const float*input,float*output,
         else g_gemm_routes.cpu_avx2.fetch_add(1,std::memory_order_relaxed);
         if(gemm_q8_0_parallel(w,input,output,tokens,rows,cols,rb,requested_workers))return true;
     }
+    if(tokens>=2&&iq_ptq_fast_enabled()&&zen::cpu_has_avx2_fma()){
+        auto fn=f.encoding==Encoding::ptq1_0?zen::gemm_ptq1_0_kblk_avx2:
+                f.encoding==Encoding::iq4_nl?zen::gemm_iq4_nl_kblk_avx2:
+                f.encoding==Encoding::iq4_xs?zen::gemm_iq4_xs_kblk_avx2:
+                f.encoding==Encoding::iq2_xxs?zen::gemm_iq2_xxs_kblk_avx2:
+                f.encoding==Encoding::iq2_xs?zen::gemm_iq2_xs_kblk_avx2:
+                f.encoding==Encoding::iq2_s?zen::gemm_iq2_s_kblk_avx2:
+                f.encoding==Encoding::iq3_xxs?zen::gemm_iq3_xxs_kblk_avx2:
+                f.encoding==Encoding::iq3_s?zen::gemm_iq3_s_kblk_avx2:
+                f.encoding==Encoding::iq1_s?zen::gemm_iq1_s_kblk_avx2:
+                f.encoding==Encoding::iq1_m?zen::gemm_iq1_m_kblk_avx2:nullptr;
+        if(fn){
+            g_gemm_routes.cpu_avx2.fetch_add(1,std::memory_order_relaxed);
+            if(gemm_fast_parallel(fn,w,input,output,tokens,rows,cols,rb,requested_workers))return true;
+        }
+    }
     static const bool new_quant_fast=[](){const char* e=std::getenv("ZEN_CPU_FAST_NEWQUANT");return !(e&&e[0]=='0');}();
     if(tokens>=2&&new_quant_fast&&zen::cpu_has_avx2_fma()){
         auto fn=f.encoding==Encoding::q1_0?zen::gemm_q1_0_kblk_avx2:
@@ -1482,7 +1531,7 @@ bool gemm(const Format& f,const std::uint8_t*w,const float*input,float*output,
         }
     }
     // Non-Q8 fast paths fall back to generic GEMM if the gate, shape, or
-    // kernel fails. Q6_K is ungated; the IQ formats use the generic path.
+    // kernel fails. Q6_K is ungated.
     if(tokens>=2&&zen::cpu_has_avx2_fma()&&cols%32==0){
         if(f.encoding==Encoding::fp16&&f16_fast_enabled()){
             g_gemm_routes.cpu_avx2.fetch_add(1,std::memory_order_relaxed);

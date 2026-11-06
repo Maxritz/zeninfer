@@ -1,6 +1,7 @@
-// Cross-check the GGML Q8_K / TQ / IQ decoders and their generic GEMV path
+// Cross-check the GGML Q8_K / TQ / IQ / PTQ decoders and CPU matrix paths
 // against the independent Python reference produced by iq_reference.py.
 #include "zen/quant.h"
+#include "zen/kernels.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -71,20 +72,19 @@ int main(int argc, char** argv) {
     //    and parallel dispatch.
     for (const auto& fmt_name : std::vector<std::string>{"Q8_K", "TQ1_0", "TQ2_0", "IQ4_XS",
                                                          "IQ2_XXS", "IQ2_XS", "IQ2_S",
-                                                         "IQ3_XXS", "IQ3_S", "IQ1_S", "IQ1_M"}) {
+                                                         "IQ3_XXS", "IQ3_S", "IQ1_S", "IQ1_M", "IQ4_NL", "PTQ1_0"}) {
         std::vector<const Record*> pool;
         for (const auto& rec : records) if (rec.name == fmt_name) pool.push_back(&rec);
         if (pool.empty()) { std::printf("%s: no reference records\n", fmt_name.c_str()); ++failures; continue; }
         const auto* fmt = zen::quant::find(fmt_name);
-        const std::size_t rows = 8, columns = 256, blocks_per_row = columns / fmt->block_elements;
+        const std::size_t rows = 8, columns = 256;
         const std::size_t row_bytes = zen::quant::row_bytes(*fmt, columns);
         std::vector<std::uint8_t> matrix(rows * row_bytes);
         std::vector<float> input(columns), output(rows), expected(rows);
         for (std::size_t i = 0; i < columns; ++i) input[i] = activation(i);
         for (std::size_t r = 0; r < rows; ++r) {
             const Record& rec = *pool[r % pool.size()];
-            for (std::size_t b = 0; b < blocks_per_row; ++b)
-                std::memcpy(matrix.data() + r * row_bytes + b * rec.block.size(), rec.block.data(), rec.block.size());
+            std::memcpy(matrix.data() + r * row_bytes, rec.block.data(), rec.block.size());
             double sum = 0.0;
             for (std::size_t k = 0; k < columns; ++k) sum += double(rec.expected[k]) * input[k];
             expected[r] = float(sum);
@@ -109,6 +109,66 @@ int main(int argc, char** argv) {
                     ++failures;
                 }
             }
+        }
+    }
+
+    // Independent decoded reference with multiple 256-element records per row,
+    // unaligned weights, matrix/panel tails, varied token counts and workers.
+    for(const auto& fmt_name:std::vector<std::string>{"IQ4_NL","IQ4_XS","IQ2_XXS","IQ2_XS","IQ2_S","IQ3_XXS","IQ3_S","IQ1_S","IQ1_M","PTQ1_0"}){
+        std::vector<const Record*> pool;
+        for(const auto& rec:records)if(rec.name==fmt_name)pool.push_back(&rec);
+        const auto* fmt=zen::quant::find(fmt_name);
+        if(!fmt||pool.empty()){++failures;continue;}
+        for(std::size_t columns:{std::size_t(256),std::size_t(768),std::size_t(fmt->block_elements),std::size_t(fmt->block_elements)*3})for(std::size_t rows:{1u,5u,67u}){
+            const auto rb=zen::quant::row_bytes(*fmt,columns);
+            std::vector<std::uint8_t> matrix(rows*rb+1);
+            std::vector<float> x(8*columns), output(8*rows), ref(rows*columns);
+            for(std::size_t c=0;c<x.size();++c)x[c]=activation(c);
+            for(std::size_t r=0;r<rows;++r)for(std::size_t pos=0;pos<columns;pos+=256){
+                const auto& rec=*pool[(r*3+pos/256)%pool.size()];
+                const auto chunk=std::min<std::size_t>(256,columns-pos);
+                std::memcpy(matrix.data()+1+r*rb+zen::quant::row_bytes(*fmt,pos),rec.block.data(),zen::quant::row_bytes(*fmt,chunk));
+                std::copy_n(rec.expected.begin(),chunk,ref.begin()+r*columns+pos);
+            }
+            for(std::size_t tokens:{1u,2u,3u,8u})for(unsigned workers:{1u,4u}){
+                const bool ok=tokens==1?zen::quant::gemv(*fmt,matrix.data()+1,x.data(),output.data(),rows,columns,1,workers):
+                    zen::quant::gemm(*fmt,matrix.data()+1,x.data(),output.data(),tokens,rows,columns,1,workers);
+                ++checks;if(!ok){std::printf("%s matrix dispatch failed\n",fmt_name.c_str());++failures;continue;}
+                for(std::size_t t=0;t<tokens;++t)for(std::size_t r=0;r<rows;++r){
+                    double sum=0,mag=0;
+                    for(std::size_t c=0;c<columns;++c){const double v=double(ref[r*columns+c])*x[t*columns+c];sum+=v;mag+=std::abs(v);}
+                    if(!std::isfinite(output[t*rows+r])||std::abs(double(output[t*rows+r])-sum)>2e-5*std::max(1.0,mag)){
+                        std::printf("%s matrix mismatch rows=%zu cols=%zu tokens=%zu workers=%u\n",fmt_name.c_str(),rows,columns,tokens,workers);
+                        ++failures;goto matrix_failed;
+                    }
+                }
+                matrix_failed:;
+            }
+#ifdef ZEN_HAS_AVX2_KERNELS
+            if(zen::cpu_has_avx2_fma()){
+                using Fn=bool(*)(const std::uint8_t*,const float*,float*,std::size_t,std::size_t,std::size_t,std::size_t);
+                using E=zen::quant::Encoding;
+                Fn fn=fmt->encoding==E::ptq1_0?zen::gemm_ptq1_0_kblk_avx2:
+                    fmt->encoding==E::iq4_nl?zen::gemm_iq4_nl_kblk_avx2:
+                    fmt->encoding==E::iq4_xs?zen::gemm_iq4_xs_kblk_avx2:
+                    fmt->encoding==E::iq2_xxs?zen::gemm_iq2_xxs_kblk_avx2:
+                    fmt->encoding==E::iq2_xs?zen::gemm_iq2_xs_kblk_avx2:
+                    fmt->encoding==E::iq2_s?zen::gemm_iq2_s_kblk_avx2:
+                    fmt->encoding==E::iq3_xxs?zen::gemm_iq3_xxs_kblk_avx2:
+                    fmt->encoding==E::iq3_s?zen::gemm_iq3_s_kblk_avx2:
+                    fmt->encoding==E::iq1_s?zen::gemm_iq1_s_kblk_avx2:
+                    fmt->encoding==E::iq1_m?zen::gemm_iq1_m_kblk_avx2:nullptr;
+                const auto stride=rows+3;std::vector<float> padded(3*stride,-777.f);
+                if(!fn||!fn(matrix.data()+1,x.data(),padded.data(),3,rows,columns,stride)){++failures;}
+                else for(std::size_t t=0;t<3;++t){
+                    for(std::size_t r=0;r<rows;++r){
+                        double sum=0,mag=0;for(std::size_t c=0;c<columns;++c){const double v=double(ref[r*columns+c])*x[t*columns+c];sum+=v;mag+=std::abs(v);}
+                        if(!std::isfinite(padded[t*stride+r])||std::abs(double(padded[t*stride+r])-sum)>2e-5*std::max(1.0,mag)){std::printf("%s padded mismatch\n",fmt_name.c_str());++failures;}
+                    }
+                    for(std::size_t r=rows;r<stride;++r)if(padded[t*stride+r]!=-777.f){std::printf("%s wrote padding\n",fmt_name.c_str());++failures;}
+                }
+            }
+#endif
         }
     }
 

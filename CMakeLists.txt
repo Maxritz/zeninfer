@@ -591,7 +591,11 @@ if(ZEN_BUILD_TESTS)
             "${CMAKE_CURRENT_SOURCE_DIR}/scripts/iq_reference.py"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/iq_tables.h"
             "${CMAKE_CURRENT_BINARY_DIR}/iq_ref.bin"
-    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/scripts/iq_reference.py"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/data/ptq1_0_prism.bin"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/data/iq2_xxs_ggml.bin"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/data/ptq1_0_prism.bin"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/data/iq2_xxs_ggml.bin"
+            "${CMAKE_CURRENT_SOURCE_DIR}/scripts/iq_reference.py"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/iq_tables.h"
     COMMENT "Generating independent IQ decoder reference vectors (Python)")
   add_custom_target(zen_iq_ref DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/iq_ref.bin")

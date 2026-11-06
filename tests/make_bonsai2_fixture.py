@@ -140,10 +140,11 @@ def decode_ptq1_0(block):
     qs, qh = block[0:24], block[24:26]
     out = np.empty(128, dtype=np.float32)
     i = 0
-    for n in range(5):
-        for byte in qs:
-            out[i] = _ptq1_0_digit(byte, n)
-            i += 1
+    for section in (qs[:16], qs[16:]):
+        for n in range(5):
+            for byte in section:
+                out[i] = _ptq1_0_digit(byte, n)
+                i += 1
     for n in range(4):
         for byte in qh:
             out[i] = _ptq1_0_digit(byte, n)
@@ -172,8 +173,9 @@ def encode_ptq1_0(a):
         # OR-ed the five lane constants together, which corrupts every lane: the
         # decoder reads all five, so it saw trits belonging to other positions.
         qs = bytearray(24)
-        for m in range(24):
-            qs[m] = _pack_trits([int(levels[24 * n + m]) for n in range(5)])
+        for start, width, out_start in ((0, 16, 0), (16, 8, 80)):
+            for m in range(width):
+                qs[start + m] = _pack_trits([int(levels[out_start + width * n + m]) for n in range(5)])
         qh = bytearray(2)
         for j in range(2):
             # qh holds 8 trits: lanes 0..3 of two bytes, 8 = 2 * 4 trits
