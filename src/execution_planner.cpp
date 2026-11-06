@@ -17,7 +17,7 @@ Plan ExecutionPlanner::select(Phase phase,bool quantized,std::size_t tokens,std:
         ResourceGovernor governor;const unsigned n=governor.snapshot().logical_cpus;
         return std::max(1u,std::min(n,32u));
     }();
-    const unsigned budget=std::max(policy.worker_threads,logical_workers);
+    const unsigned budget=batch?std::max(policy.worker_threads,logical_workers):policy.worker_threads;
     p.workers=(parallel_units>=32&&columns>=128)?std::max(1u,std::min<unsigned>(budget,static_cast<unsigned>(std::min<std::size_t>(parallel_units,512)))):1u;
     return p;
 }

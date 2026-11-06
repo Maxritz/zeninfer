@@ -396,6 +396,13 @@ const quant::Format* format_for_ggml(std::uint32_t id){
         default:break;}
     return name?quant::find(name):nullptr;
 }
+// Fused D3D12 layer/FFN kernels interpret every matrix as raw Q8_0.
+// A mapped tensor alone does not establish its quantization format.
+#if defined(ZEN_HAS_D3D12)
+bool tensor_is_q8(const DenseTransformerRuntime::Tensor* t) {
+    return t && t->raw && t->format && t->format->encoding==quant::Encoding::q8_0;
+}
+#endif
 // `validate_output=false` skips the output finite scan. Only the per-token decode
 // LM head passes false (ZEN_VALIDATE_LOGITS gate in forward()): it is the one call
 // whose rows == vocab (128256), so the scan is a second full pass over the logit
@@ -602,7 +609,25 @@ void DenseTransformerRuntime::Hadamard::transform(float* x,std::size_t width,std
 void DenseTransformerRuntime::Hadamard::unrotate(float* x,std::size_t width,std::vector<float>& scratch)const{
     (void)x;(void)width;(void)scratch;
 }
+DenseTransformerRuntime::~DenseTransformerRuntime() {
+#if defined(ZEN_HAS_D3D12)
+    for (const auto& entry : tensors_) {
+        const auto& t=entry.second;
+        if (t.raw && t.format && (t.format->encoding==quant::Encoding::q4_k || t.format->encoding==quant::Encoding::q5_k))
+            zen::d3d12::release_kquant_weights(t.raw);
+    }
+#endif
+}
 bool DenseTransformerRuntime::load(const std::filesystem::path& path,std::string* error){
+#if defined(ZEN_HAS_D3D12)
+    // The old mapping may be unmapped on either a successful reload or an
+    // early failure. Drop its cached K-quant entries before addresses can recur.
+    for (const auto& entry : tensors_) {
+        const auto& t=entry.second;
+        if (t.raw && t.format && (t.format->encoding==quant::Encoding::q4_k || t.format->encoding==quant::Encoding::q5_k))
+            zen::d3d12::release_kquant_weights(t.raw);
+    }
+#endif
     zen::diag::Scope trace("model.load",zen::diag::Phase::io);
     auto fail=[&](const std::string& e){if(error)*error=e;loaded_=false;tensors_.clear();mapping_.reset();{std::lock_guard<std::mutex> lock(prefix_cache_mutex_);prefix_cache_.reset();}return false;};
     auto report=gguf::inspect(path);if(!report.ok)return fail("GGUF: "+report.error);
@@ -1626,18 +1651,18 @@ bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& to
         // host ops below. BitNet subln skips the fused path (its norms are
         // CPU), as do non-quantised or differently-shaped weights.
         bool ffn_gpu=false;
+#if defined(ZEN_HAS_D3D12)
         if(use_prefill_gpu&&!config_.bitnet_variant){
             const auto* lo=tensor(p+"attn_output.weight");const auto* lg=tensor(p+"ffn_gate.weight");
             const auto* lu=tensor(p+"ffn_up.weight");const auto* ldw=tensor(p+"ffn_down.weight");
             const auto* lfn=tensor(p+"ffn_norm.weight");
-            if(lo&&lg&&lu&&ldw&&lfn&&lo->raw&&lg->raw&&lu->raw&&ldw->raw&&
+            if(tensor_is_q8(lo)&&tensor_is_q8(lg)&&tensor_is_q8(lu)&&tensor_is_q8(ldw)&&lfn&&
                tensor(p+"attn_q.bias")==nullptr&&tensor(p+"attn_k.bias")==nullptr&&tensor(p+"attn_v.bias")==nullptr){
-#if defined(ZEN_HAS_D3D12)
                 ffn_gpu=zen::d3d12::ffn_prefill_fused(lo->raw,lg->raw,lu->raw,ldw->raw,
                     lfn->values.data(),x.data(),att.data(),x.data(),T,E,QW,F,config_.rms_epsilon);
-#endif
             }
         }
+#endif
         if(ffn_gpu){
             if(!finite_values(x.data(),x.size()))return false;
         }else{
@@ -1728,6 +1753,10 @@ bool DenseTransformerRuntime::forward(std::uint32_t token,std::uint32_t pos,
         if(rope_cos.empty())
             rope_table(config_.rope_dim,pos,config_.rope_base,config_.rope_scaling_type,config_.rope_scaling_factor,config_.rope_original_context,config_.rope_low_freq_factor,config_.rope_high_freq_factor,config_.rope_yarn_beta_fast,config_.rope_yarn_beta_slow,rope_cos,rope_sin);
     };
+    bool pipeline_completed=false;
+    bool lm_head_fused=false;
+    double setup_us = 0.0, pipeline_us = 0.0;
+#if defined(ZEN_HAS_D3D12)
     // Try to run all layers through the GPU pipeline (single submit+wait for all layers)
     // First check if all layers qualify for the pipeline path
     bool all_layers_qualify = true;
@@ -1748,7 +1777,8 @@ bool DenseTransformerRuntime::forward(std::uint32_t token,std::uint32_t pos,
         const auto* ldw=tensor(p+"ffn_down.weight");
         const auto* ln=tensor(p+"attn_norm.weight");const auto* lfn=tensor(p+"ffn_norm.weight");
         if(!config_.use_alibi&&!config_.bitnet_variant&&lq&&lk&&lv&&lo&&lg&&lu&&ldw&&ln&&lfn
-           &&lq->raw&&lk->raw&&lv->raw&&lo->raw&&lg->raw&&lu->raw&&ldw->raw
+           &&tensor_is_q8(lq)&&tensor_is_q8(lk)&&tensor_is_q8(lv)&&tensor_is_q8(lo)
+           &&tensor_is_q8(lg)&&tensor_is_q8(lu)&&tensor_is_q8(ldw)
            &&!tensor(p+"attn_q.bias")&&!tensor(p+"attn_k.bias")&&!tensor(p+"attn_v.bias")
            &&!tensor(p+"attn_q_norm.weight")
            &&device_attention_available(config_.layers,kc[l].size()/KW,KH,D,config_.rms_epsilon)){
@@ -1781,13 +1811,12 @@ bool DenseTransformerRuntime::forward(std::uint32_t token,std::uint32_t pos,
         const char* e = std::getenv("ZEN_D3D12_PIPELINE");
         return !(e && e[0] == '0');
     }();
-    double setup_us = 0.0, pipeline_us = 0.0;
     // Fused LM head plumbing: the pipeline may record final-rmsnorm + vocab GEMV +
     // logits readback into its single submission; fused==true means logits[] is
     // already valid and the host skips both its final rms and the vocab matvec.
     // The backend rejects (fused=false) on kill-switch/VRAM-pressure/shape limits.
     zen::d3d12::LmHeadFuse lm_fuse{};
-    if(pipeline_enabled && all_layers_qualify && pipeline_layers.size() == config_.layers) {
+    if(pipeline_enabled && all_layers_qualify && pipeline_layers.size() == config_.layers && pipeline_layers.size() <= 64) {
         setup_us = tm_setup.us();
         StageTimer tm_pipe(stage_trace);
         zen::d3d12::LayerDecodeParams d3d_layers[64];
@@ -1808,7 +1837,7 @@ bool DenseTransformerRuntime::forward(std::uint32_t token,std::uint32_t pos,
         if(!lm_out)lm_out=tensor("token_embd.weight");
         if(lm_out){
             lm_fuse.output_norm_w=tensor("output_norm.weight")->values.data();
-            lm_fuse.lm_head_w=(lm_out->raw&&lm_out->format)?lm_out->raw:nullptr;
+            lm_fuse.lm_head_w=tensor_is_q8(lm_out)?lm_out->raw:nullptr;
             lm_fuse.vocab_rows=config_.vocab;
             lm_fuse.epsilon=config_.rms_epsilon;
             lm_fuse.logits=logits.data();
@@ -1816,29 +1845,30 @@ bool DenseTransformerRuntime::forward(std::uint32_t token,std::uint32_t pos,
         bool pipeline_ok = zen::d3d12::layer_decode_pipeline(d3d_layers, pipeline_layers.size(), x.data(), x.data(), E, H, KH, D, F, config_.rms_epsilon, lm_fuse.lm_head_w?&lm_fuse:nullptr);
         pipeline_us = tm_pipe.us();
         if (pipeline_ok) {
+            pipeline_completed=true;
+            lm_head_fused=lm_fuse.fused;
             // Pipeline succeeded - skip per-layer path
             if (const char* trace = std::getenv("ZEN_D3D12_TRACE"); trace && trace[0] == '1') {
-                std::printf("[d3d12] pipeline: SUCCESS for token pos=%zu\n", pos);
+                std::printf("[d3d12] pipeline: SUCCESS for token pos=%u\n", pos);
             }
         } else {
             // Pipeline failed - fall through to per-layer path
             all_layers_qualify = false;
             if (const char* trace = std::getenv("ZEN_D3D12_TRACE"); trace && trace[0] == '1') {
-                std::printf("[d3d12] pipeline: FALLBACK for token pos=%zu (pipeline_decode returned false)\n", pos);
+                std::printf("[d3d12] pipeline: FALLBACK for token pos=%u (pipeline_decode returned false)\n", pos);
             }
         }
         
         // Also log when not all layers qualify
         if (!all_layers_qualify && pipeline_layers.size() < config_.layers) {
             if (const char* trace = std::getenv("ZEN_D3D12_TRACE"); trace && trace[0] == '1') {
-                std::printf("[d3d12] pipeline: NOT ALL QUALIFY pipeline_layers=%zu vs config_.layers=%zu\n", pipeline_layers.size(), config_.layers);
+                std::printf("[d3d12] pipeline: NOT ALL QUALIFY pipeline_layers=%zu vs config_.layers=%u\n", pipeline_layers.size(), config_.layers);
             }
         }
     }
 
-    if(all_layers_qualify && pipeline_enabled) {
-        // Pipeline succeeded, skip per-layer path
-    } else {
+#endif
+    if(!pipeline_completed) {
         for(std::uint32_t l=0;l<config_.layers;++l){
         const std::string p="blk."+std::to_string(l)+".";
         // ZI-P8: one map lookup per weight per layer per token. The loop body used
@@ -1860,7 +1890,8 @@ bool DenseTransformerRuntime::forward(std::uint32_t token,std::uint32_t pos,
 #if defined(ZEN_HAS_D3D12)
         {
             if(!config_.use_alibi&&!config_.bitnet_variant&&lq&&lk&&lv&&lo&&lg&&lu&&ldw&&ln&&lfn
-               &&lq->raw&&lk->raw&&lv->raw&&lo->raw&&lg->raw&&lu->raw&&ldw->raw
+               &&tensor_is_q8(lq)&&tensor_is_q8(lk)&&tensor_is_q8(lv)&&tensor_is_q8(lo)
+               &&tensor_is_q8(lg)&&tensor_is_q8(lu)&&tensor_is_q8(ldw)
                &&!qb&&!kb&&!vb
                &&!qnorm
                &&device_attention_available(config_.layers,kc[l].size()/KW,KH,D,config_.rms_epsilon)){
@@ -1999,7 +2030,7 @@ bool DenseTransformerRuntime::forward(std::uint32_t token,std::uint32_t pos,
         }
     }
     }
-    if(!lm_fuse.fused){
+    if(!lm_head_fused){
         rms_norm(x.data(),tensor("output_norm.weight")->values.data(),norm.data(),E,config_.rms_epsilon);
         if(!finite_values(norm.data(),E))return false;
     }
@@ -2018,7 +2049,7 @@ bool DenseTransformerRuntime::forward(std::uint32_t token,std::uint32_t pos,
     StageTimer tm_head(stage_trace);
     // lm_fuse.fused: the pipeline submission already ran final-rmsnorm + vocab GEMV
     // on the device and read the logits back into logits[] — nothing to do here.
-    if(!lm_fuse.fused&&!tensor_matvec(*output,norm.data(),logits.data(),config_.vocab,E,validate_logits))return false;
+    if(!lm_head_fused&&!tensor_matvec(*output,norm.data(),logits.data(),config_.vocab,E,validate_logits))return false;
     if(stage_trace){
         acc_setup+=setup_us;acc_pipeline+=pipeline_us;acc_head+=tm_head.us();++acc_n;
         if(acc_n%2==0){

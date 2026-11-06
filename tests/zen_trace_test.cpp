@@ -9,7 +9,9 @@
 #include <vector>
 
 int main(int argc,char**argv){
+#if defined(ZEN_HAS_D3D12)
     _putenv("ZEN_D3D12_TRACE_LITE=1");
+#endif
     if(argc<2||argc>3){std::cerr<<"usage: zen_runtime_tests model.gguf [draft.gguf]\n";return 2;}
     std::string error;auto runtime=zen::runtime::load_model_runtime(argv[1],nullptr,&error);
     if(!runtime){std::cerr<<"generic adapter load failed: "<<error<<"\n";return 1;}
@@ -47,6 +49,7 @@ int main(int argc,char**argv){
              <<" decode_forward_ms_median="<<decode_ms<<" tokengen_tok_s_median="<<decode_tps
              <<" cache_hit=no warmup=one-distinct-prompt\n";
     
+    #if defined(ZEN_HAS_D3D12)
     // Print D3D12 stats
     const auto& stats = zen::d3d12::stats();
     std::cout << "D3D12_STATS: dispatches=" << stats.dispatches
@@ -64,6 +67,7 @@ int main(int argc,char**argv){
               << " fallbacks=" << stats.fallbacks << "\n";
     
     zen::d3d12::trace_report();
+    #endif
     
     return 0;
 }
