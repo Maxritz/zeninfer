@@ -84,9 +84,10 @@ void gdn_output_avx2(const float* sh, const float* qh, float* oh,
                      float scale, std::size_t S);
 float dot_f32_avx2(const float* a, const float* b, std::size_t n) noexcept;
 void axpy_f32_avx2(float a, const float* x, float* y, std::size_t n) noexcept;
-// Non-Q8 K-blocked batched GEMM (F16, Q4_K). Opt-in via ZEN_CPU_FAST_F16 /
-// ZEN_CPU_FAST_Q4K in quant::gemm (default off); Q6_K/IQ stay on the generic
-// path. 4-row x 2-token micro-tile, K-panel Kc from ZEN_CPU_F16_KC /
+// Non-Q8 K-blocked batched GEMM. F16/Q4_K/BF16 are enabled unless the
+// corresponding ZEN_CPU_FAST_* variable starts with 0; Q6_K is ungated and
+// IQ uses the generic path. 4-row x 2-token micro-tile, K-panel Kc for
+// F16 and Q4_K from ZEN_CPU_F16_KC /
 // ZEN_CPU_Q4K_KC (64/128/256, default 128). The fp32 weight panel [4, Kc]
 // is dequantised once per panel and reused across every token from L1;
 // partials stay __m256 until a single hsum at the end (lane order 0..7), so
