@@ -425,6 +425,8 @@ endif()
 
 
 if(ZEN_BUILD_BENCH)
+  add_executable(zen_kquant_gemv_bench tools/kquant_gemv_bench.cpp)
+  target_link_libraries(zen_kquant_gemv_bench PRIVATE zen_core)
   add_executable(zen_bench bench/main.cpp)
   target_link_libraries(zen_bench PRIVATE zen_core)
   if(ZEN_BUILD_AVX2)
