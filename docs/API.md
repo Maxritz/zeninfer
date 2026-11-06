@@ -41,7 +41,7 @@ Both completion endpoints support:
 - `speculative_tokens` (0-16; greedy speculative decoding proposals, requires `--draft-model`)
 - `stream` (boolean; SSE supported by both endpoints)
 
-Chat messages accept `system`, `user` and `assistant` roles with string content. Common Llama 2, Llama 3 and ChatML prompt layouts are selected from the GGUF chat-template markers. Speculative decoding is greedy-only and requires the draft model to use the exact same token vocabulary as the target. This is not a general Jinja-template interpreter.
+Chat messages accept `system`, `user` and `assistant` roles with string content. Common Llama 2, Llama 3 and ChatML prompt layouts are selected from the GGUF chat-template markers. Speculative decoding supports greedy and stochastic sampling and requires the draft model to use the exact same token vocabulary as the target; the Qwen3.5 hybrid path currently falls back to ordinary generation. This is not a general Jinja-template interpreter.
 
 ## Diagnostics and resource policy
 
@@ -58,4 +58,4 @@ Chat messages accept `system`, `user` and `assistant` roles with string content.
 - Defaults to loopback. No TLS, rate limiting, request deadlines or production-grade abuse protection.
 - Tools/function calling, multimodal content, JSON-schema grammar constraints, logprobs and the Responses API are not implemented.
 
-For API contract testing without a model, build `zen_mock_server` and run the `zen_http_api_smoke` CTest. Mock responses are not model inference.
+For API contract testing without a model, build `zen_mock_server` and run the `zen_http_api_smoke` CTest. Mock responses are not model inference. `zen_http_model_smoke` additionally starts the real server with a generated synthetic Qwen2-layout GGUF and tests completion, streaming, chat and limited concurrency. Its random weights are not a trained model.

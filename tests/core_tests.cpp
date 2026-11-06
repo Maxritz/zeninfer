@@ -679,8 +679,9 @@ int main(){
     check_ggml_type(21,256,110);check_ggml_type(22,256,82);check_ggml_type(23,256,136);
     check_ggml_type(24,1,1);check_ggml_type(25,1,2);check_ggml_type(26,1,4);check_ggml_type(27,1,8);check_ggml_type(28,1,8);
     check_ggml_type(29,256,56);check_ggml_type(30,1,2);check_ggml_type(34,256,54);check_ggml_type(35,256,66);
-    check_ggml_type(39,32,17);
-    for(auto removed:{4u,5u,31u,32u,33u,36u,37u,38u,40u,41u,42u})check_ggml_type(removed,256,0);
+    check_ggml_type(9,32,36);check_ggml_type(39,32,17);check_ggml_type(40,64,36);
+    check_ggml_type(41,128,18);check_ggml_type(42,64,18);check_ggml_type(43,1,1);
+    for(auto removed:{4u,5u,31u,32u,33u,36u,37u,38u})check_ggml_type(removed,256,0);
     // End-to-end GGUF tensor read/decode for a BitNet TQ2_0 block (f16 delta
     // at the end of the 66-byte block, per block_tq2_0={qs[64];d}).
     const auto tqfile=std::filesystem::temp_directory_path()/"zeninfer-bitnet-tq2.gguf";

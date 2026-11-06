@@ -1,48 +1,69 @@
-# ZenInfer GGML/GGUF format support (0.4.4-alpha)
+# ZenInfer CPU GGML/GGUF format support
 
-A parser recognising a storage layout does not mean that a decoder or runtime kernel exists for that format. The three levels are deliberately separate:
+This inventory is against upstream llama.cpp GGML commit
+[`240d68fcfe0c2a1f298c8e18ca181368b1914259`](https://github.com/ggml-org/llama.cpp/blob/240d68fcfe0c2a1f298c8e18ca181368b1914259/ggml/include/ggml.h).
+All its currently defined tensor types below have CPU FP32 decoding, GGUF
+size validation and dense mapped-weight GEMV/GEMM dispatch. This is **format
+coverage**, not a claim that every architecture or checkpoint using those types
+is supported, or that every path has a specialized SIMD kernel.
 
-1. **Size-known**: GGUF tensor directory can be bounds-checked using the canonical GGML type ID, block element count and bytes per block.
-2. **Decoder implemented**: tensor payload can be converted to FP32 by ZenInfer.
-3. **Runtime projection path**: weights can be used directly from mapped storage by quantised GEMV/GEMM.
+| GGML IDs | Types | Elements / bytes per block |
+|---|---|---|
+| 0, 1 | F32, F16 | 1/4, 1/2 |
+| 2, 3 | Q4_0, Q4_1 | 32/18, 32/20 |
+| 6, 7, 8, 9 | Q5_0, Q5_1, Q8_0, Q8_1 | 32/22, 32/24, 32/34, 32/36 |
+| 10–15 | Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K | 256/84, 256/110, 256/144, 256/176, 256/210, 256/292 |
+| 16–20 | IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S, IQ4_NL | 256/66, 256/74, 256/98, 256/50, 32/18 |
+| 21–23 | IQ3_S, IQ2_S, IQ4_XS | 256/110, 256/82, 256/136 |
+| 24–28 | I8, I16, I32, I64, F64 | 1/1, 1/2, 1/4, 1/8, 1/8 |
+| 29, 30 | IQ1_M, BF16 | 256/56, 1/2 |
+| 34, 35 | TQ1_0, TQ2_0 | 256/54, 256/66 |
+| 39–43 | MXFP4, NVFP4, Q1_0, Q2_0, F8_E4M3 | 32/17, 64/36, 128/18, 64/18, 1/1 |
 
-## Runtime decoder formats
+Removed/deprecated IDs 4, 5, 31–33 and 36–38, unknown future IDs and
+unrecognized fork-specific formats are rejected rather than guessed. GGML
+blocks must fit within each row (dimension 0), not just the whole tensor.
 
-| Format | GGML ID | Elements/block | Bytes/block | Decoder | Runtime projection |
-|---|---:|---:|---:|---|---|
-| F32 | 0 | 1 | 4 | Yes | Mapped GEMV/GEMM |
-| F16 | 1 | 1 | 2 | Yes | Mapped row conversion + GEMV/GEMM |
-| Q4_0 | 2 | 32 | 18 | Yes | Block-streaming GEMV/GEMM |
-| Q5_0 | 6 | 32 | 22 | Yes | Block-streaming GEMV/GEMM |
-| Q8_0 | 8 | 32 | 34 | Yes | Fused AVX2 GEMV when available; block-streaming GEMM |
-| Q3_K | 11 | 256 | 110 | Yes | Block-streaming GEMV/GEMM |
-| Q6_K | 14 | 256 | 210 | Yes | Block-streaming GEMV/GEMM |
-| IQ4_NL | 20 | 32 | 18 | Yes | Block-streaming GEMV/GEMM |
-| TQ1_0 | 34 | 256 | 54 | Yes | Block-streaming GEMV/GEMM |
-| TQ2_0 | 35 | 256 | 66 | Yes | Block-streaming GEMV/GEMM |
+### Important compatibility details
 
-The runtime keeps supported matrix weights in a file-backed GGUF mapping. Quantised GEMV/GEMM decodes one block at a time into bounded scratch storage and accumulates the dot products. It does not expand the entire matrix into FP32 RAM.
+* **Q8_1 is the current 36-byte layout**, with FP16 scale and precomputed sum
+  followed by 32 signed bytes. Decoding uses the scale; the sum is ignored.
+  Some old GGML versions used a 40-byte Q8_1 block with FP32 scale and sum
+  under the same ID. GGUF does not reliably distinguish these layouts: padding
+  and following tensors can make the old payload appear large enough. ZenInfer
+  cannot safely auto-detect or reject every old layout; do not load legacy
+  40-byte Q8_1 files without converting them to the current layout.
+* I32/I64/F64 tensors are converted to FP32 for inference and can lose
+  precision; F64 can overflow to infinity. F8_E4M3 preserves signed zero and
+  decodes both NaN codes as NaN. Non-finite model weights may fail runtime
+  finite-value checks. NVFP4 follows the pinned upstream UE4M3 decoding even
+  for noncanonical scale bytes with the top bit set.
+* CPU execution uses existing specialized kernels for some formats and a
+  generic row-decode/dot or GEMM path for others. In particular, the five
+  newly added Q8_1/NVFP4/Q1_0/Q2_0/F8_E4M3 paths do **not** yet have bespoke
+  fused kernels. There is no claim of uniform performance or full optimization.
+  Supported matrices are mapped; generic paths use bounded scratch rather than
+  expanding the entire matrix. Vector/non-matrix tensors can be decoded to RAM.
+* This work adds **no GPU support**; GPU format support is a separate question.
 
-## Parser-known, decoder not implemented
+## Explicit fork and ZenInfer formats
 
-The parser knows the canonical storage sizes for Q4_1 (3), Q5_1 (7), Q8_1 (9), Q2_K (10), Q4_K (12), Q5_K (13), Q8_K (15), IQ2_XXS (16), IQ2_XS (17), IQ3_XXS (18), IQ1_S (19), IQ3_S (21), IQ2_S (22), IQ4_XS (23), I8/I16/I32/I64/F64 (24-28), IQ1_M (29), BF16 (30), MXFP4 (39). IDs 40 and above are not part of the upstream GGML type enum used by this parser; fork-specific extensions are rejected unless explicitly added with a verified storage contract.
+The parser also recognizes fork-specific ROCmFP4 IDs 100/101 (32/18 and
+32/17) and PrismML PTQ1_0 ID 143 (128/28). These ID assignments are not
+universal across forks. `Q1_SIGNED` through `Q18_SIGNED` and `TERNARY2` are
+ZenInfer reference encodings, not GGUF quantization IDs. Altogether the CPU
+registry has 58 encodings, including scalar types and these reference formats.
 
-These formats are **not runtime-decodable** in this release unless listed in the runtime decoder table above. A tensor using one of them is no longer rejected merely because the parser lacks its block-size entry, but loading it for inference still fails closed with an explicit unsupported decoder error.
+## Verification scope
 
-GGML IDs 4, 5, 31-33 and 36-38 are removed/deprecated storage types and are rejected. They are not assigned guessed block sizes.
-
-## ZenInfer-specific reference encodings
-
-`Q1_SIGNED` through `Q18_SIGNED` and `TERNARY2` are ZenInfer reference encodings. They are not GGUF quantisation IDs and must not be confused with GGML's Q1_0/Q2_0 types.
-
-## Correctness policy
-
-Decoder tests include synthetic block-layout checks and runtime fixture tests. The two supplied GGUF fixtures are exercised by optional CTest runtime tests. Independent reference parity was measured for the current dense Llama forward path on those two fixtures; broader format/model parity remains outstanding.
-
-
-## BitNet decoder scope added in 0.4.4-alpha
-
-These are BitNet ternary storage decoders. TQ2_0 uses the GGML interleaved
-4-by-32 layout and maps 2-bit codes to -1, 0, +1, +2 times the block scale.
-A trained ternary checkpoint generally uses the first three values. Decoder
-support alone does not mean a complete BitNet architecture adapter exists.
+`zen_new_quant_tests` checks new formats against checked-in vectors generated
+from the pinned upstream GGML reference (Q1_0, Q2_0, NVFP4 and F8_E4M3), and
+independent arithmetic for Q8_1 and scalar types. It tests all 256 FP8 codes,
+all 256 NVFP4 scale bytes, unaligned multi-block decoding, truncated GGUFs,
+GGUF tensor reads and CPU matmuls. `zen_new_quant_runtime` compares mapped
+projection execution against independently decoded F32 twin weights in a small
+synthetic Qwen3.5 fixture. The broader CPU sweep covers all registry formats,
+but mostly compares matmul with ZenInfer's own decoder. See
+`docs/CPU_QUANT_PROGRESS.md` for earlier independent checks and benchmark
+limits. Real checkpoints for these new types and Windows/target-CPU performance
+have not been validated by these tests.

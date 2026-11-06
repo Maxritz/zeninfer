@@ -1,0 +1,16 @@
+ZENMODEL 1
+# Synthetic seeded kernel micro-model, not a trained GGUF checkpoint.
+name=zen-bitnet-tiny
+architecture=bitnet_ternary
+fixture_kind=architecture_kernel_micro_model
+hidden=64
+vocab=128
+layers=3
+experts=0
+top_k=0
+group_size=256
+seed=31032
+prefill_tokens=64
+decode_tokens=64
+weight_format=tq2_0
+expected_checksum=4.36009153

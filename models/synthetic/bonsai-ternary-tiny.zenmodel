@@ -1,0 +1,16 @@
+ZENMODEL 1
+# Synthetic seeded kernel micro-model, not a trained GGUF checkpoint.
+name=zen-bonsai-ternary-tiny
+architecture=bonsai_ternary_qwen3
+fixture_kind=architecture_kernel_micro_model
+hidden=128
+vocab=128
+layers=2
+experts=0
+top_k=0
+group_size=128
+seed=31033
+prefill_tokens=64
+decode_tokens=64
+weight_format=ternary
+expected_checksum=21.74052589

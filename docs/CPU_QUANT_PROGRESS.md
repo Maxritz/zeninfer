@@ -100,5 +100,19 @@ pure CSV. Environment gates are cached at first use; set them before launching.
 Next: optimize and independently validate remaining formats; benchmark actual
 GGUF models and per-format tensor mixes on the target CPU with worker scaling,
 separate uncached prefill/decode, stable process settings, and model-level
-correctness. GPU work is deferred. A previously observed Qwen3.5 incremental
-decode mismatch must also be resolved before trusting hybrid generation rates.
+correctness. GPU work is deferred. The previously observed Qwen3.5 synthetic
+incremental mismatch was subsequently fixed and regression-tested; see
+[CPU runtime validation](CPU_RUNTIME_VALIDATION.md). This does not establish
+real-model hybrid correctness or performance.
+
+## CPU format-coverage follow-up
+
+The earlier 48-format sweep in this document predates the additional upstream GGML types.
+The current registry contains 58 formats, including scalar types. Q8_1,
+NVFP4, Q1_0, Q2_0 and F8_E4M3 have GGUF decoding and generic CPU GEMV/GEMM;
+I8/I16/I32/I64/F64 are also converted to FP32. These are functional fallback
+paths, not new fused SIMD implementations. Independent upstream-GGML golden
+blocks and a synthetic mapped-weight runtime test were added. For the precise
+format inventory, Q8_1 legacy-layout warning and validation limits, see
+[FORMAT_SUPPORT.md](FORMAT_SUPPORT.md). No real-model or target-CPU throughput
+measurement was made for the new types.
