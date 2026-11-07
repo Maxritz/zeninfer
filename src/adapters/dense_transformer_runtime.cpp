@@ -630,6 +630,12 @@ DenseTransformerRuntime::~DenseTransformerRuntime() {
         zen::d3d12::release_q8_0_weights(t.raw);
         zen::d3d12::release_kquant_weights(t.raw);
     }
+    // Weights are not the only per-model state. The device KV cache holds this model's
+    // activations, the residency record claims positions were written, and the resident
+    // prefill keeps a layer's output for the next one to read; a fresh instance that
+    // inherits any of them reads the previous model's data.
+    zen::d3d12::prefill_residual_invalidate();
+    zen::d3d12::kv_cache_reset();
 #endif
 }
 bool DenseTransformerRuntime::load(const std::filesystem::path& path,std::string* error){
@@ -642,6 +648,10 @@ bool DenseTransformerRuntime::load(const std::filesystem::path& path,std::string
         zen::d3d12::release_q8_0_weights(t.raw);
         zen::d3d12::release_kquant_weights(t.raw);
     }
+    // Same rule for the device activation state as for the weights: the KV cache, its
+    // residency record and the resident prefill all describe the model being replaced.
+    zen::d3d12::prefill_residual_invalidate();
+    zen::d3d12::kv_cache_reset();
 #endif
     zen::diag::Scope trace("model.load",zen::diag::Phase::io);
     auto fail=[&](const std::string& e){if(error)*error=e;loaded_=false;tensors_.clear();mapping_.reset();{std::lock_guard<std::mutex> lock(prefix_cache_mutex_);prefix_cache_.reset();}return false;};

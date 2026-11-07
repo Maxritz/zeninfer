@@ -503,6 +503,11 @@ struct State {
     std::size_t n_cap{};
     std::size_t y_cap{};
     ComPtr<ID3D12Resource> stage;
+    // Buffers replaced by a growing upload/scratch allocation. Freeing them at the
+    // replacement is a use-after-free: the queue may still be reading the old copy, and
+    // the GPU reports that as a page fault far away from the free (the VA is unmapped and
+    // reused by the next small allocation). They are released by the next completed wait.
+    std::vector<ComPtr<ID3D12Resource>> retired;
     void* stage_cpu{};
     std::size_t stage_cap{};
 
@@ -1010,6 +1015,10 @@ const char* breadcrumb_op_name(D3D12_AUTO_BREADCRUMB_OP op) {
     }
 }
 
+// The page-fault address reported by DRED, recorded by report_device_removed and
+// consumed by dump_live_ranges.
+static std::uint64_t g_fault_va{};
+
 // Device-removal forensics.
 //
 // Once the device is removed every later CreateCommittedResource fails with
@@ -1058,6 +1067,7 @@ void report_device_removed(ID3D12Device* device, const char* where) {
     if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&dred)))) {
         D3D12_DRED_PAGE_FAULT_OUTPUT pf{};
         if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&pf)) && pf.PageFaultVA != 0) {
+            g_fault_va = pf.PageFaultVA;
             std::fprintf(stderr, "[d3d12]   DRED page-fault VA=0x%llx\n",
                          static_cast<unsigned long long>(pf.PageFaultVA));
         }
@@ -1079,6 +1089,59 @@ void report_device_removed(ID3D12Device* device, const char* where) {
                 }
             }
         }
+    }
+}
+
+// A buffer freed while a submission may still read it is a use-after-free that the GPU
+// reports as a page fault much later, and at an address that has already been handed to
+// a smaller allocation. Moving the old resource to `retired` keeps its VA mapped until
+// the next wait, which is the first point at which the queue is known to be drained.
+void retire(State& s, ComPtr<ID3D12Resource>& res) {
+    if (res) {
+        s.retired.push_back(std::move(res));
+    }
+    res.Reset();
+}
+
+// A page fault names only an address. Printing every range the backend still holds
+// separates "read past the end of a live buffer" from "read a buffer that was
+// released", which are different bugs with different fixes.
+void dump_live_ranges(State& s) {
+    if (!g_fault_va) {
+        return;
+    }
+    auto show = [](const char* tag, ID3D12Resource* r) {
+        if (!r) {
+            return;
+        }
+        const std::uint64_t va = r->GetGPUVirtualAddress();
+        const std::uint64_t width = r->GetDesc().Width;
+        const bool hit = g_fault_va >= va && g_fault_va < va + width;
+        std::fprintf(stderr, "[d3d12]   live %-8s va=0x%llx bytes=%llu%s\n", tag,
+                     static_cast<unsigned long long>(va),
+                     static_cast<unsigned long long>(width),
+                     hit ? "   <== FAULT INSIDE" : "");
+    };
+    show("stage", s.stage.Get());
+    show("xbuf", s.xbuf.Get());
+    show("ybuf", s.ybuf.Get());
+    show("params", s.params.Get());
+    show("kcache", s.kcache.Get());
+    show("vcache", s.vcache.Get());
+    show("fa_q", s.fa_q.Get());
+    show("fa_qup", s.fa_qup.Get());
+    show("fa_qdev", s.fa_qdev.Get());
+    show("datt", s.datt.Get());
+    show("dq", s.dq.Get());
+    show("hbuf", s.hbuf.Get());
+    show("fbuf", s.fbuf.Get());
+    show("qact", s.qact.Get());
+    show("wbuf", s.wbuf.Get());
+    show("nbuf", s.nbuf.Get());
+    show("front", s.front_dev.Get());
+    show("xscale", s.gemm_xscale.Get());
+    for (const auto& kv : s.weights) {
+        show("weights", kv.second.quants.Get());
     }
 }
 
@@ -1120,6 +1183,15 @@ ComPtr<ID3D12Resource> create_buffer(ID3D12Device* device, std::uint64_t bytes,
             }
         }
         return nullptr;
+    }
+    // Device VAs are what a recorded root SRV still points at after the resource is
+    // gone, so a page fault can only be attributed by matching its address against the
+    // allocations in the trace.
+    if (trace_env && trace_env[0] == '1') {
+        std::printf("[d3d12] alloc va=0x%llx bytes=%llu heap=%d\n",
+                    static_cast<unsigned long long>(res->GetGPUVirtualAddress()),
+                    static_cast<unsigned long long>(bytes), static_cast<int>(heap));
+        std::fflush(stdout);
     }
     return res;
 }
@@ -1253,10 +1325,15 @@ bool wait_gpu(State& s) {
             WaitForSingleObject(s.fence_event, INFINITE);
         }
     }
+    // Reaching here proves the queue drained the work submitted before the signal, which
+    // is the first safe point to release buffers that were replaced while in flight.
+    s.retired.clear();
+
     // A TDR'd dispatch still signals the fence, so "the wait returned" is not proof
     // the work succeeded. Ask the device directly before the caller reuses anything.
     if (FAILED(s.device->GetDeviceRemovedReason())) {
         report_device_removed(s.device.Get(), "wait_gpu");
+        dump_live_ranges(s);
         return false;
     }
     return true;
@@ -2054,7 +2131,13 @@ bool init_locked(State& s) {
 
 bool reserve_scratch(State& s, std::size_t x_bytes, std::size_t y_bytes) {
     if (x_bytes > s.x_cap) {
-        s.xbuf.Reset();
+        if (s.trace && s.xbuf) {
+            std::printf("[d3d12] retire va=0x%llx bytes=%llu (xbuf scratch)\n",
+                        static_cast<unsigned long long>(s.xbuf->GetGPUVirtualAddress()),
+                        static_cast<unsigned long long>(s.x_cap));
+            std::fflush(stdout);
+        }
+        retire(s, s.xbuf);
         s.xbuf = create_buffer(s.device.Get(), x_bytes, upload_heap_type(),
                                upload_heap_state());
         if (!s.xbuf || FAILED(s.xbuf->Map(0, nullptr, &s.x_cpu))) {
@@ -2067,8 +2150,14 @@ bool reserve_scratch(State& s, std::size_t x_bytes, std::size_t y_bytes) {
         // New scratch: whatever was resident in the old ybuf is gone.
         s.prefill_resident = false;
         s.prefill_host_valid = true;
-        s.ybuf.Reset();
-        s.yread.Reset();
+        if (s.trace && s.ybuf) {
+            std::printf("[d3d12] retire va=0x%llx bytes=%llu (ybuf scratch)\n",
+                        static_cast<unsigned long long>(s.ybuf->GetGPUVirtualAddress()),
+                        static_cast<unsigned long long>(s.y_cap));
+            std::fflush(stdout);
+        }
+        retire(s, s.ybuf);
+        retire(s, s.yread);
         s.ybuf = create_buffer(s.device.Get(), y_bytes, D3D12_HEAP_TYPE_DEFAULT,
                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
@@ -2097,6 +2186,14 @@ bool upload_weights(State& s, const std::uint8_t* weights, std::size_t rows,
     if (s.adapter.dedicated_vram) {
         const std::uint64_t budget = s.adapter.dedicated_vram / 100 * kVRAMBudgetPercent;
         if (s.weight_bytes + quant_bytes + scale_bytes > budget) {
+            if (s.trace) {
+                std::printf("[d3d12] residency CLEAR: weight_bytes=%llu need=%llu budget=%llu "
+                            "entries=%zu\n",
+                            static_cast<unsigned long long>(s.weight_bytes),
+                            static_cast<unsigned long long>(quant_bytes + scale_bytes),
+                            static_cast<unsigned long long>(budget), s.weights.size());
+                std::fflush(stdout);
+            }
             s.weights.clear();
             s.weight_bytes = 0;
         }
@@ -2121,7 +2218,7 @@ bool upload_weights(State& s, const std::uint8_t* weights, std::size_t rows,
     // transfers themselves: ~1.3 GB of first-touch faults across 112 uploads.
     if (needed > s.stage_cap) {
         const auto stage_start = std::chrono::steady_clock::now();
-        s.stage.Reset();
+        retire(s, s.stage);
         s.stage_cpu = nullptr;
         s.stage = create_buffer(s.device.Get(), needed, upload_heap_type(),
                                 upload_heap_state());
@@ -2251,7 +2348,7 @@ WeightEntry* lookup_kquant_weights(State& s, const std::uint8_t* weights,
                                  D3D12_RESOURCE_STATE_COPY_DEST);
     if (!entry.quants) return nullptr;
     if (bytes > s.stage_cap) {
-        s.stage.Reset(); s.stage_cpu = nullptr; s.stage_cap = 0;
+        retire(s, s.stage); s.stage_cpu = nullptr; s.stage_cap = 0;
         s.stage = create_buffer(s.device.Get(), bytes, upload_heap_type(), upload_heap_state());
         if (!s.stage || FAILED(s.stage->Map(0, nullptr, &s.stage_cpu))) return nullptr;
         s.stage_cap = bytes;
@@ -2949,6 +3046,18 @@ bool gemm_batch_locked(State& s, const float* x, const GemmTask* tasks,
         s.list->SetComputeRootShaderResourceView(2, scales[i]);
         s.list->SetComputeRootShaderResourceView(3, s.xbuf->GetGPUVirtualAddress());
         s.list->SetComputeRootUnorderedAccessView(5, s.ybuf->GetGPUVirtualAddress() + offsets[i]);
+        if (s.trace) {
+            // A page fault names only an address, so the bindings recorded for this list
+            // are what attribute it to a tensor.
+            std::printf("[d3d12] gemmB i=%zu rows=%zu cols=%zu tok=%zu w=0x%llx s=0x%llx "
+                        "x=0x%llx y=0x%llx\n",
+                        i, tasks[i].rows, columns, tokens,
+                        static_cast<unsigned long long>(quants[i]->GetGPUVirtualAddress()),
+                        static_cast<unsigned long long>(scales[i]),
+                        static_cast<unsigned long long>(s.xbuf->GetGPUVirtualAddress()),
+                        static_cast<unsigned long long>(s.ybuf->GetGPUVirtualAddress() + offsets[i]));
+            std::fflush(stdout);
+        }
         if (use_i8_b) {
             s.list->Dispatch(static_cast<UINT>((tasks[i].rows + 127u) / 128u),
                              static_cast<UINT>((tokens + 63u) / 64u), 1);
@@ -5824,6 +5933,12 @@ void release_q8_0_weights(const std::uint8_t* weights) noexcept {
     State& s=state(); std::lock_guard<std::mutex> lock(s.mutex);
     auto it=s.weights.find(weights);
     if (it!=s.weights.end() && it->second.kind==0) {
+        if (s.trace) {
+            std::printf("[d3d12] free va=0x%llx bytes=%llu (q8_0 weights)\n",
+                        static_cast<unsigned long long>(it->second.quants->GetGPUVirtualAddress()),
+                        static_cast<unsigned long long>(it->second.quants->GetDesc().Width));
+            std::fflush(stdout);
+        }
         s.weight_bytes-=it->second.quants->GetDesc().Width;
         s.weights.erase(it);
         s.stats.weight_bytes=s.weight_bytes;
@@ -5835,6 +5950,12 @@ void release_kquant_weights(const std::uint8_t* weights) noexcept {
     State& s=state(); std::lock_guard<std::mutex> lock(s.mutex);
     auto it=s.weights.find(weights);
     if (it!=s.weights.end() && (it->second.kind==4 || it->second.kind==5)) {
+        if (s.trace) {
+            std::printf("[d3d12] free va=0x%llx bytes=%llu (kquant weights)\n",
+                        static_cast<unsigned long long>(it->second.quants->GetGPUVirtualAddress()),
+                        static_cast<unsigned long long>(it->second.quants->GetDesc().Width));
+            std::fflush(stdout);
+        }
         s.weight_bytes-=it->second.quants->GetDesc().Width;
         s.weights.erase(it);
         s.stats.weight_bytes=s.weight_bytes;
