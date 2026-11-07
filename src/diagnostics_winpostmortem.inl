@@ -1,30 +1,30 @@
 #if defined(_WIN32)
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
-#include <exception>
 #include <windows.h>
-#include <string>
 
 static void zen_diag_write_str_literal(HANDLE f, const char* s) noexcept {
     if (!f) return;
-    DWORD written = 0;
-    WriteFile(f, s, static_cast<DWORD>(std::strlen(s)), &written, nullptr);
+    for (std::size_t i = 0; s[i] != '\0'; ++i) {
+        char c = s[i];
+        DWORD written = 0;
+        WriteFile(f, &c, 1, &written, nullptr);
+    }
 }
 
 static void zen_diag_dump_breadcrumbs_text(HANDLE f) noexcept {
-    if (!zen::diag::breadcrumbs_enabled()) {
+    if (!breadcrumbs_enabled()) {
         zen_diag_write_str_literal(f, "\n[r] breadcrumbs disabled at dump time\n");
         return;
     }
-    const std::uint64_t end = zen::diag::g_breadcrumb_next.load(std::memory_order_acquire);
-    const std::uint64_t limit = (std::min)(static_cast<std::uint64_t>(256), zen::diag::kBreadcrumbCapacity);
+    const std::uint64_t end = g_breadcrumb_next.load(std::memory_order_acquire);
+    const std::uint64_t limit = (std::min)(static_cast<std::uint64_t>(256), kBreadcrumbCapacity);
     const std::uint64_t begin = (end > limit) ? (end - limit) : 0;
     char buf[384];
     std::size_t n = 0;
     n += std::sprintf(buf + n, "\nBreadcrumbs (global atomic ring; oldest first; event IDs are defined by caller)\n");
     for (std::uint64_t seq = begin; seq < end; ++seq) {
-        const zen::diag::BreadcrumbSlot& slot = zen::diag::g_breadcrumbs_ring[seq % zen::diag::kBreadcrumbCapacity];
+        const BreadcrumbSlot& slot = g_breadcrumbs_ring[seq % kBreadcrumbCapacity];
         const std::uint64_t before = slot.sequence.load(std::memory_order_acquire);
         if (before != seq) continue;
         const std::uint64_t ts = slot.timestamp_ns.load(std::memory_order_relaxed);
@@ -46,7 +46,8 @@ static void zen_diag_dump_breadcrumbs_text(HANDLE f) noexcept {
 static void zen_diag_dump_path(char* path, std::size_t path_cap) noexcept {
     const char* dir = std::getenv("ZEN_DIAG_CRASH_DUMP_DIR");
     if (dir && dir[0] && dir[0] != ' ') {
-        std::size_t dlen = std::strlen(dir);
+        std::size_t dlen = 0;
+        while (dir[dlen] != '\0') ++dlen;
         if (dlen < path_cap - 64) {
             std::sprintf(path, "%s\\zen_diag_crash_breadcrumbs.txt", dir);
             return;
@@ -65,6 +66,21 @@ static void zen_diag_dump_breadcrumbs_safe(HANDLE f) noexcept {
     WriteFile(f, buf, static_cast<DWORD>(n), &written, nullptr);
     zen_diag_dump_breadcrumbs_text(f);
     zen_diag_write_str_literal(f, "\n[end]\n");
+}
+
+static void zen_diag_atexit_dump() noexcept {
+    char path[512];
+    zen_diag_dump_path(path, sizeof(path));
+    HANDLE f = CreateFileA(path, GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) {
+        f = CreateFileA("zen_diag_crash_breadcrumbs.txt", GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS,
+                        FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (f == INVALID_HANDLE_VALUE) return;
+    }
+    zen_diag_write_str_literal(f, "ZenInfer atexit breadcrumb dump\n");
+    zen_diag_dump_breadcrumbs_safe(f);
+    CloseHandle(f);
 }
 
 static LONG CALLBACK zen_diag_seh_filter(EXCEPTION_POINTERS* ep) noexcept {
@@ -121,20 +137,7 @@ static void zen_diag_init_once() noexcept {
     zen::diag::breadcrumb(1, 1, 0);
     SetUnhandledExceptionFilter(reinterpret_cast<LPTOP_LEVEL_EXCEPTION_FILTER>(zen_diag_seh_filter));
     std::set_terminate(&zen_diag_terminate_handler);
-    std::atexit([]() noexcept {
-        char path[512];
-        zen_diag_dump_path(path, sizeof(path));
-        HANDLE f = CreateFileA(path, GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS,
-                               FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (f == INVALID_HANDLE_VALUE) {
-            f = CreateFileA("zen_diag_crash_breadcrumbs.txt", GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS,
-                            FILE_ATTRIBUTE_NORMAL, nullptr);
-            if (f == INVALID_HANDLE_VALUE) return;
-        }
-        zen_diag_write_str_literal(f, "ZenInfer atexit breadcrumb dump\n");
-        zen_diag_dump_breadcrumbs_safe(f);
-        CloseHandle(f);
-    });
+    std::atexit(&zen_diag_atexit_dump);
 }
 
 static const bool zen_diag_postmortem_init = (zen_diag_init_once(), true);

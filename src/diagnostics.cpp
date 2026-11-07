@@ -44,6 +44,10 @@ std::atomic<std::uint64_t> g_breadcrumb_next{0};
 thread_local Scope* t_scope_top = nullptr;
 }
 
+#if defined(_WIN32)
+#include "diagnostics_winpostmortem.inl"
+#endif
+
 void set_trace_enabled(bool v) noexcept { g_trace.store(v, std::memory_order_relaxed); }
 bool trace_enabled() noexcept { return g_trace.load(std::memory_order_relaxed); }
 void reset_trace() noexcept { std::lock_guard lock(g_mutex); g_aggregates.clear(); }
@@ -139,14 +143,9 @@ void dump_breadcrumbs(std::ostream& out, std::size_t count) {
         Breadcrumb b{seq, slot.timestamp_ns.load(std::memory_order_relaxed),
                      slot.event.load(std::memory_order_relaxed),
                      slot.arg0.load(std::memory_order_relaxed), slot.arg1.load(std::memory_order_relaxed)};
-        if (slot.sequence.load(std::memory_order_acquire) != seq) continue;
         out << "seq=" << b.sequence << " t_ns=" << b.timestamp_ns << " event=" << b.event
             << " arg0=" << b.arg0 << " arg1=" << b.arg1 << '\n';
     }
 }
-
-#if defined(_WIN32)
-#include "diagnostics_winpostmortem.inl"
-#endif
 
 } // namespace zen::diag
