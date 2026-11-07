@@ -66,7 +66,7 @@ int main(int argc, char** argv) {
     };
 
     std::mt19937 rng(7);
-    double total_flops = 0.0, total_ms = 0.0;
+    double total_flops = 0.0, total_ms = 0.0, total_kernel_ms = 0.0;
 
     for (const auto& sh : shapes) {
         std::vector<std::uint8_t> w;
@@ -85,6 +85,11 @@ int main(int argc, char** argv) {
             continue;
         }
 
+        // Wall clock per call includes a synchronous fence wait (~1 ms) and the host
+        // memcpy of x and y, which dwarf the kernel at these sizes: stripping 96% of the
+        // kernel's arithmetic in an ablation moved wall time by 4%. So report the
+        // stamped dispatch time separately and divide that for the real TFLOP/s.
+        const zen::d3d12::Stats s0 = zen::d3d12::stats();
         double best = 1e9;
         for (int i = 0; i < iters; ++i) {
             const auto t = Clock::now();
@@ -96,18 +101,28 @@ int main(int argc, char** argv) {
             best = ms < best ? ms : best;
         }
 
+        const zen::d3d12::Stats s1 = zen::d3d12::stats();
+        const double kernel_ms = double(s1.gpu_us - s0.gpu_us) / 1000.0 / iters;
+        const double fence_ms = double(s1.wait_us - s0.wait_us) / 1000.0 / iters;
+        const double copy_ms = double(s1.gpu_copy_us - s0.gpu_copy_us) / 1000.0 / iters;
         const double flops = 2.0 * double(tokens) * double(sh.rows) * double(sh.cols);
         const double tflops = flops / (best / 1000.0) / 1e12;
+        const double ktflops = kernel_ms > 0.0 ? flops / (kernel_ms / 1000.0) / 1e12 : 0.0;
         total_flops += flops;
         total_ms += best;
-        std::printf("%-9s %5zux%-5zu t=%-4zu cold=%7.1f ms best=%7.2f ms  %6.2f TFLOP/s\n",
-                    sh.name, sh.rows, sh.cols, tokens, cold_ms, best, tflops);
+        total_kernel_ms += kernel_ms;
+        std::printf("%-9s %5zux%-5zu t=%-4zu best=%7.2f ms (%.2f) | kernel=%6.2f ms "
+                    "(%6.2f TFLOP/s) fence=%5.2f copy=%5.2f ms\n",
+                    sh.name, sh.rows, sh.cols, tokens, best, tflops, kernel_ms, ktflops,
+                    fence_ms, copy_ms);
     }
 
     if (total_ms > 0) {
-        std::printf("TOTAL %.2f ms for %.1f GFLOP -> %.2f TFLOP/s "
+        std::printf("TOTAL wall %.2f ms -> %.2f TFLOP/s | kernel %.2f ms -> %.2f TFLOP/s "
                     "(one layer's 4 big matmuls; 8000 tok/s needs ~15.4)\n",
-                    total_ms, total_flops / 1e9, total_flops / (total_ms / 1000.0) / 1e12);
+                    total_ms, total_flops / (total_ms / 1000.0) / 1e12,
+                    total_kernel_ms,
+                    total_kernel_ms > 0.0 ? total_flops / (total_kernel_ms / 1000.0) / 1e12 : 0.0);
     }
     return 0;
 }

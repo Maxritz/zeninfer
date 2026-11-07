@@ -94,6 +94,10 @@ bool gemm_q8_0_kblk_repack_avx2(const std::uint8_t* repacked, std::size_t row_of
                     std::size_t output_row_stride);
 // ZI-P4 elementwise helpers. The scalar reference for each lives in the caller.
 void silu_mul_avx2(const float* gate, const float* up, float* out, std::size_t n);
+// All-finite predicate: false if any element is NaN or +/-Inf. 8 lanes per
+// compare; the scalar reference is the isfinite() loop in the runtime and the
+// decision is identical for every input.
+bool all_finite_f32_avx2(const float* p, std::size_t n) noexcept;
 // RMSNorm: y[i] = x[i] * inv * weight[i], inv = 1/sqrt(mean(x^2)+eps).
 // The sum of squares is accumulated in double via __m256d accumulators
 // (see kernels/avx2.cpp for the reduction-order note vs the scalar loop).

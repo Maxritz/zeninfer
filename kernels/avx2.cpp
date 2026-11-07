@@ -637,6 +637,23 @@ void silu_mul_avx2(const float* gate, const float* up, float* out, std::size_t n
     for(;i<n;++i){const float z=gate[i];out[i]=(z/(1.0f+std::exp(-z)))*up[i];}
 }
 
+// Vectorised all-finite predicate. A value is finite iff (unordered-compare
+// false) |v| <= FLT_MAX: NaN makes the ordered compare false and +/-Inf exceeds
+// FLT_MAX, so one compare per 8 lanes replaces 8 isfinite() calls. The scalar
+// reference is the loop in dense_transformer_runtime.cpp and the accept/reject
+// decision is identical for every input, including NaN payloads and -0.0.
+bool all_finite_f32_avx2(const float* p, std::size_t n) noexcept {
+    const __m256 absmask=_mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+    const __m256 maxv=_mm256_set1_ps(std::numeric_limits<float>::max());
+    std::size_t i=0;
+    for(;i+8<=n;i+=8){
+        const __m256 v=_mm256_and_ps(_mm256_loadu_ps(p+i),absmask);
+        if(_mm256_movemask_ps(_mm256_cmp_ps(v,maxv,_CMP_LE_OQ))!=0xff)return false;
+    }
+    for(;i<n;++i)if(!std::isfinite(p[i]))return false;
+    return true;
+}
+
 float dot_f32_avx2(const float* a, const float* b, std::size_t n) noexcept {
     __m256 s0=_mm256_setzero_ps(),s1=_mm256_setzero_ps();
     std::size_t i=0;
