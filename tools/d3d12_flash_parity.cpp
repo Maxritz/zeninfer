@@ -145,6 +145,10 @@ int main() {
     bool ok = true;
     // Llama-3.2-1B real shape, single prefill batch.
     ok = run(128, 32, 8, 64, 256, 20261120u, "llama-prefill") && ok;
+    // Qwen3-4B real shape: head_dim == 128 and 4 query heads per KV head. That pair is
+    // what the keys-across-lanes kernel requires, so without this case it is covered
+    // only by the model-level token-id oracles.
+    ok = run(128, 32, 8, 128, 256, 20261124u, "qwen3-prefill") && ok;
     // Same shape, one token (degenerate: softmax over a single key).
     ok = run(1, 32, 8, 64, 256, 20261121u, "single-token") && ok;
     // MQA: every query head shares one KV head.

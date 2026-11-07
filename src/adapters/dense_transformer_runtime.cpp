@@ -127,7 +127,16 @@ void qk_rms_norm(float* values,std::uint32_t heads,std::uint32_t head_dim,
     for(std::uint32_t h=0;h<heads;++h)
         rms_norm(values+std::size_t(h)*head_dim,weight,values+std::size_t(h)*head_dim,head_dim,epsilon);
 }
-bool finite_values(const float* p,std::size_t n){for(std::size_t i=0;i<n;++i)if(!std::isfinite(p[i]))return false;return true;}
+// Guard used after every prefill GEMM and normalisation. The scalar isfinite()
+// loop cost ~1 ns/element over ~5.7 M elements per layer -- 190 ms of a warm
+// 512-token prefill, the second largest item after the GEMM itself. The AVX2
+// predicate makes exactly the same accept/reject decision for every input.
+bool finite_values(const float* p,std::size_t n){
+#ifdef ZEN_HAS_AVX2_KERNELS
+    static const bool avx2=zen::cpu_has_avx2_fma();
+    if(avx2&&n>=8)return zen::all_finite_f32_avx2(p,n);
+#endif
+    for(std::size_t i=0;i<n;++i)if(!std::isfinite(p[i]))return false;return true;}
 // ZI-P4: elementwise helpers. The scalar path stays the numerical reference for
 // non-AVX2 builds; the AVX2 implementations live in kernels/avx2.cpp.
 static inline float dot_f32(const float* a,const float* b,std::size_t n){
@@ -615,8 +624,11 @@ DenseTransformerRuntime::~DenseTransformerRuntime() {
 #if defined(ZEN_HAS_D3D12)
     for (const auto& entry : tensors_) {
         const auto& t=entry.second;
-        if (t.raw && t.format && (t.format->encoding==quant::Encoding::q4_k || t.format->encoding==quant::Encoding::q5_k))
-            zen::d3d12::release_kquant_weights(t.raw);
+        if (!t.raw) continue;
+        // Every layout, not just the K-quants: the device caches any weight tensor by
+        // host address, and a later allocation can land on the same address.
+        zen::d3d12::release_q8_0_weights(t.raw);
+        zen::d3d12::release_kquant_weights(t.raw);
     }
 #endif
 }
@@ -626,8 +638,9 @@ bool DenseTransformerRuntime::load(const std::filesystem::path& path,std::string
     // early failure. Drop its cached K-quant entries before addresses can recur.
     for (const auto& entry : tensors_) {
         const auto& t=entry.second;
-        if (t.raw && t.format && (t.format->encoding==quant::Encoding::q4_k || t.format->encoding==quant::Encoding::q5_k))
-            zen::d3d12::release_kquant_weights(t.raw);
+        if (!t.raw) continue;
+        zen::d3d12::release_q8_0_weights(t.raw);
+        zen::d3d12::release_kquant_weights(t.raw);
     }
 #endif
     zen::diag::Scope trace("model.load",zen::diag::Phase::io);
@@ -682,7 +695,14 @@ bool DenseTransformerRuntime::load(const std::filesystem::path& path,std::string
             break;}
     }
     if(!config_.head_dim)config_.head_dim=config_.embedding/config_.heads;
-    config_.rope_dim=meta_uint_arch(report.config,architecture_name_,"rope.dimension_count",config_.embedding/config_.heads);
+    // Rotary dimension: an explicit rope.dimension_count wins. The fallback must be
+    // head_dim, NOT embedding/heads: llama.cpp defaults n_rot to attention.key_length
+    // (llama-model.cpp: n_rot_full = n_embd_head_k_full) and only Llama-family arches
+    // constrain it to equal head_dim anyway. The two differ for Qwen3-family models
+    // whose q width is heads*head_dim != embedding (e.g. Qwen3-4B: head_dim 128 vs
+    // 2560/32 = 80), where the old fallback rotated only 80 of 128 dims and used
+    // base^(-2i/80) for every angle.
+    config_.rope_dim=meta_uint_arch(report.config,architecture_name_,"rope.dimension_count",config_.head_dim);
     config_.rope_base=meta_float_arch(report.config,architecture_name_,"rope.freq_base",10000.0f);
     config_.rms_epsilon=meta_float_arch(report.config,architecture_name_,"attention.layer_norm_rms_epsilon",1.0e-5f);
     config_.rope_scaling_type=meta_string_arch(report.config,architecture_name_,"rope.scaling.type");
@@ -1363,49 +1383,19 @@ bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& to
     bool prefill_tables_built=false;
     std::future<void> prefetch;
     for(std::uint32_t l=0;l<config_.layers;++l){if(prefetch.valid())prefetch.get();if(l+1<config_.layers&&prefetch_enabled_)prefetch=std::async(std::launch::async,[this,l]{prefetch_layer(l+1);});const std::string p="blk."+std::to_string(l)+".";
-        bool attn_norm_gpu=false;
+        // Host copy of the attention norm only for decode and for the host fallback:
+        // the fused prefill front stages the RESIDUAL and normalises it inside its own
+        // submission, which takes a ~0.47 ms/layer CPU loop out of every prefill layer.
+        auto compute_attn_norm=[&]() -> bool {
+            bool attn_norm_gpu=false;
 #if defined(ZEN_HAS_D3D12)
-        if(use_prefill_gpu)attn_norm_gpu=zen::d3d12::rms_norm(x.data(),tensor(p+"attn_norm.weight")->values.data(),norm.data(),T,E,config_.rms_epsilon);
+            if(use_prefill_gpu)attn_norm_gpu=zen::d3d12::rms_norm(x.data(),tensor(p+"attn_norm.weight")->values.data(),norm.data(),T,E,config_.rms_epsilon);
 #endif
-        if(!attn_norm_gpu)for(std::size_t t=0;t<T;++t)rms_norm(x.data()+t*E,tensor(p+"attn_norm.weight")->values.data(),norm.data()+t*E,E,config_.rms_epsilon);
-        if(!finite_values(norm.data(),norm.size()))return false;
-        if(T==1){
-            // Decode: Q, K and V share the normed input, so submitting them as one
-            // batch replaces two extra queue round trips (~70us each) per layer.
-            const DenseTransformerRuntime::Tensor* const qkv_t[3]={tensor(p+"attn_q.weight"),tensor(p+"attn_k.weight"),tensor(p+"attn_v.weight")};
-            float* const qkv_y[3]={q.data(),k.data(),v.data()};
-            const std::size_t qkv_r[3]={QW,KW,KW};
-            if(!tensor_matvec_batch(qkv_t,norm.data(),qkv_y,qkv_r,3,E))return false;
-        }else{
-            // Prefill Q|K|V share the normed input: submit as one batched GEMM
-            // when ZEN_D3D12_BATCH=1, otherwise tensor_gemm_batch loops the
-            // single path. Attn O and FFN down stay separate (attention / SiLU
-            // in between).
-            const DenseTransformerRuntime::Tensor* const qkv_t[3]={tensor(p+"attn_q.weight"),tensor(p+"attn_k.weight"),tensor(p+"attn_v.weight")};
-            float* const qkv_y[3]={q.data(),k.data(),v.data()};
-            const std::size_t qkv_r[3]={QW,KW,KW};
-            if(!tensor_gemm_batch(qkv_t,norm.data(),qkv_y,qkv_r,3,T,E))return false;
-        }
-        if(!finite_values(q.data(),q.size())||!finite_values(k.data(),k.size())||!finite_values(v.data(),v.size()))return false;
-        for(const auto& item:std::array<std::pair<const char*,std::vector<float>*>,3>{{{"attn_q.bias",&q},{"attn_k.bias",&k},{"attn_v.bias",&v}}})if(const auto*bias=tensor(p+item.first)){const std::size_t width=item.first[5]=='q'?QW:KW;if(bias->values.size()!=width)return false;for(std::size_t t=0;t<T;++t)for(std::size_t i=0;i<width;++i)(*item.second)[t*width+i]+=bias->values[i];}
-        const auto* qnorm=tensor(p+"attn_q_norm.weight");const auto* knorm=tensor(p+"attn_k_norm.weight");
-        if((qnorm==nullptr)!=(knorm==nullptr))return false;
-        if(qnorm&&(qnorm->values.size()!=D||knorm->values.size()!=D))return false;
-        {zen::diag::Scope scope_rope("transformer.prefill.rope",zen::diag::Phase::compute);
-        // Collect all K/V pointers for batched KV cache append
-        std::vector<std::size_t> kv_layers;
-        std::vector<std::size_t> kv_positions;
-        std::vector<const float*> kv_ks;
-        std::vector<const float*> kv_vs;
-        kv_layers.reserve(T);
-        kv_positions.reserve(T);
-        kv_ks.reserve(T);
-        kv_vs.reserve(T);
-
-        // Build the per-token tables once (layer 0's scope); reuse for every layer
-        // and for BOTH the CPU fallback and the GPU prefill rope. rope_dim is
-        // already validated even and <= D (forward load check), but apply the same
-        // clamp rope() applies so signed-off shapes cannot drift apart.
+            {zen::diag::Scope san("prefill.attn_norm",zen::diag::Phase::compute);
+            if(!attn_norm_gpu)for(std::size_t t=0;t<T;++t)rms_norm(x.data()+t*E,tensor(p+"attn_norm.weight")->values.data(),norm.data()+t*E,E,config_.rms_epsilon);}
+            return finite_values(norm.data(),norm.size());
+        };
+        if(T==1&&!compute_attn_norm())return false;
         if(!prefill_tables_built){
             prefill_tables_built=true;
             if(!config_.use_alibi){
@@ -1425,15 +1415,125 @@ bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& to
                 }
             }
         }
+        bool front_done=false;
+        bool ffn_fused_done=false;
+        if(T==1){
+            // Decode: Q, K and V share the normed input, so submitting them as one
+            // batch replaces two extra queue round trips (~70us each) per layer.
+            const DenseTransformerRuntime::Tensor* const qkv_t[3]={tensor(p+"attn_q.weight"),tensor(p+"attn_k.weight"),tensor(p+"attn_v.weight")};
+            float* const qkv_y[3]={q.data(),k.data(),v.data()};
+            const std::size_t qkv_r[3]={QW,KW,KW};
+            if(!tensor_matvec_batch(qkv_t,norm.data(),qkv_y,qkv_r,3,E))return false;
+        }else{
+            // Prefill Q|K|V share the normed input: submit as one batched GEMM
+            // when ZEN_D3D12_BATCH=1, otherwise tensor_gemm_batch loops the
+            // single path. Attn O and FFN down stay separate (attention / SiLU
+            // in between).
+            const DenseTransformerRuntime::Tensor* const qkv_t[3]={tensor(p+"attn_q.weight"),tensor(p+"attn_k.weight"),tensor(p+"attn_v.weight")};
+            float* const qkv_y[3]={q.data(),k.data(),v.data()};
+            const std::size_t qkv_r[3]={QW,KW,KW};
+            // Device-resident attention front half: QKV GEMM, qk norm, rope and the
+            // KV append as ONE submission. Before this each was its own submit and
+            // each bounced its activation through host memory (~10 MB/layer at T=512).
+            // Only taken when the chain can do the whole job: no attention biases, no
+            // ALiBi or sliding window, Q8_0 projections, a usable device KV cache, and
+            // a rope table that exists.
+#if defined(ZEN_HAS_D3D12)
+            {
+                // The integer kernel is where this chain wins, so it is also enabled by
+                // ZEN_D3D12_GEMM_I8 alone - the same intent probe the FFN chain uses.
+                static const bool front_i8_on=[](){const char* e=std::getenv("ZEN_D3D12_GEMM_I8");return e&&e[0]=='1';}();
+                // Escape hatch, so the fused front can be A/B-ed in one window.
+                static const bool front_off=[](){const char* e=std::getenv("ZEN_D3D12_ATTN_FRONT");return e&&e[0]=='0';}();
+                // The front keeps q/k/v in VRAM, so it is only legal when the device
+                // flash path will consume them; with ZEN_D3D12_FLASH=0 the CPU
+                // attention needs host q/k/v and this chain must not run.
+                static const bool front_flash_on=[](){const char* e=std::getenv("ZEN_D3D12_FLASH");return !(e&&e[0]=='0');}();
+                const auto* fq=tensor(p+"attn_q_norm.weight");const auto* fk=tensor(p+"attn_k_norm.weight");
+                // Whole-layer fusion needs the FFN half's weights known before the
+                // attention dispatches are recorded, because the FFN scratch must be
+                // reserved first. ZEN_D3D12_LAYER_FUSED=0 keeps the two submissions.
+                static const bool layer_fused_off=[](){const char* e=std::getenv("ZEN_D3D12_LAYER_FUSED");return e&&e[0]=='0';}();
+                const auto* lo=tensor(p+"attn_output.weight");const auto* lg=tensor(p+"ffn_gate.weight");
+                const auto* lu=tensor(p+"ffn_up.weight");const auto* ldw=tensor(p+"ffn_down.weight");
+                const auto* lfn=tensor(p+"ffn_norm.weight");
+                zen::d3d12::PrefillFfn ffn_args{};
+                bool layer_fused=false;
+                if(!layer_fused_off&&lo&&lg&&lu&&ldw&&lfn&&tensor_is_q8(lo)&&tensor_is_q8(lg)&&
+                   tensor_is_q8(lu)&&tensor_is_q8(ldw)){
+                    ffn_args.attn_output_w=lo->raw;ffn_args.gate_w=lg->raw;ffn_args.up_w=lu->raw;
+                    ffn_args.down_w=ldw->raw;ffn_args.norm_weight=lfn->values.data();
+                    ffn_args.x=x.data();ffn_args.out=x.data();ffn_args.ffn_rows=F;
+                    ffn_args.keep_resident=(l+1<config_.layers);
+                    layer_fused=true;
+                }
+                if(!front_off&&front_flash_on&&(use_prefill_gpu||front_i8_on)&&!config_.use_alibi&&
+                   config_.sliding_window==0&&!config_.bitnet_variant&&
+                   prefill_pairs&&(fq==nullptr)==(fk==nullptr)&&
+                   tensor(p+"attn_q.bias")==nullptr&&tensor(p+"attn_k.bias")==nullptr&&tensor(p+"attn_v.bias")==nullptr&&
+                   tensor_is_q8(qkv_t[0])&&tensor_is_q8(qkv_t[1])&&tensor_is_q8(qkv_t[2])&&
+                   device_attention_available(config_.layers,kc[l].size()/KW,KH,D,config_.rms_epsilon)){
+                    if(layer_fused){
+                        front_done=zen::d3d12::attn_prefill_front(x.data(),tensor(p+"attn_norm.weight")->values.data(),E,
+                            qkv_t[0]->raw,qkv_t[1]->raw,qkv_t[2]->raw,QW,KW,
+                            fq?fq->values.data():nullptr,fk?fk->values.data():nullptr,
+                            T,H,KH,D,prefill_pairs,
+                            config_.rope_pairs_adjacent,prefill_cos.data(),prefill_sin.data(),
+                            l,start_pos,config_.rms_epsilon,1.0f/std::sqrt(float(D)),&ffn_args);
+                        if(front_done)ffn_fused_done=true;
+                    }
+                    // The layer-fused call declines before recording anything (it plans
+                    // the FFN half first), so a refusal can safely retry attention-only.
+                    if(!front_done)front_done=zen::d3d12::attn_prefill_front(x.data(),tensor(p+"attn_norm.weight")->values.data(),E,
+                        qkv_t[0]->raw,qkv_t[1]->raw,qkv_t[2]->raw,QW,KW,
+                        fq?fq->values.data():nullptr,fk?fk->values.data():nullptr,
+                        T,H,KH,D,prefill_pairs,
+                        config_.rope_pairs_adjacent,prefill_cos.data(),prefill_sin.data(),
+                        l,start_pos,config_.rms_epsilon,1.0f/std::sqrt(float(D)),nullptr);
+                }
+            }
+#endif
+            if(!front_done){
+                if(!compute_attn_norm())return false;
+                if(!tensor_gemm_batch(qkv_t,norm.data(),qkv_y,qkv_r,3,T,E))return false;
+            }
+        }
+        {zen::diag::Scope sfin("prefill.finite_qkv",zen::diag::Phase::compute);
+        // Host q/k/v only exist when the fused front declined: on the fused path the QKV
+        // GEMM writes device buffers and these arrays keep stale contents, so this scan
+        // validated nothing at ~0.59 ms/layer. ZEN_D3D12_FINITE_QKV=1 restores the
+        // unconditional scan so the saving can be A/B-ed.
+        static const bool fq_always=[](){const char* e=std::getenv("ZEN_D3D12_FINITE_QKV");return e&&e[0]=='1';}();
+        if((!front_done||fq_always)&&(!finite_values(q.data(),q.size())||!finite_values(k.data(),k.size())||!finite_values(v.data(),v.size())))return false;}
+        for(const auto& item:std::array<std::pair<const char*,std::vector<float>*>,3>{{{"attn_q.bias",&q},{"attn_k.bias",&k},{"attn_v.bias",&v}}})if(const auto*bias=tensor(p+item.first)){const std::size_t width=item.first[5]=='q'?QW:KW;if(bias->values.size()!=width)return false;for(std::size_t t=0;t<T;++t)for(std::size_t i=0;i<width;++i)(*item.second)[t*width+i]+=bias->values[i];}
+        const auto* qnorm=tensor(p+"attn_q_norm.weight");const auto* knorm=tensor(p+"attn_k_norm.weight");
+        if((qnorm==nullptr)!=(knorm==nullptr))return false;
+        if(qnorm&&(qnorm->values.size()!=D||knorm->values.size()!=D))return false;
+        {zen::diag::Scope scope_rope("transformer.prefill.rope",zen::diag::Phase::compute);
+        // Collect all K/V pointers for batched KV cache append
+        std::vector<std::size_t> kv_layers;
+        std::vector<std::size_t> kv_positions;
+        std::vector<const float*> kv_ks;
+        std::vector<const float*> kv_vs;
+        kv_layers.reserve(T);
+        kv_positions.reserve(T);
+        kv_ks.reserve(T);
+        kv_vs.reserve(T);
+
+        // Build the per-token tables once (layer 0's scope); reuse for every layer
+        // and for BOTH the CPU fallback and the GPU prefill rope. rope_dim is
+        // already validated even and <= D (forward load check), but apply the same
+        // clamp rope() applies so signed-off shapes cannot drift apart.
         // qk RMS-norm for every token BEFORE rope (unchanged order:
         // GEMM -> bias -> qk_norm -> rope). Hoisted out of the per-token loop so
         // the batched GPU rope sees fully-normalised Q/K in one dispatch; the
         // CPU fallback below applies rope to the same normalised rows.
-        if(qnorm)for(std::size_t t=0;t<T;++t){
+        if(qnorm&&!front_done){zen::diag::Scope sk("prefill.rope.qknorm",zen::diag::Phase::compute);for(std::size_t t=0;t<T;++t){
             qk_rms_norm(q.data()+t*QW,H,D,qnorm->values.data(),config_.rms_epsilon);
             qk_rms_norm(k.data()+t*KW,KH,D,knorm->values.data(),config_.rms_epsilon);
-        }
-        if(!config_.use_alibi&&prefill_pairs){
+        }}
+        if(!front_done&&!config_.use_alibi&&prefill_pairs){
+            zen::diag::Scope sa("prefill.rope.apply",zen::diag::Phase::compute);
             bool q_done=false,k_done=false;
 #if defined(ZEN_HAS_D3D12)
             // GPU prefill rope: ONE batched dispatch per tensor covering all T
@@ -1468,16 +1568,28 @@ bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& to
                 if(!k_done)for(std::size_t t=0;t<T;++t)rope_apply_table(k.data()+t*KW,KH,D,static_cast<std::uint32_t>(prefill_pairs),prefill_cos.data()+t*std::size_t(prefill_pairs),prefill_sin.data()+t*std::size_t(prefill_pairs),config_.rope_pairs_adjacent);
             }
         }
+        // Loop-invariant across tokens AND layers up to the KV length, but it was
+        // re-evaluated 512 times per layer: device_attention_available takes the
+        // backend lock and re-validates the device cache config, which cost ~4.4 us
+        // per iteration against a 4 KiB memcpy (2.25 ms/layer of the prefill).
+#if defined(ZEN_HAS_D3D12)
+        const bool kv_dev = !config_.use_alibi && device_attention_available(config_.layers,kc[l].size()/KW,KH,D,config_.rms_epsilon);
+#else
+        const bool kv_dev = false;
+#endif
+        // The fused front already wrote both device caches from VRAM and nothing on
+        // the host consumes q/k/v on that path, so the host copies are skipped.
+        if(!front_done){zen::diag::Scope skv("prefill.rope.kvhost",zen::diag::Phase::compute);
         for(std::size_t t=0;t<T;++t){
             const std::uint32_t pos = start_pos + static_cast<std::uint32_t>(t);
-            std::copy_n(k.data()+t*KW,KW,kc[l].data()+std::size_t(pos)*KW);
-            std::copy_n(v.data()+t*KW,KW,vc[l].data()+std::size_t(pos)*KW);
+            std::memcpy(kc[l].data()+std::size_t(pos)*KW,k.data()+t*KW,KW*sizeof(float));
+            std::memcpy(vc[l].data()+std::size_t(pos)*KW,v.data()+t*KW,KW*sizeof(float));
             // Keep the device cache in step with the host one: decode reads the device
             // cache, so without this the prompt positions are missing from it and decode
             // attends over the wrong window. Not fatal if it fails - decode then falls
             // back to the host path, which uses kc/vc.
 #if defined(ZEN_HAS_D3D12)
-            if(!config_.use_alibi && device_attention_available(config_.layers,kc[l].size()/KW,KH,D,config_.rms_epsilon)){
+            if(kv_dev){
                 kv_layers.push_back(l);
                 kv_positions.push_back(pos);
                 kv_ks.push_back(k.data()+t*KW);
@@ -1485,13 +1597,15 @@ bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& to
             }
 #endif
         }
+        }
         // Batched KV cache append for this layer
 #if defined(ZEN_HAS_D3D12)
-        if(!kv_layers.empty() && !config_.use_alibi && device_attention_available(config_.layers,kc[l].size()/KW,KH,D,config_.rms_epsilon)){
+        if(!front_done && !kv_layers.empty() && kv_dev){
             if (const char* trace = std::getenv("ZEN_D3D12_TRACE"); trace && trace[0] == '1') {
                 std::printf("[d3d12] batched kv append (runtime): layer=%zu num_tokens=%zu\n", l, kv_layers.size());
             }
-            zen::d3d12::kv_cache_append_batched(kv_layers.data(), kv_layers.size(), kv_positions.data(), kv_ks.data(), kv_vs.data(), KH, D);
+            {zen::diag::Scope skvd("prefill.rope.kvdev",zen::diag::Phase::compute);
+            zen::d3d12::kv_cache_append_batched(kv_layers.data(), kv_layers.size(), kv_positions.data(), kv_ks.data(), kv_vs.data(), KH, D);}
         }
 #endif
         }
@@ -1520,17 +1634,39 @@ bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& to
                            l, T, H, KH, D, start_pos, kv_ctx);
             }
 
+            // With the fused front, Q is already rotated in VRAM and the result stays
+            // there: neither directional transfer happens, and the FFN chain reads the
+            // attention output straight out of fa_out.
+            // With the fused front the attention dispatch has already run inside that
+            // submission (QKV -> norm -> rope -> append -> flash), so there is nothing
+            // left to submit here; submitting again would attend twice. With
+            // ZEN_D3D12_ATTN_FRONT_FLASH=0 the front left the work out, and the merged
+            // and unmerged shapes are compared with the same binary.
+            static const bool front_flash_off=[](){const char* e=std::getenv("ZEN_D3D12_ATTN_FRONT_FLASH");return e&&e[0]=='0';}();
+            if (front_done && !front_flash_off) {
+                flash_ok = true;
+            } else {
+            {zen::diag::Scope sfa("prefill.flash",zen::diag::Phase::compute);
             flash_ok = zen::d3d12::flash_attention_prefill(
-                q.data(), k.data(), v.data(), att.data(),
+                front_done ? nullptr : q.data(), nullptr, nullptr,
+                front_done ? nullptr : att.data(),
                 T, H, KH, D, inv_scale,
-                l, start_pos, kv_ctx, KH, D
-            );
+                l, start_pos, kv_ctx, KH, D, front_done
+            );}
+            }
             
             if (flash_ok) {
-                if (!finite_values(att.data(), att.size())) {
+                if (!front_done && !finite_values(att.data(), att.size())) {
                     std::fprintf(stderr, "[fa] non-finite flash_attention output layer=%u\n", l);
                     return false;
                 }
+            } else if (front_done) {
+                // Host q/k/v and the host KV cache were never staged on this path, so
+                // the CPU attention cannot stand in here: continuing would attend over
+                // stale rows. Fail loudly instead of producing plausible garbage.
+                std::fprintf(stderr, "[fa] flash_attention declined after the fused attention front "
+                                     "(layer=%u); no host q/k/v or host KV cache to fall back on\n", l);
+                return false;
             } else {
                 if (const char* trace = std::getenv("ZEN_D3D12_TRACE"); trace && trace[0] == '1') {
                     std::printf("[d3d12] flash_attention fallback to CPU\n");
@@ -1675,26 +1811,60 @@ bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& to
         // CPU), as do non-quantised or differently-shaped weights.
         bool ffn_gpu=false;
 #if defined(ZEN_HAS_D3D12)
-        if(use_prefill_gpu&&!config_.bitnet_variant){
+        // The whole FFN half (attn_output GEMM, residual, FFN norm, gate|up GEMMs, SiLU,
+        // down GEMM, final residual) runs as one submission over device scratch, so no
+        // intermediate activation crosses the host: that removes three synchronous
+        // fences and three x/y staging round trips per layer. It is worth taking
+        // whenever the integer kernel is on, because that is where these three GEMMs
+        // are fastest - measured Qwen3-4B Q8_0 at T=512, interleaved: host path +
+        // integer kernel 1059 ms, fused chain + integer kernel 615 ms, fp32 1150 ms.
+        // Setting only ZEN_D3D12_GEMM_I8=1 used to leave this on the table.
+        // ZEN_D3D12_FFN_FUSED=0 forces the host FFN half back on, so the fused chain can
+        // still be A/B'd against the separate host ops it replaced (same convention as
+        // ZEN_D3D12_FLASH=0, ZEN_CPU_ROPE=0 and ZEN_CPU_SILU_PAR=0).
+        static const bool ffn_fused_off=[](){const char* e=std::getenv("ZEN_D3D12_FFN_FUSED");return e&&e[0]=='0';}();
+        static const bool prefill_i8_on=[](){const char* e=std::getenv("ZEN_D3D12_GEMM_I8");return e&&e[0]=='1';}();
+        if(ffn_fused_done){
+            // Already part of the attention submission.
+            ffn_gpu=true;
+        }else if((use_prefill_gpu||prefill_i8_on)&&!ffn_fused_off&&!config_.bitnet_variant){
             const auto* lo=tensor(p+"attn_output.weight");const auto* lg=tensor(p+"ffn_gate.weight");
             const auto* lu=tensor(p+"ffn_up.weight");const auto* ldw=tensor(p+"ffn_down.weight");
             const auto* lfn=tensor(p+"ffn_norm.weight");
             if(tensor_is_q8(lo)&&tensor_is_q8(lg)&&tensor_is_q8(lu)&&tensor_is_q8(ldw)&&lfn&&
                tensor(p+"attn_q.bias")==nullptr&&tensor(p+"attn_k.bias")==nullptr&&tensor(p+"attn_v.bias")==nullptr){
                 ffn_gpu=zen::d3d12::ffn_prefill_fused(lo->raw,lg->raw,lu->raw,ldw->raw,
-                    lfn->values.data(),x.data(),att.data(),x.data(),T,E,QW,F,config_.rms_epsilon);
+                    lfn->values.data(),x.data(),front_done?nullptr:att.data(),x.data(),T,E,QW,F,
+                    config_.rms_epsilon,front_done);
             }
         }
 #endif
         if(ffn_gpu){
+            // The fused readback rejects non-finite rows while copying them back, in that
+            // same pass; re-scanning the same 5.2 MB here cost 0.23 ms/layer at T=512.
+#ifdef ZEN_HAS_D3D12
+            if(!zen::d3d12::prefill_x_finite())return false;
+#else
             if(!finite_values(x.data(),x.size()))return false;
+#endif
+        }else if(front_done){
+            // att is not on the host on this path, so the separate host FFN ops below
+            // would read the previous layer's activations.
+            std::fprintf(stderr,"[ffn] fused FFN chain declined after the fused attention front "
+                                "(layer=%u); att is not on the host\n",l);
+            return false;
         }else{
+#if defined(ZEN_HAS_D3D12)
+        // The host half recomputes the residual here, so the device copy is stale.
+        zen::d3d12::prefill_residual_invalidate();
+#endif
         // BitNet subln: RMS-normalise each token's attention output before
         // the wo projection.
         if(config_.bitnet_variant)for(std::size_t t=0;t<T;++t)rms_norm(att.data()+t*QW,tensor(p+"attn_sub_norm.weight")->values.data(),att.data()+t*QW,QW,config_.rms_epsilon);
         if(!tensor_gemm(*tensor(p+"attn_output.weight"),att.data(),tmp.data(),T,E,QW))return false;
+        {zen::diag::Scope sr("prefill.resnorm",zen::diag::Phase::compute);
         for(std::size_t i=0;i<T*E;++i)x[i]+=tmp[i];
-        for(std::size_t t=0;t<T;++t)rms_norm(x.data()+t*E,tensor(p+"ffn_norm.weight")->values.data(),norm.data()+t*E,E,config_.rms_epsilon);
+        for(std::size_t t=0;t<T;++t)rms_norm(x.data()+t*E,tensor(p+"ffn_norm.weight")->values.data(),norm.data()+t*E,E,config_.rms_epsilon);}
         if(!finite_values(norm.data(),norm.size()))return false;
         if(T==1){
             const DenseTransformerRuntime::Tensor* const fu_t[2]={tensor(p+"ffn_gate.weight"),tensor(p+"ffn_up.weight")};
@@ -1711,7 +1881,17 @@ bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& to
             if(!tensor_gemm_batch(fu_t,norm.data(),fu_y,fu_r,2,T,E))return false;
         }
         {zen::diag::Scope scope_silu("transformer.prefill.silu",zen::diag::Phase::compute);
-        silu_mul(gate.data(),up.data(),ffn.data(),T*F);}
+        // silu_mul is elementwise, so splitting it over token rows is bit-identical
+        // to the serial pass (same kernel, same inputs, no reduction). At T=512 and
+        // F=9728 the serial pass cost 2.9 ms/layer (8.6% of a warm prefill) of pure
+        // AVX2 exp, which the worker pool absorbs. ZEN_CPU_SILU_PAR=0 restores it.
+        static const bool silu_par_enabled=[](){const char* e=std::getenv("ZEN_CPU_SILU_PAR");return !(e&&e[0]=='0');}();
+        zen::ResourceGovernor silu_gov;
+        const unsigned silu_workers=silu_par_enabled?silu_gov.current_policy().worker_threads:1u;
+        if(silu_workers>1&&T>=8)
+            zen::ComputePool::instance().parallel_for(T,silu_workers,[&](std::size_t first,std::size_t last){for(std::size_t t=first;t<last;++t)silu_mul(gate.data()+t*F,up.data()+t*F,ffn.data()+t*F,F);});
+        else
+            silu_mul(gate.data(),up.data(),ffn.data(),T*F);}
         // BitNet subln: RMS-normalise the FFN hidden activation before ffn_down.
         if(config_.bitnet_variant)for(std::size_t t=0;t<T;++t)rms_norm(ffn.data()+t*F,tensor(p+"ffn_sub_norm.weight")->values.data(),ffn.data()+t*F,F,config_.rms_epsilon);
         if(!tensor_gemm(*tensor(p+"ffn_down.weight"),ffn.data(),tmp.data(),T,E,F))return false;
@@ -1788,6 +1968,7 @@ bool DenseTransformerRuntime::forward(std::uint32_t token,std::uint32_t pos,
     struct LayerParams {
         const std::uint8_t* q_w, *k_w, *v_w, *o_w, *gate_w, *up_w, *down_w;
         const float* attn_norm_w; const float* ffn_norm_w;
+        const float* q_norm_w=nullptr; const float* k_norm_w=nullptr; // Qwen3 per-head rows
         const float* cos; const float* sin; // shared per-token table (rope_cos/rope_sin above)
         std::size_t pairs, layer, pos, first_pos;
     };
@@ -1801,17 +1982,25 @@ bool DenseTransformerRuntime::forward(std::uint32_t token,std::uint32_t pos,
         const auto* lg=tensor(p+"ffn_gate.weight");const auto* lu=tensor(p+"ffn_up.weight");
         const auto* ldw=tensor(p+"ffn_down.weight");
         const auto* ln=tensor(p+"attn_norm.weight");const auto* lfn=tensor(p+"ffn_norm.weight");
+        // Qwen3 normalises every q/k head before RoPE. The pipeline applies it on the
+        // device (qk_norm.hlsl), so the tensors no longer disqualify a layer; they are
+        // only rejected when the pair is incomplete or the wrong width, which load
+        // already rules out for this arch.
+        const auto* lqn=tensor(p+"attn_q_norm.weight");const auto* lkn=tensor(p+"attn_k_norm.weight");
+        const bool qk_ok=(!lqn&&!lkn)||(lqn&&lkn&&lqn->values.size()==D&&lkn->values.size()==D);
         if(!config_.use_alibi&&!config_.bitnet_variant&&lq&&lk&&lv&&lo&&lg&&lu&&ldw&&ln&&lfn
            &&tensor_is_q8(lq)&&tensor_is_q8(lk)&&tensor_is_q8(lv)&&tensor_is_q8(lo)
            &&tensor_is_q8(lg)&&tensor_is_q8(lu)&&tensor_is_q8(ldw)
            &&!tensor(p+"attn_q.bias")&&!tensor(p+"attn_k.bias")&&!tensor(p+"attn_v.bias")
-           &&!tensor(p+"attn_q_norm.weight")
+           &&qk_ok
            &&device_attention_available(config_.layers,kc[l].size()/KW,KH,D,config_.rms_epsilon)){
             // Qualifies for pipeline
             LayerParams lp;
             lp.q_w = lq->raw; lp.k_w = lk->raw; lp.v_w = lv->raw; lp.o_w = lo->raw;
             lp.gate_w = lg->raw; lp.up_w = lu->raw; lp.down_w = ldw->raw;
             lp.attn_norm_w = ln->values.data(); lp.ffn_norm_w = lfn->values.data();
+            lp.q_norm_w = lqn?lqn->values.data():nullptr;
+            lp.k_norm_w = lkn?lkn->values.data():nullptr;
             lp.layer = l; lp.pos = pos;
             lp.first_pos = config_.sliding_window&&pos+1>config_.sliding_window?pos+1-config_.sliding_window:0;
             device_rope_table();
@@ -1850,6 +2039,7 @@ bool DenseTransformerRuntime::forward(std::uint32_t token,std::uint32_t pos,
             d3d_layers[i].q_w = lp.q_w; d3d_layers[i].k_w = lp.k_w; d3d_layers[i].v_w = lp.v_w; d3d_layers[i].o_w = lp.o_w;
             d3d_layers[i].gate_w = lp.gate_w; d3d_layers[i].up_w = lp.up_w; d3d_layers[i].down_w = lp.down_w;
             d3d_layers[i].attn_norm_w = lp.attn_norm_w; d3d_layers[i].ffn_norm_w = lp.ffn_norm_w;
+            d3d_layers[i].q_norm_w = lp.q_norm_w; d3d_layers[i].k_norm_w = lp.k_norm_w;
             d3d_layers[i].cos = lp.cos; d3d_layers[i].sin = lp.sin;
             d3d_layers[i].pairs = lp.pairs; d3d_layers[i].layer = lp.layer; d3d_layers[i].pos = lp.pos; d3d_layers[i].first_pos = lp.first_pos;
             d3d_layers[i].rope_pairs_adjacent = config_.rope_pairs_adjacent ? 1u : 0u;
@@ -1938,7 +2128,8 @@ bool DenseTransformerRuntime::forward(std::uint32_t token,std::uint32_t pos,
             const std::size_t qkv_r[3]={QW,KW,KW};
             if(!tensor_matvec_batch(qkv_t,norm.data(),qkv_y,qkv_r,3,E))return false;
             for(const auto& item:std::array<std::pair<const DenseTransformerRuntime::Tensor*,std::vector<float>*>,3>{{{qb,&q},{kb,&k},{vb,&v}}})if(const auto*bias=item.first){if(bias->values.size()!=item.second->size())return false;for(std::size_t i=0;i<item.second->size();++i)(*item.second)[i]+=bias->values[i];}
-            if(!finite_values(q.data(),q.size())||!finite_values(k.data(),k.size())||!finite_values(v.data(),v.size()))return false;
+            {zen::diag::Scope sfin("prefill.finite_qkv",zen::diag::Phase::compute);
+            if(!finite_values(q.data(),q.size())||!finite_values(k.data(),k.size())||!finite_values(v.data(),v.size()))return false;}
             if((qnorm==nullptr)!=(knorm==nullptr))return false;
             if(qnorm){if(qnorm->values.size()!=D||knorm->values.size()!=D)return false;qk_rms_norm(q.data(),H,D,qnorm->values.data(),config_.rms_epsilon);qk_rms_norm(k.data(),KH,D,knorm->values.data(),config_.rms_epsilon);}
             // Device attention: rope(q), rope(k), the cache append and GQA attention in

@@ -104,7 +104,7 @@ if(ZEN_BUILD_D3D12)
       # The *_fuseq shaders are producer-fused quantize variants (DP4A decode
       # when ZEN_D3D12_DP4A_FUSEQ=1): each also quantises its output into the
       # qact int8/scale streams (u3/u4), bit-identical to quantize_acts.
-      foreach(spec "q8_0_gemm|GemmQ8_0|kQ8_0GemmCso|cs_6_0" "q8_0_gemm_sh|GemvQ8_0SH|kQ8_0GemmShCso|cs_6_0" "q8_0_gemm_v2|GemmQ8_0V2|kQ8_0GemmV2Cso|cs_6_0" "q8_0_gemm_v3|GemmQ8_0V3|kQ8_0GemmV3Cso|cs_6_0" "q8_0_gemm_rt|GemmQ8_0RT|kQ8_0GemmRtCso|cs_6_0" "q8_0_gemm_fused|GemmQ8_0Fused|kQ8_0GemmFusedCso|cs_6_0" "silu_mul|SiluMul|kSiluMulCso|cs_6_0" "rmsnorm|RmsNorm|kRmsNormCso|cs_6_0" "addn|Addn|kAddnCso|cs_6_0" "rope|Rope|kRopeCso|cs_6_0" "rope_prefill|RopePrefill|kRopePrefillCso|cs_6_0" "attention|Attention|kAttnCso|cs_6_0" "attention2|Attention2|kAttn2Cso|cs_6_0" "flash_attention|FlashAttentionWithCache|kFlashAttnCso|cs_6_0" "q8_0_gemm_dp4a|GemmQ8_0Dp4a|kQ8_0GemmDp4aCso|cs_6_4" "q8_0_gemm_q4k|GemmQ4_K|kQ8_0GemmQ4kCso|cs_6_0" "rmsnorm_fuseq|RmsNormFused|kRmsNormFusedCso|cs_6_0" "silu_fuseq|SiluMulFused|kSiluFusedCso|cs_6_0" "attention_fuseq|AttentionFused|kAttnFusedCso|cs_6_0")
+      foreach(spec "q8_0_gemm|GemmQ8_0|kQ8_0GemmCso|cs_6_0" "q8_0_gemm_i8|GemmQ8_0I8|kQ8_0GemmI8Cso|cs_6_4" "q8_0_gemm_sh|GemvQ8_0SH|kQ8_0GemmShCso|cs_6_0" "q8_0_gemm_v2|GemmQ8_0V2|kQ8_0GemmV2Cso|cs_6_0" "q8_0_gemm_v3|GemmQ8_0V3|kQ8_0GemmV3Cso|cs_6_0" "q8_0_gemm_t|GemmQ8_0T|kQ8_0GemmTCso|cs_6_0" "q8_0_gemm_rt|GemmQ8_0RT|kQ8_0GemmRtCso|cs_6_0" "q8_0_gemm_fused|GemmQ8_0Fused|kQ8_0GemmFusedCso|cs_6_0" "silu_mul|SiluMul|kSiluMulCso|cs_6_0" "rmsnorm|RmsNorm|kRmsNormCso|cs_6_0" "qk_norm|QkNorm|kQkNormCso|cs_6_0" "addn|Addn|kAddnCso|cs_6_0" "rope|Rope|kRopeCso|cs_6_0" "rope_prefill|RopePrefill|kRopePrefillCso|cs_6_0" "attention|Attention|kAttnCso|cs_6_0" "attention2|Attention2|kAttn2Cso|cs_6_0" "attention3|Attention3|kAttn3Cso|cs_6_0" "flash_attention|FlashAttentionWithCache|kFlashAttnCso|cs_6_0" "flash_attention_tile|FlashAttentionTile|kFlashAttnTileCso|cs_6_0" "flash_attention_keys|FlashAttentionKeys|kFlashAttnKeysCso|cs_6_0" "q8_0_gemm_dp4a|GemmQ8_0Dp4a|kQ8_0GemmDp4aCso|cs_6_4" "q8_0_gemm_q4k|GemmQ4_K|kQ8_0GemmQ4kCso|cs_6_0" "rmsnorm_fuseq|RmsNormFused|kRmsNormFusedCso|cs_6_0" "silu_fuseq|SiluMulFused|kSiluFusedCso|cs_6_0" "attention_fuseq|AttentionFused|kAttnFusedCso|cs_6_0")
         string(REPLACE "|" ";" parts "${spec}")
         list(GET parts 0 shader)
         list(GET parts 1 entry)
@@ -506,6 +506,10 @@ target_link_libraries(zen_tokenizer_export PRIVATE zen_core)
 
 add_executable(zen_generate_ids tools/generate_ids.cpp)
 target_link_libraries(zen_generate_ids PRIVATE zen_model_adapters)
+# Loads one model twice in a single process and compares the generated ids: exercises the
+# weight-residency invalidation on reload/unload (see tools/reload_check.cpp).
+add_executable(zen_reload_check tools/reload_check.cpp)
+target_link_libraries(zen_reload_check PRIVATE zen_model_adapters)
 
 add_executable(zen_speculative_timing tools/speculative_timing.cpp)
 target_link_libraries(zen_speculative_timing PRIVATE zen_model_adapters)
@@ -663,6 +667,16 @@ if(ZEN_BUILD_TESTS)
   target_link_libraries(zen_trace_test PRIVATE zen_model_adapters)
   add_test(NAME zen_runtime_qwen2_synthetic COMMAND zen_runtime_tests "${ZEN_QWEN2_SYNTHETIC}")
   set_tests_properties(zen_runtime_qwen2_synthetic PROPERTIES LABELS "runtime;gguf;synthetic;qwen2" TIMEOUT 180)
+  # The same model loaded twice in one process must produce the same tokens. ZEN_BACKEND
+  # makes the runtime use the D3D12 path when the machine has it, which is where the
+  # weight residency lives; without it the check still covers the reload bookkeeping.
+  if(TARGET zen_reload_check)
+    add_test(NAME zen_reload_same_model
+             COMMAND zen_reload_check "${ZEN_QWEN2_SYNTHETIC}" --prompt-ids 1,2,3,4 --max-new 4)
+    set_tests_properties(zen_reload_same_model PROPERTIES
+      LABELS "runtime;gguf;d3d12;reload" TIMEOUT 180
+      ENVIRONMENT "ZEN_BACKEND=d3d12;ZEN_D3D12=1")
+  endif()
   if(ZEN_GGUF_FIXTURE_1 AND ZEN_GGUF_FIXTURE_2)
     add_test(NAME zen_runtime_fixture_1 COMMAND zen_runtime_tests "${ZEN_GGUF_FIXTURE_1}" "${ZEN_GGUF_FIXTURE_2}")
     add_test(NAME zen_runtime_fixture_2 COMMAND zen_runtime_tests "${ZEN_GGUF_FIXTURE_2}" "${ZEN_GGUF_FIXTURE_1}")

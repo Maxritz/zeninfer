@@ -81,6 +81,10 @@ bool gemv_q8_0(const std::uint8_t* weights, const float* x, float* y,
                std::size_t rows, std::size_t columns) noexcept;
 bool gemm_q8_0(const std::uint8_t* weights, const float* input, float* output,
                std::size_t tokens, std::size_t rows, std::size_t columns) noexcept;
+// Call before freeing or rewriting a Q8_0 weight address. The device copy is cached
+// under the host pointer plus the shape, so a caller that hands the same address a
+// different tensor gets the previous bytes back unless it releases first.
+void release_q8_0_weights(const std::uint8_t* weights) noexcept;
 // Q4_K GPU GEMM (experimental, basic, no tiling). Falls back to CPU on failure.
 bool gemm_q4k(const std::uint8_t* weights, const float* input, float* output,
               std::size_t tokens, std::size_t rows, std::size_t columns) noexcept;
@@ -114,6 +118,47 @@ struct GemmTask {
 // packed output readback. Kernels and parameters are the same as gemm_q8_0,
 // so batched results are bit-identical to the unbatched path; the win is the
 // removed queue round trips (~0.7-1.1 ms per submit measured on RDNA4).
+// The FFN half of a prefill layer, handed to attn_prefill_front so the whole layer
+// runs as ONE submission (attention + FFN, one fence).
+struct PrefillFfn {
+    const std::uint8_t* attn_output_w{};
+    const std::uint8_t* gate_w{};
+    const std::uint8_t* up_w{};
+    const std::uint8_t* down_w{};
+    const float* norm_weight{};
+    const float* x{};    // residual base, staged to the upload heap
+    float* out{};        // layer output; may alias x
+    std::size_t ffn_rows{};
+    // Keep the layer output in device scratch instead of copying it back: the next
+    // merged layer reads it there, so neither a readback nor a re-upload is needed.
+    bool keep_resident{};
+};
+
+// Whether the fused prefill FFN readback found every copied value finite. The readback
+// checks while it copies, so the caller no longer scans the same rows afterwards.
+bool prefill_x_finite() noexcept;
+
+// Drops the device-resident residual: call after the host recomputes the layer output.
+bool prefill_residual_invalidate() noexcept;
+
+// The whole attention half of a PREFILL layer in one submission:
+//   QKV GEMM -> qk RMS-norm -> RoPE -> KV cache append -> flash attention
+// Nothing returns to the host: Q is consumed in place, and the attention output stays
+// in the device buffer `ffn_prefill_fused` takes when `attn_on_device` is set.
+// `x` is the layer's residual input and `norm_weight` the attention norm weight: the
+// RMS norm is the first dispatch in the submission, so the caller no longer pays a host
+// norm per layer.
+bool attn_prefill_front(const float* x, const float* norm_weight, std::size_t hidden,
+                        const std::uint8_t* q_w,
+                        const std::uint8_t* k_w, const std::uint8_t* v_w,
+                        std::size_t q_width, std::size_t kv_width, const float* q_norm,
+                        const float* k_norm, std::size_t tokens, std::size_t heads,
+                        std::size_t kv_heads,
+                        std::size_t head_dim, std::size_t pairs, bool interleaved,
+                        const float* cos, const float* sin, std::size_t layer,
+                        std::size_t start_pos, float epsilon, float inv_scale,
+                        const PrefillFfn* ffn = nullptr) noexcept;
+
 bool gemm_q8_0_batch(const float* x, const GemmTask* tasks, std::size_t count,
                      std::size_t tokens, std::size_t columns) noexcept;
 
@@ -217,12 +262,17 @@ bool layer_decode(const std::uint8_t* q_w, const std::uint8_t* k_w, const std::u
 // on GPU. Input Q is [tokens, heads, head_dim], K/V come from device KV cache.
 // Output is [tokens, heads, head_dim].
 // Uses tiled FlashAttention algorithm with causal masking and KV cache.
+// `q_on_device` takes Q from the buffer `attn_prefill_front` just filled instead of
+// from host memory (pass a null `q`), and a null `out` leaves the result in the
+// device buffer `ffn_prefill_fused` consumes as its attention input.
 // Returns false if not supported (falls back to CPU attention).
 bool flash_attention_prefill(const float* q, const float* k, const float* v, float* out,
                              std::size_t tokens, std::size_t heads, std::size_t kv_heads,
                              std::size_t head_dim, float inv_scale,
                              std::size_t layer, std::size_t start_pos,
-                             std::size_t kv_context, std::size_t k_cache_heads, std::size_t k_cache_head_dim) noexcept;
+                             std::size_t kv_context, std::size_t k_cache_heads,
+                             std::size_t k_cache_head_dim,
+                             bool q_on_device = false) noexcept;
 
 // Pipelined multi-layer decode: records all layers into command lists, submits once,
 // waits once. Keeps intermediate activations in VRAM (GPU-to-GPU). Only final output
@@ -248,6 +298,12 @@ struct LayerDecodeParams {
     std::size_t first_pos;
     const float* cos;
     const float* sin;
+    // Per-head RMS normalisation rows (Qwen3: blk.N.attn_q_norm / attn_k_norm), each
+    // `head_dim` floats applied per head to q and k between the matvecs and RoPE.
+    // Both null = the model has none. The pipeline runs a layer's q/k normalisation
+    // only when both are set; the caller keeps the pair together.
+    const float* q_norm_w{};
+    const float* k_norm_w{};
 };
 
 bool layer_decode_pipeline(const LayerDecodeParams* layers, std::size_t num_layers,
@@ -319,12 +375,14 @@ bool silu_mul(const float* gate, const float* up, float* out, std::size_t count)
 // keeps the separate GEMM + CPU SiLU/add path) when the backend is absent,
 // the shape is not Q8_0 GEMM-eligible, DP4A is on (the fused path is fp32
 // only), or the working buffers exceed the device-resident cap.
+// `attn_on_device` takes the attention output from the device buffer flash left it in
+// (pass a null `attn_out`), so the attention result is never read back and re-uploaded.
 bool ffn_prefill_fused(const std::uint8_t* attn_output, const std::uint8_t* gate,
                        const std::uint8_t* up, const std::uint8_t* down,
                        const float* norm_weight, const float* x, const float* attn_out,
                        float* out, std::size_t tokens, std::size_t hidden,
                        std::size_t attn_width, std::size_t ffn_rows,
-                       float epsilon) noexcept;
+                       float epsilon, bool attn_on_device = false) noexcept;
 
 bool gemv_q8_0_ffn(const std::uint8_t* gate, const std::uint8_t* up, const std::uint8_t* down,
                    const float* x, float* y, std::size_t ffn_rows, std::size_t columns,

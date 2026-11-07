@@ -38,26 +38,38 @@
 #include "q8_0_gemm_sh_cso.h"
 #include "q8_0_gemm_v2_cso.h"
 #include "q8_0_gemm_v3_cso.h"
+#include "q8_0_gemm_t_cso.h"
 #include "q8_0_gemm_fused_cso.h"
 #include "q8_0_gemm_rt_cso.h"
 #include "q8_0_gemm_fused_cso.h"
 #include "q8_0_gemm_dp4a_cso.h"
+#include "q8_0_gemm_i8_cso.h"
 #include "q8_0_gemv_dp4a_cso.h"
 #include "quantize_acts_cso.h"
 #include "q8_0_gemv_fp32_cso.h"
 #include "silu_mul_cso.h"
 #include "addn_cso.h"
 #include "rmsnorm_cso.h"
+#include "qk_norm_cso.h"
 #include "rope_cso.h"
 #include "rope_prefill_cso.h"
 #include "attention_cso.h"
 #include "attention2_cso.h"
+#include "attention3_cso.h"
 #include "rmsnorm_fuseq_cso.h"
 #include "silu_fuseq_cso.h"
 #include "attention_fuseq_cso.h"
 #include "flash_attention_cso.h"
+#include "flash_attention_tile_cso.h"
+#include "flash_attention_keys_cso.h"
+
+#include "zen/compute_pool.h"
+#include "zen/resource_governor.h"
+#include "flash_attention_cso.h"
 #include "repack.h"
 #include "zen/d3d12_backend.h"
+#include "zen/diagnostics.h"
+#include "zen/kernels.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -301,6 +313,10 @@ struct State {
     // Optional: null when its CSO failed to build, in which case attention.hlsl
     // stays selected regardless of the env gate.
     ComPtr<ID3D12PipelineState> pso_attn2;
+    // attention3: decode attention with the KV window split across the waves of a
+    // 256-thread workgroup (one workgroup per head). Selected by ZEN_D3D12_ATTN3,
+    // default on; null means its CSO failed to build and attention/attention2 stays.
+    ComPtr<ID3D12PipelineState> pso_attn3;
 
     // Device-resident KV cache, [layers][kv_heads][context][head_dim] floats, with k and
     // v in separate buffers. Configured once per model by kv_cache_configure; the
@@ -366,9 +382,15 @@ struct State {
     ComPtr<ID3D12PipelineState> pso_gemm_sh;
     ComPtr<ID3D12PipelineState> pso_gemm_v2;
     ComPtr<ID3D12PipelineState> pso_gemm_v3;
+    // Register-tiled prefill GEMM (64x64 tile, 4x4 micro-tile). Optional: null keeps
+    // the v1 kernel.
+    ComPtr<ID3D12PipelineState> pso_gemm_t;
     ComPtr<ID3D12PipelineState> pso_gemm_rt;
     ComPtr<ID3D12PipelineState> pso_gemm_fused;
     ComPtr<ID3D12PipelineState> pso_gemm_dp4a;
+    // Integer-domain prefill GEMM (no dequant, v_dot4_i32_i8). Null when the CSO
+    // could not be built (device below Shader Model 6.4); callers fall back.
+    ComPtr<ID3D12PipelineState> pso_gemm_i8;
 
     // Per-token activation scales for the DP4A GEMM, one float each.
     ComPtr<ID3D12Resource> gemm_xscale;
@@ -376,8 +398,17 @@ struct State {
     std::size_t gemm_xscale_cap{};
     ComPtr<ID3D12PipelineState> pso_silu;
     ComPtr<ID3D12PipelineState> pso_rms;
+    // Per-head q/k RMS norm (Qwen3). Optional: null keeps the pipeline closed to those
+    // models, exactly like the pre-existing gate did.
+    ComPtr<ID3D12PipelineState> pso_qknorm;
     ComPtr<ID3D12PipelineState> pso_addn;
     ComPtr<ID3D12PipelineState> pso_flash_attn;
+    // Tiled prefill attention (shaders/flash_attention_tile.hlsl). Optional: a
+    // missing CSO or a non-wave64 device keeps the one-wave-per-token kernel.
+    ComPtr<ID3D12PipelineState> pso_flash_tile;
+    // Keys-across-lanes prefill attention (shaders/flash_attention_keys.hlsl):
+    // one lane owns one key. Optional too; see flash_kernel_pick.
+    ComPtr<ID3D12PipelineState> pso_flash_keys;
     // Producer-fused quantize variants (ZEN_D3D12_DP4A_FUSEQ=1): rms/silu/
     // attention dispatches that also write the qact int8/scale streams (u3/u4).
     // Null when the CSO failed to build; the unfused path is then used.
@@ -391,8 +422,10 @@ struct State {
     // the kernel itself. Grown on demand, never shrunk.
     ComPtr<ID3D12Resource> fa_q;      // device Q [tokens, heads, head_dim]
     ComPtr<ID3D12Resource> fa_out;    // device O (UAV)
-    ComPtr<ID3D12Resource> fa_qup;    // upload staging for Q
+    void* fa_q_cpu{};                 // mapped Q (UPLOAD heap, read as an SRV)
     ComPtr<ID3D12Resource> fa_rd;     // readback staging for O
+    ComPtr<ID3D12Resource> fa_qup;    // ablation: staging for the two-hop upload
+    ComPtr<ID3D12Resource> fa_qdev;   // ablation: VRAM SRV for the two-hop upload
     void* fa_qup_cpu{};
     std::size_t fa_cap{};
 
@@ -420,6 +453,36 @@ struct State {
     ComPtr<ID3D12Resource> yread;
     ComPtr<ID3D12Resource> fbuf;
     std::size_t f_cap{};
+    // Prefill attention front half (attn_prefill_front_locked): rotated q/k staging
+    // plus the per-prefill rope tables and qk-norm rows. The staging buffer is a
+    // device heap because rope reads one region as an SRV while writing another as a
+    // UAV, so they cannot alias; the tables are upload-heap because they are only ever
+    // read through root SRVs.
+    ComPtr<ID3D12Resource> front_dev;
+    std::size_t front_dev_cap{};
+    // Attention RMS-norm output for the fused prefill front: the front stages the
+    // residual, so the rows its QKV GEMMs read are normalised in-list.
+    ComPtr<ID3D12Resource> attn_norm_dev;
+    std::size_t attn_norm_cap = 0;
+    std::size_t front_bytes{};  // q+k+v span a device-Q flash may read
+    // Result of the finiteness check the fused FFN readback performs inline. The caller
+    // used to scan those same 5.2 MB again on the host right after the copy.
+    bool prefill_x_finite{true};
+    // Residual kept on the device between merged prefill layers: ybuf + prefill_res_off
+    // holds the layer output, which the next layer's attention norm and its FFN residual
+    // add both read there. `host_valid` says whether the caller's buffer matches it.
+    bool prefill_resident{};
+    std::uint64_t prefill_res_off{};
+    std::size_t prefill_res_tokens{}, prefill_res_hidden{};
+    float* prefill_out_host{};
+    bool prefill_host_valid{true};
+    // Per-stage GPU time inside the merged prefill submission (TRACE=1 only): the layer
+    // bracket said how long a layer took, not where the time went.
+    std::uint64_t stage_us[12]{};
+    std::uint64_t stage_layers{};
+    ComPtr<ID3D12Resource> front_tab;
+    void* front_tab_cpu{};
+    std::size_t front_tab_cap{};
     // DP4A decode activation-quant staging: [int8 acts (1B/elem) | fp32 scales
     // per 32-elem block], dedicated DEFAULT-heap buffer. It MUST live in a
     // separate resource from fbuf: the DP4A matvec reads the tail as SRV (needs
@@ -444,6 +507,9 @@ struct State {
     std::size_t stage_cap{};
 
     bool trace{};
+    // Wave size is <= 64 lanes (see query_d3d12_features): required by the
+    // tiled prefill attention kernel.
+    bool wave_tile_ok{};
     bool no_readback{};
     ComPtr<ID3D12QueryHeap> ts_heap;
     ComPtr<ID3D12Resource> ts_read;
@@ -452,6 +518,7 @@ struct State {
     // Per-component trace accumulators (ZEN_D3D12_TRACE=1).
     struct CompStat {
         std::uint64_t ops{};
+        std::uint64_t submits{};
         std::uint64_t dev_us{};
         std::uint64_t wait_us{};
     };
@@ -486,7 +553,47 @@ D3D12_BARRIER_SYNC state_to_sync(D3D12_RESOURCE_STATES state) {
     return D3D12_BARRIER_SYNC_NONE;
 }
 
+// Large host-side copies for the attention round trip. Q up and att down are
+// 8 MiB each per layer (512 tokens, 32 heads, head_dim 128), and one core
+// sustains ~16 GB/s, so the copy is spread over the compute pool. Capped at 4
+// workers on purpose: pooled threads are asleep by the time a prefill layer
+// reaches this point, and each wake costs ~30 us, so beyond four the wake price
+// exceeds the bandwidth it buys. Below 2 MiB the pool is all overhead.
+void copy_parallel(void* dst, const void* src, std::size_t bytes) {
+    constexpr std::size_t kChunk = std::size_t(1) << 20;
+    static const unsigned workers = [] {
+        zen::ResourceGovernor governor;
+        return std::min(4u, std::max(1u, governor.current_policy().worker_threads));
+    }();
+    if (bytes < 2 * kChunk || workers <= 1) {
+        std::memcpy(dst, src, bytes);
+        return;
+    }
+    const std::size_t chunks = (bytes + kChunk - 1) / kChunk;
+    auto* d = static_cast<std::uint8_t*>(dst);
+    const auto* s = static_cast<const std::uint8_t*>(src);
+    zen::ComputePool::instance().parallel_for(chunks, workers,
+                                              [&](std::size_t first, std::size_t last) {
+        for (std::size_t c = first; c < last; ++c) {
+            const std::size_t off = c * kChunk;
+            const std::size_t n = std::min(kChunk, bytes - off);
+            std::memcpy(d + off, s + off, n);
+        }
+    });
+}
+
 void query_d3d12_features(State& s) {
+    // Wave size. The tiled prefill attention kernel puts one key per lane and
+    // sizes its key tile from WaveGetLaneCount(), so it needs the wave to be no
+    // wider than 64 lanes (its groupshared probability row and its FAQD=4
+    // dimension split are both sized for <= 64). RDNA reports Min=32, Max=64
+    // because both widths are legal, so the test is on Max alone. A device that
+    // reports nothing keeps the legacy kernel.
+    D3D12_FEATURE_DATA_D3D12_OPTIONS1 opts1{};
+    s.wave_tile_ok = SUCCEEDED(s.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1,
+                                                             &opts1, sizeof(opts1))) &&
+                     opts1.WaveLaneCountMin >= 32 && opts1.WaveLaneCountMax <= 64;
+
     // OPTIONS12
     D3D12_FEATURE_DATA_D3D12_OPTIONS12 opts12{};
     if (SUCCEEDED(s.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS12, &opts12, sizeof(opts12)))) {
@@ -659,6 +766,40 @@ void uav_barrier(State& s, ID3D12Resource* resource) {
     uav_barrier_on(s.list.Get(), resource);
 }
 
+bool all_finite_rows(const float* p, std::size_t n) {
+#if defined(ZEN_HAS_AVX2_KERNELS)
+    if (zen::cpu_has_avx2_fma() && n >= 8) return zen::all_finite_f32_avx2(p, n);
+#endif
+    for (std::size_t i = 0; i < n; ++i) {
+        std::uint32_t bits = 0;
+        std::memcpy(&bits, p + i, sizeof(bits));
+        if ((bits & 0x7f800000u) == 0x7f800000u) return false;  // inf or nan
+    }
+    return true;
+}
+
+// Copies host-visible rows into the caller's buffer and rejects non-finite values on the
+// way. A separate full scan of the same bytes cost ~0.23 ms/layer at T=512 on top of the
+// readback copy that always ran right before it; walking them in L2-sized chunks lets the
+// predicate ride on data that is already hot instead of re-reading 5.2 MB from scratch.
+bool copy_check_finite(const float* src, float* dst, std::size_t bytes) {
+    constexpr std::size_t kChunkBytes = 256u * 1024u;
+    const auto* src_bytes = reinterpret_cast<const std::uint8_t*>(src);
+    auto* dst_bytes = reinterpret_cast<std::uint8_t*>(dst);
+    std::size_t done = 0;
+    bool ok = true;
+    while (done < bytes) {
+        const std::size_t run = (bytes - done) < kChunkBytes ? (bytes - done) : kChunkBytes;
+        std::memcpy(dst_bytes + done, src_bytes + done, run);
+        if (ok) {
+            ok = all_finite_rows(reinterpret_cast<const float*>(dst_bytes + done),
+                                 run / sizeof(float));
+        }
+        done += run;
+    }
+    return ok;
+}
+
 // KV direct-write switch (default ON): rope-k and the v matvec write the current
 // token's cache rows straight from compute and attention reads the caches as UAVs.
 // ZEN_D3D12_KVDIRECT=0 restores the CopyBufferRegion append path.
@@ -680,6 +821,24 @@ bool lm_fuse_enabled() {
 // int8-activation DP4A. Default OFF: the fp32 path is the parity default.
 bool dp4a_enabled() {
     const char* e = std::getenv("ZEN_D3D12_DP4A");
+    return e && e[0] == '1';
+}
+
+// Register-tiled prefill GEMM switch (default ON): ZEN_D3D12_GEMM_T=0 restores the
+// v1 kernel. Selected only when DP4A is off; a null PSO (shader missing) also falls
+// back to v1, so init never fails on this switch.
+bool gemm_t_enabled() {
+    const char* e = std::getenv("ZEN_D3D12_GEMM_T");
+    return !(e && e[0] == '0');
+}
+
+// Integer-domain GEMM switch: ZEN_D3D12_GEMM_I8=1 selects the no-dequant kernel.
+// OFF by default and it must stay that way until its accuracy is settled: it
+// quantises activations to int8, which measured 1.6e-3 relative error against the
+// fp32 reference on a 3-token GEMM - fast, but not the project's parity bar. The
+// env var is what makes the two kernels A/B-able in one session.
+bool gemm_i8_enabled() {
+    const char* e = std::getenv("ZEN_D3D12_GEMM_I8");
     return e && e[0] == '1';
 }
 
@@ -747,6 +906,17 @@ std::size_t attn2_min_pos() {
 // built, and the context gate met. Single place for the kill switch.
 bool use_attn2(State& s, std::size_t pos) {
     return attn2_enabled() && s.pso_attn2 != nullptr && pos >= attn2_min_pos();
+}
+
+// attention3 (KV window split across waves, one workgroup per head) is the default
+// decode kernel: ZEN_D3D12_ATTN3=0 is the kill switch back to attention/attention2.
+// Only the CSO failing to build disables it otherwise, and attention.hlsl then runs.
+bool use_attn3(State& s) {
+    const char* e = std::getenv("ZEN_D3D12_ATTN3");
+    const bool enabled = !(e && e[0] == '0');
+    // The kernel holds one head_dim element per lane per round over four rounds, so
+    // head_dim > 128 is out of contract (same bound attention.hlsl documents).
+    return enabled && s.pso_attn3 != nullptr && s.kv_head_dim <= 128;
 }
 
 // Forward declaration
@@ -963,6 +1133,20 @@ void note_dev(State& s, Comp c, std::uint64_t dev_us) {
     s.comp_stats[static_cast<int>(c)].dev_us += dev_us;
 }
 
+// Attributes a group of ops that share one measured bracket but not one command
+// list (the multi-layer pipeline records every layer into a single submission).
+// execute_and_wait() owns ops/submits for per-list paths; this owns it for the
+// paths that wait directly, which is why decode used to report dev=0 and an
+// idle share of 100%.
+void note_group(State& s, Comp c, std::uint64_t ops, std::uint64_t dev_us) {
+    if (!s.trace) {
+        return;
+    }
+    auto& e = s.comp_stats[static_cast<int>(c)];
+    e.ops += ops;
+    e.dev_us += dev_us;
+}
+
 // Prints the per-component decomposition. dev_us comes from GPU timestamp queries,
 // wait_us from the fence; the difference is time the queue spent idle waiting for the
 // GPU, which is where fixed per-submission latency shows up.
@@ -974,12 +1158,12 @@ void print_trace_report() {
     }
     std::cout << "\n     component        ops  submits     dev us    wait us    idle us"
               << std::endl;
-    std::uint64_t tot_dev = 0, tot_wait = 0, tot_ops = 0;
+    std::uint64_t tot_dev = 0, tot_wait = 0, tot_ops = 0, tot_submits = 0;
     auto row = [](const char* name, const State::CompStat& e) {
         const std::uint64_t idle = e.wait_us > e.dev_us ? e.wait_us - e.dev_us : 0;
         std::printf("     %-15s %5llu %8llu %10llu %10llu %10llu\n", name,
                     static_cast<unsigned long long>(e.ops),
-                    static_cast<unsigned long long>(e.ops),
+                    static_cast<unsigned long long>(e.submits),
                     static_cast<unsigned long long>(e.dev_us),
                     static_cast<unsigned long long>(e.wait_us),
                     static_cast<unsigned long long>(idle));
@@ -996,19 +1180,42 @@ void print_trace_report() {
                                                                      : "residual";
         row(name, e);
         tot_ops += e.ops;
+        tot_submits += e.submits;
         tot_dev += e.dev_us;
         tot_wait += e.wait_us;
     }
     const std::uint64_t tot_idle = tot_wait > tot_dev ? tot_wait - tot_dev : 0;
     std::printf("     %-15s %5llu %8llu %10llu %10llu %10llu\n", "TOTAL",
                 static_cast<unsigned long long>(tot_ops),
-                static_cast<unsigned long long>(tot_ops),
+                static_cast<unsigned long long>(tot_submits),
                 static_cast<unsigned long long>(tot_dev),
                 static_cast<unsigned long long>(tot_wait),
                 static_cast<unsigned long long>(tot_idle));
     if (tot_wait) {
         std::printf("     idle share of fence time: %.1f%%\n",
                     100.0 * static_cast<double>(tot_idle) / static_cast<double>(tot_wait));
+    }
+    if (s.trace && s.ts_read) {
+        static const char* const kStage[12] = {"attn-norm", "qkv-gemm", "qk-norm",   "rope",
+                                               "kv-append", "flash",    "ffn-pre",   "ffn-gate",
+                                               "ffn-up",    "ffn-silu", "ffn-down",  "ffn-addn"};
+        std::uint64_t tot = 0;
+        for (int i = 0; i < 12; ++i) tot += s.stage_us[i];
+        std::printf("     prefill stage      us/layer    share  (layers=%llu)",
+                    (unsigned long long)s.stage_layers);
+        std::cout << std::endl;
+        for (int i = 0; i < 12; ++i) {
+            const double per = static_cast<double>(s.stage_us[i]) /
+                               static_cast<double>(s.stage_layers);
+            const double share = tot ? 100.0 * static_cast<double>(s.stage_us[i]) /
+                                           static_cast<double>(tot)
+                                     : 0.0;
+            std::printf("     %-16s %9.1f %7.1f%%", kStage[i], per, share);
+            std::cout << std::endl;
+        }
+        std::printf("     %-16s %9.1f", "layer total",
+                    static_cast<double>(tot) / static_cast<double>(s.stage_layers));
+        std::cout << std::endl;
     }
     std::cout.flush();
 }
@@ -1081,6 +1288,7 @@ bool execute_and_wait(State& s) {
     if (s.trace) {
         auto& e = s.comp_stats[static_cast<int>(s.current_comp)];
         ++e.ops;
+        ++e.submits;
         e.wait_us += waited;
     }
     return true;
@@ -1347,7 +1555,9 @@ bool init_locked(State& s) {
     // attention2 is optional: a failed build leaves pso_attn2 null and the
     // ZEN_D3D12_ATTN2=1 selection falls back to attention.hlsl, never fails init.
     s.pso_attn2 = build_pso(s, zen_dx12_shaders::kAttn2Cso, zen_dx12_shaders::kAttn2CsoSize);
+    s.pso_attn3 = build_pso(s, zen_dx12_shaders::kAttn3Cso, zen_dx12_shaders::kAttn3CsoSize);
     s.pso_rms = build_pso(s, zen_dx12_shaders::kRmsNormCso, zen_dx12_shaders::kRmsNormCsoSize);
+    s.pso_qknorm = build_pso(s, zen_dx12_shaders::kQkNormCso, zen_dx12_shaders::kQkNormCsoSize);
     s.pso_silu = build_pso(s, zen_dx12_shaders::kSiluMulCso, zen_dx12_shaders::kSiluMulCsoSize);
     s.pso_gemm = build_pso(s, zen_dx12_shaders::kQ8_0GemmCso, zen_dx12_shaders::kQ8_0GemmCsoSize);
     s.pso_gemm_q4k = build_pso(s, zen_dx12_shaders::kQ8_0GemmQ4kCso, zen_dx12_shaders::kQ8_0GemmQ4kCsoSize);
@@ -1358,12 +1568,19 @@ bool init_locked(State& s) {
     // GEMM v3 (verify tile BLOCK_T=8, bit-identical): optional,
     // selected by ZEN_D3D12_GEMM_V3=1; v1 stays the default until validated.
     s.pso_gemm_v3 = build_pso(s, zen_dx12_shaders::kQ8_0GemmV3Cso, zen_dx12_shaders::kQ8_0GemmV3CsoSize);
+    s.pso_gemm_t = build_pso(s, zen_dx12_shaders::kQ8_0GemmTCso, zen_dx12_shaders::kQ8_0GemmTCsoSize);
     s.pso_gemm_rt = build_pso(s, zen_dx12_shaders::kQ8_0GemmRtCso, zen_dx12_shaders::kQ8_0GemmRtCsoSize);
     s.pso_gemm_fused = build_pso(s, zen_dx12_shaders::kQ8_0GemmFusedCso, zen_dx12_shaders::kQ8_0GemmFusedCsoSize);
     s.pso_gemm_dp4a = build_pso(s, zen_dx12_shaders::kQ8_0GemmDp4aCso,
                                 zen_dx12_shaders::kQ8_0GemmDp4aCsoSize);
+    s.pso_gemm_i8 = build_pso(s, zen_dx12_shaders::kQ8_0GemmI8Cso,
+                              zen_dx12_shaders::kQ8_0GemmI8CsoSize);
     s.pso_addn = build_pso(s, zen_dx12_shaders::kAddnCso, zen_dx12_shaders::kAddnCsoSize);
     s.pso_flash_attn = build_pso(s, zen_dx12_shaders::kFlashAttnCso, zen_dx12_shaders::kFlashAttnCsoSize);
+    s.pso_flash_tile = build_pso(s, zen_dx12_shaders::kFlashAttnTileCso,
+                                 zen_dx12_shaders::kFlashAttnTileCsoSize);
+    s.pso_flash_keys = build_pso(s, zen_dx12_shaders::kFlashAttnKeysCso,
+                                 zen_dx12_shaders::kFlashAttnKeysCsoSize);
     // Producer-fused quantize variants (ZEN_D3D12_DP4A_FUSEQ=1): optional,
     // like the DP4A pair above - a missing CSO just disables the fused path.
     s.pso_rms_fuse = build_pso(s, zen_dx12_shaders::kRmsNormFusedCso,
@@ -1403,13 +1620,15 @@ bool init_locked(State& s) {
     if (s.trace) {
         D3D12_QUERY_HEAP_DESC query_desc{};
         query_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-        // Pipeline needs 16 layers * 2 queries = 32. Prefill needs 4. Use max.
-        query_desc.Count = 64;
+        // Pipeline needs 16 layers * 2 queries = 32. Prefill needs 4. Layer-0 op
+        // stamps occupy 41..57 and the pre-attention bisection probes 70..73, so the
+        // heap is oversized to 128 to keep room for diagnostics.
+        query_desc.Count = 128;
         query_desc.NodeMask = 0;
         if (FAILED(s.device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&s.ts_heap)))) {
             return fail();
         }
-        s.ts_read = create_buffer(s.device.Get(), 64 * sizeof(std::uint64_t),
+        s.ts_read = create_buffer(s.device.Get(), 128 * sizeof(std::uint64_t),
                                   D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
         if (!s.ts_read) {
             return fail();
@@ -1845,6 +2064,9 @@ bool reserve_scratch(State& s, std::size_t x_bytes, std::size_t y_bytes) {
         s.x_cap = x_bytes;
     }
     if (y_bytes > s.y_cap) {
+        // New scratch: whatever was resident in the old ybuf is gone.
+        s.prefill_resident = false;
+        s.prefill_host_valid = true;
         s.ybuf.Reset();
         s.yread.Reset();
         s.ybuf = create_buffer(s.device.Get(), y_bytes, D3D12_HEAP_TYPE_DEFAULT,
@@ -1980,6 +2202,11 @@ WeightEntry* lookup_weights(State& s, const std::uint8_t* weights, std::size_t r
                             std::size_t columns) {
     auto it = s.weights.find(weights);
     if (it != s.weights.end() && it->second.rows == rows && it->second.columns == columns && it->second.kind == 0) {
+        // NOTE: this trusts the caller to keep the bytes behind `weights` unchanged
+        // while they are resident. A pointer is not a lifetime: once the caller frees
+        // or rewrites that buffer, this address may describe a different tensor, and
+        // the hit below would silently serve the old one. release_q8_0_weights() is the
+        // contract that covers it (the same one release_kquant_weights() provides).
         return &it->second;
     }
     // A different shape at the same address means the loader reused the storage;
@@ -2425,9 +2652,19 @@ bool gemm_locked(State& s, const std::uint8_t* weights, const float* input, floa
     const bool use_v3 = !dp4a && gemm_v3_enabled() && s.pso_gemm_v3 != nullptr;
     const bool use_v2 = !dp4a && !use_v3 && gemm_v2_enabled() && s.pso_gemm_v2 != nullptr;
     const bool use_fused = !dp4a && !use_v3 && !use_v2 && gemm_fused_enabled() && s.pso_gemm_fused != nullptr;
-    const bool use_sh = !dp4a && !use_v3 && !use_v2 && !use_fused && gemm_sh_enabled() && s.pso_gemm_sh != nullptr;
+    const bool use_sh = !dp4a && !use_v3 && !use_v2 && !use_fused && !gemm_t_enabled() &&
+                        gemm_sh_enabled() && s.pso_gemm_sh != nullptr;
+    // Register-tiled kernel: a 2D grid over (row tiles, token tiles) instead of the 1D
+    // row grid whose token loop re-read the weights once per 64-token group. Preferred
+    // whenever it is available and DP4A is off, unless ZEN_D3D12_GEMM_T=0.
+    // Integer-domain kernel: raw weights, dp4a, block-level scales. Outranks the fp32
+    // tiles whenever the CSO exists (Shader Model 6.4+).
+    const bool use_i8 = !dp4a && gemm_i8_enabled() && s.pso_gemm_i8 != nullptr;
+    const bool use_t = !dp4a && !use_i8 && gemm_t_enabled() && s.pso_gemm_t != nullptr;
     const std::uint32_t tile_v2 = use_v3 ? kTokensPerTileV3
                                     : (use_v2 ? kTokensPerTileV2 : kTokensPerTile);
+    constexpr std::uint32_t kTokensPerTileT = 64;
+    constexpr std::uint32_t kRowsPerGroupT = 64;
     const std::uint32_t rpg_v2 = use_v3 ? kGemmRowsPerGroupV3
                                    : (use_v2 ? kGemmRowsPerGroupV2 : kGemmRowsPerGroup);
 
@@ -2494,7 +2731,9 @@ bool gemm_locked(State& s, const std::uint8_t* weights, const float* input, floa
 
     s.allocator->Reset();
     s.list->Reset(s.allocator.Get(),
-                  dp4a ? s.pso_gemm_dp4a.Get()
+                  use_i8 ? s.pso_gemm_i8.Get()
+                  : use_t ? s.pso_gemm_t.Get()
+                  : dp4a ? s.pso_gemm_dp4a.Get()
                         : (use_fused ? s.pso_gemm_fused.Get()
                         : (use_v3 ? s.pso_gemm_v3.Get()
                         : (use_v2 ? s.pso_gemm_v2.Get()
@@ -2515,10 +2754,22 @@ bool gemm_locked(State& s, const std::uint8_t* weights, const float* input, floa
     // loop differs. Keeping them equal avoids a second dispatch geometry.
     // (v2 uses its own 8-row tiling; dp4a forces v1 tiling.)
     const std::uint32_t rows_per_group = dp4a ? kGemmRowsPerGroup : rpg_v2;
-    if (use_fused) {
+    if (use_i8) {
+        // Integer kernel tile: 128 rows x 64 tokens, 8x4 accumulators per thread.
+        constexpr std::uint32_t kRowsPerGroupI8 = 128;
+        s.list->Dispatch(static_cast<UINT>((rows + kRowsPerGroupI8 - 1) / kRowsPerGroupI8),
+                         static_cast<UINT>((tokens + kTokensPerTileT - 1) / kTokensPerTileT),
+                         1);
+    } else if (use_t) {
+        // One workgroup per (64-row, 64-token) output tile. The kernel reads only
+        // in-range tokens/rows, so the staging buffer needs no tile padding.
+        s.list->Dispatch(static_cast<UINT>((rows + kRowsPerGroupT - 1) / kRowsPerGroupT),
+                         static_cast<UINT>((tokens + kTokensPerTileT - 1) / kTokensPerTileT),
+                         1);
+    } else if (use_fused) {
         s.list->Dispatch(static_cast<UINT>((rows + 3u) / 4u), static_cast<UINT>((tokens + 3u) / 4u), 1);
     } else {
-        s.list->Dispatch(static_cast<UINT>((rows + rows_per_group - 1) / rows_per_group), 1, 1);
+        s.list->Dispatch(static_cast<std::uint32_t>((rows + rows_per_group - 1) / rows_per_group), 1, 1);
     }
     if (s.trace) {
         s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
@@ -2627,12 +2878,21 @@ bool gemm_batch_locked(State& s, const float* x, const GemmTask* tasks,
     }
 
     const std::size_t blocks_per_row = columns / kElemsPerBlock;
-    const bool use_v3_b = gemm_v3_enabled() && s.pso_gemm_v3 != nullptr;
-    const bool use_v2_b = !use_v3_b && gemm_v2_enabled() && s.pso_gemm_v2 != nullptr;
-    const bool use_fused_b = !use_v3_b && !use_v2_b && gemm_fused_enabled() && s.pso_gemm_fused != nullptr;
-    const bool use_sh_b = !use_v3_b && !use_v2_b && !use_fused_b && gemm_sh_enabled() && s.pso_gemm_sh != nullptr;
-    const bool use_rt_b = !use_v3_b && !use_v2_b && !use_fused_b && !use_sh_b && gemm_rt_enabled() && s.pso_gemm_rt != nullptr;
-    const std::uint32_t tile_b = use_v3_b ? kTokensPerTileV3
+    // The register-tiled kernel must be selected here as well as in gemm_locked: the
+    // parity test requires the batch wrapper to be bit-identical to separate single
+    // submissions, which only holds while both paths dispatch the same kernel.
+    // Same kernel selection as gemm_locked, including the integer kernel: prefill
+    // goes through this batch wrapper, so leaving it on the fp32 tile would mean the
+    // i8 kernel only ever ran in the parity tool.
+    const bool use_i8_b = gemm_i8_enabled() && s.pso_gemm_i8 != nullptr;
+    const bool use_t_b = !use_i8_b && gemm_t_enabled() && s.pso_gemm_t != nullptr;
+    const bool use_v3_b = !use_t_b && gemm_v3_enabled() && s.pso_gemm_v3 != nullptr;
+    const bool use_v2_b = !use_t_b && !use_v3_b && gemm_v2_enabled() && s.pso_gemm_v2 != nullptr;
+    const bool use_fused_b = !use_t_b && !use_v3_b && !use_v2_b && gemm_fused_enabled() && s.pso_gemm_fused != nullptr;
+    const bool use_sh_b = !use_t_b && !use_v3_b && !use_v2_b && !use_fused_b && gemm_sh_enabled() && s.pso_gemm_sh != nullptr;
+    const bool use_rt_b = !use_t_b && !use_v3_b && !use_v2_b && !use_fused_b && !use_sh_b && gemm_rt_enabled() && s.pso_gemm_rt != nullptr;
+    const std::uint32_t tile_b = use_t_b ? 64u
+                              : use_v3_b ? kTokensPerTileV3
                               : (use_v2_b ? kTokensPerTileV2 : kTokensPerTile);
     const std::uint32_t rpg_b = use_v3_b ? kGemmRowsPerGroupV3
                             : (use_v2_b ? kGemmRowsPerGroupV2 : kGemmRowsPerGroup);
@@ -2671,9 +2931,11 @@ bool gemm_batch_locked(State& s, const float* x, const GemmTask* tasks,
 
     s.allocator->Reset();
     s.list->Reset(s.allocator.Get(),
-                  use_fused_b ? s.pso_gemm_fused.Get()
+                  use_i8_b ? s.pso_gemm_i8.Get()
+                  : use_t_b ? s.pso_gemm_t.Get()
+                  : (use_fused_b ? s.pso_gemm_fused.Get()
                   : (use_v3_b ? s.pso_gemm_v3.Get()
-                  : (use_v2_b ? s.pso_gemm_v2.Get() : s.pso_gemm.Get())));
+                  : (use_v2_b ? s.pso_gemm_v2.Get() : s.pso_gemm.Get()))));
     s.list->SetComputeRootSignature(s.root.Get());
     if (s.trace) {
         s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
@@ -2687,7 +2949,13 @@ bool gemm_batch_locked(State& s, const float* x, const GemmTask* tasks,
         s.list->SetComputeRootShaderResourceView(2, scales[i]);
         s.list->SetComputeRootShaderResourceView(3, s.xbuf->GetGPUVirtualAddress());
         s.list->SetComputeRootUnorderedAccessView(5, s.ybuf->GetGPUVirtualAddress() + offsets[i]);
-        if (use_fused_b) {
+        if (use_i8_b) {
+            s.list->Dispatch(static_cast<UINT>((tasks[i].rows + 127u) / 128u),
+                             static_cast<UINT>((tokens + 63u) / 64u), 1);
+        } else if (use_t_b) {
+            s.list->Dispatch(static_cast<UINT>((tasks[i].rows + 63u) / 64u),
+                             static_cast<UINT>((tokens + 63u) / 64u), 1);
+        } else if (use_fused_b) {
             s.list->Dispatch(
                 static_cast<UINT>((tasks[i].rows + 3u) / 4u),
                 static_cast<UINT>((tokens + 3u) / 4u), 1);
@@ -2992,11 +3260,175 @@ bool gemm_q8_0_batch(const float* x, const GemmTask* tasks, std::size_t count,
 // Output is [tokens, heads, head_dim].
 // Uses tiled FlashAttention algorithm with causal masking and KV cache.
 // Returns false if not supported (falls back to CPU attention).
+// FlashAttention scratch: Q upload staging (read as an SRV), the device output, and
+// the readback buffer. Created in the state each buffer rests in between calls, so the
+// round trip is identical on first and later use. Shared by the standalone entry and
+// by the fused prefill front, which also needs the output buffer.
+bool ensure_flash_scratch(State& s, std::size_t q_bytes, std::size_t out_bytes) {
+    static const bool fa_stage = [] {
+        const char* e = std::getenv("ZEN_D3D12_FA_STAGE");
+        return e && e[0] == '1';
+    }();
+    if (s.fa_q && s.fa_out && s.fa_rd && s.fa_cap >= q_bytes &&
+        (!fa_stage || (s.fa_qup && s.fa_qdev))) {
+        return true;
+    }
+    s.fa_q.Reset();
+    s.fa_out.Reset();
+    s.fa_rd.Reset();
+    s.fa_qup.Reset();
+    s.fa_qdev.Reset();
+    s.fa_q_cpu = nullptr;
+    s.fa_qup_cpu = nullptr;
+    s.fa_cap = 0;
+    const std::size_t cap = q_bytes > out_bytes ? q_bytes : out_bytes;
+    s.fa_q = create_buffer(s.device.Get(), cap, D3D12_HEAP_TYPE_UPLOAD,
+                           D3D12_RESOURCE_STATE_GENERIC_READ);
+    s.fa_out = create_buffer(s.device.Get(), cap, D3D12_HEAP_TYPE_DEFAULT,
+                             D3D12_RESOURCE_STATE_COPY_SOURCE,
+                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    s.fa_rd = create_buffer(s.device.Get(), cap, D3D12_HEAP_TYPE_READBACK,
+                            D3D12_RESOURCE_STATE_COPY_DEST);
+    if (fa_stage) {
+        s.fa_qdev = create_buffer(s.device.Get(), cap, D3D12_HEAP_TYPE_DEFAULT,
+                                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        s.fa_qup = create_buffer(s.device.Get(), cap, D3D12_HEAP_TYPE_UPLOAD,
+                                 D3D12_RESOURCE_STATE_GENERIC_READ);
+    }
+    if (!(s.fa_q && s.fa_out && s.fa_rd && (!fa_stage || (s.fa_qup && s.fa_qdev)))) {
+        return false;
+    }
+    if (FAILED(s.fa_q->Map(0, nullptr, &s.fa_q_cpu))) {
+        return false;
+    }
+    if (fa_stage && FAILED(s.fa_qup->Map(0, nullptr, &s.fa_qup_cpu))) {
+        return false;
+    }
+    s.fa_cap = cap;
+    return true;
+}
+
+// Which prefill attention kernel to record.
+//
+//   Keys32  - shaders/flash_attention_keys.hlsl: one lane owns one key, so a tile of
+//             32 keys costs one max and one sum instead of 32 reductions. The cross-lane
+//             tree stays inside 32-lane blocks, so it does not care whether the device
+//             runs 32- or 64-lane waves. Requires head_dim exactly 128 (32 float4 lanes
+//             per row) and one workgroup per GQA group, i.e. heads / kv_heads == 4.
+//   Tokens8 - shaders/flash_attention_tile.hlsl: 8 query tokens per wave with the
+//             dimensions across the lanes. The general tiled fallback.
+//   Legacy  - shaders/flash_attention.hlsl: one wave per (token, head).
+enum class FlashKernel { Legacy, Tokens8, Keys32 };
+
+inline const char* flash_kernel_name(FlashKernel k) {
+    switch (k) {
+    case FlashKernel::Keys32: return "keys";
+    case FlashKernel::Tokens8: return "tile";
+    default: return "legacy";
+    }
+}
+
+// ZEN_D3D12_FLASH_T=0 drops both tiled kernels; ZEN_D3D12_FLASH_KEYS=0 drops only the
+// keys-across-lanes one, which is what makes a same-window A/B possible.
+inline FlashKernel flash_kernel_pick(const State& s, std::size_t heads,
+                                     std::size_t kv_heads, std::size_t head_dim) {
+    static const bool tiled_on = [] {
+        const char* e = std::getenv("ZEN_D3D12_FLASH_T");
+        return !(e && e[0] == '0');
+    }();
+    static const bool keys_on = [] {
+        const char* e = std::getenv("ZEN_D3D12_FLASH_KEYS");
+        return !(e && e[0] == '0');
+    }();
+    if (!tiled_on || !s.wave_tile_ok || !s.pso_flash_tile || head_dim > 128 ||
+        kv_heads > heads || (heads % kv_heads) != 0) {
+        return FlashKernel::Legacy;
+    }
+    if (keys_on && s.pso_flash_keys && head_dim == 128 && (heads / kv_heads) == 4) {
+        return FlashKernel::Keys32;
+    }
+    return FlashKernel::Tokens8;
+}
+
+// Records the FlashAttention dispatch into the command list that is already open. The
+// caller owns the resource states: Q readable as an SRV, both KV caches readable as
+// SRVs, and `out_va` writable as a UAV. The standalone entry does the Q upload and the
+// readback around this; the fused prefill front runs it in the same list as the QKV
+// GEMM, qk norm, rope and KV append, so a prefill layer pays ONE fence for the whole
+// attention half and the data is already where the kernel wants it.
+void flash_record_locked(State& s, std::uint64_t q_va, std::uint64_t out_va,
+                         std::size_t tokens, std::size_t heads, std::size_t kv_heads,
+                         std::size_t head_dim, float inv_scale, std::size_t layer,
+                         std::size_t start_pos) {
+    struct FlashAttnParamsCB {
+        uint32_t tokens;
+        uint32_t heads;
+        uint32_t kv_heads;
+        uint32_t head_dim;
+        float inv_scale;
+        uint32_t kv_cache_base;
+        uint32_t kv_cache_stride;
+        uint32_t valid_kv_tokens;
+        uint32_t start_pos;
+        uint32_t first_pos;
+        uint32_t pad0;
+        uint32_t pad1;
+    };
+    FlashAttnParamsCB cb{};
+    cb.tokens = static_cast<uint32_t>(tokens);
+    cb.heads = static_cast<uint32_t>(heads);
+    cb.kv_heads = static_cast<uint32_t>(kv_heads);
+    cb.head_dim = static_cast<uint32_t>(head_dim);
+    cb.inv_scale = inv_scale;
+    cb.kv_cache_base =
+        static_cast<uint32_t>(layer * s.kv_context * s.kv_heads * s.kv_head_dim);
+    cb.kv_cache_stride = static_cast<uint32_t>(s.kv_heads * s.kv_head_dim);
+    cb.valid_kv_tokens = static_cast<uint32_t>(start_pos + tokens);
+    cb.start_pos = static_cast<uint32_t>(start_pos);
+    cb.first_pos = 0;
+    cb.pad0 = 0;
+    cb.pad1 = 0;
+    // Slot 0 is the flash CB; every other slot in this list belongs to the GEMMs,
+    // qk-norm and rope dispatches around it.
+    std::memcpy(s.params_cpu, &cb, sizeof(cb));
+
+    // Prefill attention kernel: keys-across-lanes, 8 tokens per wave, or legacy.
+    const FlashKernel fk = flash_kernel_pick(s, heads, kv_heads, head_dim);
+    if (s.trace) {
+        std::printf("[d3d12] flash_attention: kernel=%s layer=%zu tokens=%zu\n",
+                    flash_kernel_name(fk), layer, tokens);
+    }
+    s.list->SetComputeRootSignature(s.root.Get());
+    ID3D12PipelineState* flash_pso = s.pso_flash_attn.Get();
+    if (fk == FlashKernel::Tokens8) {
+        flash_pso = s.pso_flash_tile.Get();
+    } else if (fk == FlashKernel::Keys32) {
+        flash_pso = s.pso_flash_keys.Get();
+    }
+    s.list->SetPipelineState(flash_pso);
+    s.list->SetComputeRootConstantBufferView(0, s.params->GetGPUVirtualAddress());
+    s.list->SetComputeRootShaderResourceView(1, q_va);
+    s.list->SetComputeRootShaderResourceView(2, s.kcache->GetGPUVirtualAddress());
+    s.list->SetComputeRootShaderResourceView(3, s.vcache->GetGPUVirtualAddress());
+    s.list->SetComputeRootUnorderedAccessView(5, out_va);
+    if (fk == FlashKernel::Keys32) {
+        // One workgroup per GQA group (4 query heads sharing a KV head) per token.
+        s.list->Dispatch(static_cast<uint32_t>(heads / 4), static_cast<uint32_t>(tokens), 1);
+    } else {
+        // 8 query tokens per workgroup for the tiled kernel, one for the legacy one.
+        const uint32_t q_blocks = (fk == FlashKernel::Tokens8)
+                                      ? static_cast<uint32_t>((tokens + 7) / 8)
+                                      : static_cast<uint32_t>(tokens);
+        s.list->Dispatch(static_cast<uint32_t>(heads), q_blocks, 1);
+    }
+}
+
 bool flash_attention_prefill(const float* q, const float* k, const float* v, float* out,
                              std::size_t tokens, std::size_t heads, std::size_t kv_heads,
                              std::size_t head_dim, float inv_scale,
                              std::size_t layer, std::size_t start_pos,
-                             std::size_t kv_context, std::size_t k_cache_heads, std::size_t k_cache_head_dim) noexcept {
+                             std::size_t kv_context, std::size_t k_cache_heads,
+                             std::size_t k_cache_head_dim, bool q_on_device) noexcept {
     (void)k; (void)v; // K/V from host not used; read from device KV cache
 
     State& s = state();
@@ -3005,7 +3437,7 @@ bool flash_attention_prefill(const float* q, const float* k, const float* v, flo
         if (s.trace) std::printf("[d3d12] flash_attention: FAIL - init_locked\n");
         return false;
     }
-    if (!q || !out || tokens == 0 || heads == 0 || kv_heads == 0 || head_dim == 0) {
+    if ((!q && !q_on_device) || tokens == 0 || heads == 0 || kv_heads == 0 || head_dim == 0) {
         if (s.trace) std::printf("[d3d12] flash_attention: FAIL - null ptr or zero dims\n");
         return false;
     }
@@ -3058,6 +3490,16 @@ bool flash_attention_prefill(const float* q, const float* k, const float* v, flo
         return false;
     }
     const std::size_t kv_ctx = s.kv_context;
+    if (q_on_device) {
+        const std::size_t need = tokens * heads * head_dim * sizeof(float);
+        if (!s.front_dev || s.front_bytes < need) {
+            if (s.trace) {
+                std::printf("[d3d12] flash_attention: FAIL - no device Q (%zu < %zu)\n",
+                            s.front_bytes, need);
+            }
+            return false;
+        }
+    }
 
     if (s.trace) std::printf("[d3d12] flash_attention: START tokens=%zu heads=%zu kv_heads=%zu head_dim=%zu layer=%zu start_pos=%zu\n",
                          tokens, heads, kv_heads, head_dim, layer, start_pos);
@@ -3066,47 +3508,70 @@ bool flash_attention_prefill(const float* q, const float* k, const float* v, flo
     const std::size_t q_bytes = tokens * heads * head_dim * sizeof(float);
     const std::size_t out_bytes = tokens * heads * head_dim * sizeof(float);
 
-    // Grow the reusable scratch only when the batch got bigger. Both device
-    // buffers are created in the state they hold between calls, so the round trip
+    // Grow the reusable scratch only when the batch got bigger. Every device
+    // buffer is created in the state it holds between calls, so the round trip
     // below is identical on the first and every later use.
-    if (!s.fa_q || !s.fa_out || !s.fa_qup || !s.fa_rd || s.fa_cap < q_bytes) {
-        s.fa_q.Reset();
-        s.fa_out.Reset();
-        s.fa_qup.Reset();
-        s.fa_rd.Reset();
-        s.fa_qup_cpu = nullptr;
-        const std::size_t cap = q_bytes > out_bytes ? q_bytes : out_bytes;
-        s.fa_q = create_buffer(s.device.Get(), cap, D3D12_HEAP_TYPE_DEFAULT,
-                               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        s.fa_out = create_buffer(s.device.Get(), cap, D3D12_HEAP_TYPE_DEFAULT,
-                                 D3D12_RESOURCE_STATE_COPY_SOURCE,
-                                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-        s.fa_qup = create_buffer(s.device.Get(), cap, D3D12_HEAP_TYPE_UPLOAD,
-                                 D3D12_RESOURCE_STATE_GENERIC_READ);
-        s.fa_rd = create_buffer(s.device.Get(), cap, D3D12_HEAP_TYPE_READBACK,
-                                D3D12_RESOURCE_STATE_COPY_DEST);
-        if (!s.fa_q || !s.fa_out || !s.fa_qup || !s.fa_rd) {
-            if (s.trace) std::printf("[d3d12] flash_attention: FAIL - scratch create\n");
-            return false;
-        }
-        if (FAILED(s.fa_qup->Map(0, nullptr, &s.fa_qup_cpu))) {
-            if (s.trace) std::printf("[d3d12] flash_attention: FAIL - scratch map\n");
-            return false;
-        }
-        s.fa_cap = cap;
+    //
+    // Q is the one buffer that is NOT in a default heap. Q arrives in host RAM
+    // (the QKV GEMM reads it back), so it has to cross the bus either way; with
+    // a DEFAULT-heap SRV it crossed twice - once into upload staging and once
+    // again in a CopyBufferRegion into VRAM - and that second copy measured
+    // 0.44 ms per layer at 512 tokens. An UPLOAD heap buffer is legally readable
+    // as an SRV, so the host memcpy is now the only transfer and the resource
+    // needs no state transitions at all.
+    // Ablation gate: ZEN_D3D12_FA_STAGE=1 restores the old two-hop Q upload
+    // (host -> staging, then a CopyBufferRegion into a DEFAULT-heap SRV) so the
+    // two paths can be compared under the same load, in one session.
+    static const bool fa_stage = [] {
+        const char* e = std::getenv("ZEN_D3D12_FA_STAGE");
+        return e && e[0] == '1';
+    }();
+    if (!ensure_flash_scratch(s, q_bytes, out_bytes)) {
+        if (s.trace) std::printf("[d3d12] flash_attention: FAIL - scratch\n");
+        return false;
     }
-    ID3D12Resource* qbuf = s.fa_q.Get();
+    // Device Q: the fused attention front leaves the rotated q in front_dev, so the
+    // kernel reads it there and this call performs no host transfer at all.
+    ID3D12Resource* qbuf = q_on_device ? s.front_dev.Get()
+                                       : (fa_stage ? s.fa_qdev.Get() : s.fa_q.Get());
     ID3D12Resource* outbuf = s.fa_out.Get();
 
-    std::memcpy(s.fa_qup_cpu, q, q_bytes);
+    // Direct path: the memcpy target IS the SRV buffer, so it is the only
+    // transfer. Parallel there because the target is host-visible GPU memory
+    // (write-combined): 0.59 ms over four threads against 1.15 ms on one. Staged
+    // path: the memcpy fills system-memory staging, where one thread is enough.
+    const auto upload_start = std::chrono::steady_clock::now();
+    if (q_on_device) {
+        // No transfer: Q is already in VRAM.
+    } else if (fa_stage) {
+        std::memcpy(s.fa_qup_cpu, q, q_bytes);
+    } else {
+        copy_parallel(s.fa_q_cpu, q, q_bytes);
+    }
+    const auto gpu_copy_start = std::chrono::steady_clock::now();
+
+    if (fa_stage) {
+        s.allocator->Reset();
+        s.list->Reset(s.allocator.Get(), nullptr);
+        transition(s, qbuf, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                   D3D12_RESOURCE_STATE_COPY_DEST);
+        s.list->CopyBufferRegion(qbuf, 0, s.fa_qup.Get(), 0, q_bytes);
+        transition(s, qbuf, D3D12_RESOURCE_STATE_COPY_DEST,
+                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        s.list->Close();
+        ID3D12CommandList* lists[] = {s.list.Get()};
+        s.queue->ExecuteCommandLists(1, lists);
+        s.fence_value += 1;
+        if (FAILED(s.queue->Signal(s.fence.Get(), s.fence_value)) ||
+            FAILED(s.fence->SetEventOnCompletion(s.fence_value, s.fence_event))) {
+            if (s.trace) std::printf("[d3d12] flash_attention: FAIL - staging fence\n");
+            return false;
+        }
+        WaitForSingleObject(s.fence_event, INFINITE);
+    }
 
     s.allocator->Reset();
     s.list->Reset(s.allocator.Get(), nullptr);
-    transition(s, qbuf, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-               D3D12_RESOURCE_STATE_COPY_DEST);
-    s.list->CopyBufferRegion(qbuf, 0, s.fa_qup.Get(), 0, q_bytes);
-    transition(s, qbuf, D3D12_RESOURCE_STATE_COPY_DEST,
-               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     // The KV caches live in UNORDERED_ACCESS (decode writes them from compute and its
     // attention reads them as UAVs). This shader reads them as SRVs, so they take one
     // NSR cycle here - once per prefill submission, never per decode token.
@@ -3147,27 +3612,51 @@ bool flash_attention_prefill(const float* q, const float* k, const float* v, flo
     // Use params buffer for constant data
     std::memcpy(s.params_cpu, &cb, sizeof(cb));
     
+    // Prefill attention kernel: keys-across-lanes, 8 tokens per wave, or legacy.
+    const FlashKernel fk = flash_kernel_pick(s, heads, kv_heads, head_dim);
+
+    if (s.trace) {
+        std::printf("[d3d12] flash_attention: kernel=%s\n", flash_kernel_name(fk));
+    }
+
     // Set up root signature and pipeline
     s.list->SetComputeRootSignature(s.root.Get());
-    s.list->SetPipelineState(s.pso_flash_attn.Get());
-    s.list->SetComputeRootConstantBufferView(0, s.params->GetGPUVirtualAddress());
-    s.list->SetComputeRootShaderResourceView(1, qbuf->GetGPUVirtualAddress());
-    s.list->SetComputeRootShaderResourceView(2, s.kcache->GetGPUVirtualAddress());
-    s.list->SetComputeRootShaderResourceView(3, s.vcache->GetGPUVirtualAddress());
+    ID3D12PipelineState* flash_pso = s.pso_flash_attn.Get();
+    if (fk == FlashKernel::Tokens8) {
+        flash_pso = s.pso_flash_tile.Get();
+    } else if (fk == FlashKernel::Keys32) {
+        flash_pso = s.pso_flash_keys.Get();
+    }
+    s.list->SetPipelineState(flash_pso);
+    if (q_on_device) {
+        transition(s, s.front_dev.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
     // Transition output to copy source, after first bringing it out of the state
     // it was left in by the previous call.
     transition(s, outbuf, D3D12_RESOURCE_STATE_COPY_SOURCE,
                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    s.list->SetComputeRootUnorderedAccessView(5, outbuf->GetGPUVirtualAddress());
-    s.list->Dispatch(static_cast<uint32_t>(heads), static_cast<uint32_t>(tokens), 1);
+    flash_record_locked(s, qbuf->GetGPUVirtualAddress(), outbuf->GetGPUVirtualAddress(),
+                        tokens, heads, kv_heads, head_dim, inv_scale, layer, start_pos);
     // Hand the caches back to the decode path in the UAV state it assumes.
     transition(s, s.kcache.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     transition(s, s.vcache.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    transition(s, outbuf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-               D3D12_RESOURCE_STATE_COPY_SOURCE);
-    s.list->CopyBufferRegion(s.fa_rd.Get(), 0, outbuf, 0, out_bytes);
+    if (q_on_device) {
+        // Back to the state the next front submission creates it in.
+        transition(s, s.front_dev.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+    // A null `out` means the caller keeps the result on the device: the FFN chain
+    // reads it from fa_out, so it stays in UNORDERED_ACCESS and the readback of the
+    // whole attention output (~8 MB per layer at T=512) does not happen.
+    const bool keep_out = out == nullptr;
+    if (!keep_out) {
+        transition(s, outbuf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                   D3D12_RESOURCE_STATE_COPY_SOURCE);
+        s.list->CopyBufferRegion(s.fa_rd.Get(), 0, outbuf, 0, out_bytes);
+    }
     s.list->Close();
 
     const auto dispatch_start = std::chrono::steady_clock::now();
@@ -3182,25 +3671,33 @@ bool flash_attention_prefill(const float* q, const float* k, const float* v, flo
         report_device_removed(s.device.Get(), "flash_attention_prefill");
         return false;
     }
+    const auto readback_start = std::chrono::steady_clock::now();
+    if (!keep_out) {
+        void* mapped = nullptr;
+        const D3D12_RANGE read_range{0, out_bytes};
+        if (FAILED(s.fa_rd->Map(0, &read_range, &mapped))) {
+            if (s.trace) std::printf("[d3d12] flash_attention: FAIL - readback Map\n");
+            return false;
+        }
+        copy_parallel(out, mapped, out_bytes);
+        const D3D12_RANGE write_range{0, 0};
+        s.fa_rd->Unmap(0, &write_range);
+    }
+
     if (s.trace) {
-        const double ms = std::chrono::duration<double, std::milli>(
-                              std::chrono::steady_clock::now() - dispatch_start)
-                              .count();
-        std::printf("[d3d12] flash_attention: gpu %.2f ms layer=%zu\n", ms, layer);
+        const auto now = std::chrono::steady_clock::now();
+        const double gpu_ms = std::chrono::duration<double, std::milli>(
+                                  readback_start - dispatch_start).count();
+        const double read_ms =
+            std::chrono::duration<double, std::milli>(now - readback_start).count();
+        const double up_ms = std::chrono::duration<double, std::milli>(
+                                 gpu_copy_start - upload_start).count();
+        const double rec_ms = std::chrono::duration<double, std::milli>(
+                                  dispatch_start - gpu_copy_start).count();
+        std::printf("[d3d12] flash_attention: gpu %.2f ms layer=%zu (upload %.2f, record %.2f, "
+                    "dispatch+fence %.2f, readback %.2f)\n",
+                    up_ms + rec_ms + gpu_ms + read_ms, layer, up_ms, rec_ms, gpu_ms, read_ms);
     }
-
-    // Map and copy output
-    void* mapped = nullptr;
-    const D3D12_RANGE read_range{0, out_bytes};
-    if (FAILED(s.fa_rd->Map(0, &read_range, &mapped))) {
-        if (s.trace) std::printf("[d3d12] flash_attention: FAIL - readback Map\n");
-        return false;
-    }
-    std::memcpy(out, mapped, out_bytes);
-    const D3D12_RANGE write_range{0, 0};
-    s.fa_rd->Unmap(0, &write_range);
-
-    if (s.trace) std::printf("[d3d12] flash_attention: SUCCESS\n");
     return true;
 }
 
@@ -3294,6 +3791,8 @@ void shutdown() noexcept {
     s.nbuf.Reset();
     s.n_cpu = nullptr;
     s.n_cap = 0;
+    s.attn_norm_dev.Reset();
+    s.attn_norm_cap = 0;
     // Every device-created object must go, and every cached size must go with it:
     // leaving f_cap/w_cap set while the buffer is released would let a later init
     // reuse a scratch buffer that belongs to the destroyed device.
@@ -3302,9 +3801,11 @@ void shutdown() noexcept {
     s.pso_gemm_q4k.Reset();
     s.pso_gemm_v2.Reset();
     s.pso_gemm_v3.Reset();
+    s.pso_gemm_t.Reset();
     s.pso_gemm_rt.Reset();
     s.pso_gemm_fused.Reset();
     s.pso_gemm_dp4a.Reset();
+    s.pso_gemm_i8.Reset();
     s.pso_gemv_dp4a.Reset();
     s.pso_quantize_acts.Reset();
     s.pso_rope.Reset();
@@ -3313,11 +3814,14 @@ void shutdown() noexcept {
     s.pso_attn2.Reset();
     s.pso_silu.Reset();
     s.pso_rms.Reset();
+    s.pso_qknorm.Reset();
     s.pso_rms_fuse.Reset();
     s.pso_silu_fuse.Reset();
     s.pso_attn_fuse.Reset();
     s.pso_addn.Reset();
     s.pso_flash_attn.Reset();
+    s.pso_flash_tile.Reset();
+    s.pso_flash_keys.Reset();
     s.fbuf.Reset();
     s.f_cap = 0;
     s.wbuf.Reset();
@@ -3478,6 +3982,7 @@ bool gemv_ffn_locked(State& s, const std::uint8_t* gate_w, const std::uint8_t* u
     s.list->SetComputeRootShaderResourceView(3, s.fbuf->GetGPUVirtualAddress());
     s.list->SetComputeRootUnorderedAccessView(5, y_base + off_down);
     s.list->Dispatch(out_groups, 1, 1);
+
     if (s.trace) {
         s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
     }
@@ -3592,7 +4097,15 @@ bool addn_locked(State& s, const float* a, const float* b, float* out, std::size
     s.list->SetComputeRootShaderResourceView(1, s.xbuf->GetGPUVirtualAddress());
     s.list->SetComputeRootShaderResourceView(2, s.wbuf->GetGPUVirtualAddress());
     s.list->SetComputeRootUnorderedAccessView(5, s.ybuf->GetGPUVirtualAddress());
+    if (s.trace) {
+        s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+    }
     s.list->Dispatch(groups, 1, 1);
+    if (s.trace) {
+        s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+        s.list->ResolveQueryData(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 2,
+                                 s.ts_read.Get(), 0);
+    }
 
     transition(s, s.ybuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -3609,6 +4122,11 @@ bool addn_locked(State& s, const float* a, const float* b, float* out, std::size
     const D3D12_RANGE read_range{0, bytes};
     if (FAILED(s.yread->Map(0, &read_range, &mapped))) {
         return false;
+    }
+    if (s.trace) {
+        std::uint64_t dev = 0;
+        accumulate_gpu_us(s, dev, 0, 1);
+        note_dev(s, Comp::Residual, dev);
     }
     std::memcpy(out, mapped, bytes);
     const D3D12_RANGE written{0, 0};
@@ -3875,6 +4393,658 @@ bool rope_apply_prefill(const float* x, const float* cos, const float* sin, floa
     }
     if (!rope_prefill_locked(s, x, cos, sin, out, tokens, heads, head_dim, pairs,
                              interleaved_pairs)) {
+        ++s.stats.fallbacks;
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Prefill attention front half in ONE submission: QKV GEMM -> qk RMS-norm -> RoPE
+// -> KV cache append, entirely over device scratch.
+//
+// Before this, each of those four stages was its own submission and each bounced its
+// activation through host RAM: the QKV GEMM read q/k/v back, prefill rope uploaded q
+// and k and read them down again, and the KV append re-uploaded the same roped rows -
+// four synchronous fences and ~10 MB of avoidable traffic per layer at T=512.
+//
+// q, k and v still come back to the host, because flash attention takes Q from the
+// host and the runtime keeps host K/V for its CPU fallback; the rotations and the
+// cache write happen on the device. The kernels are the ones decode already uses -
+// qk_norm.hlsl aliased through UAV slots 5/6, rope_prefill.hlsl reading raw VAs - so
+// this adds no shader and no new arithmetic, only the batching.
+//
+// The caller must only take this path when there are no attention biases, no ALiBi,
+// no sliding window, Q8_0 projections, and a device KV cache sized for this layer.
+// ---------------------------------------------------------------------------
+// Parameter slots the FFN half writes into the shared parameter buffer. Every CBV is
+// read at execution, so two dispatches in one command list may never share a slot: the
+// single-submission path hands in the standalone layout shifted past the attention
+// half's slots (flash 0, rope 1280/1536, QKV 3072/3328/3584, qk norm 7680/7936).
+struct FfnSlots {
+    std::uint64_t gemm_base = 1024;  // four GEMMs at gemm_base + 256*i
+    std::uint64_t rms = 256;
+    std::uint64_t silu = 3072;
+    std::uint64_t addn0 = 2560;
+    std::uint64_t addn1 = 2816;
+};
+
+// Everything the FFN half needs once its inputs are staged and its scratch reserved.
+// Splitting "plan" (validate, stage, reserve, write params) from "record" (dispatches)
+// is what lets the fused attention front reserve the FFN scratch BEFORE it records any
+// binding, then append the FFN dispatches to the command list it already opened.
+struct FfnPrefillPlan {
+    ComPtr<ID3D12Resource> ao_q, g_q, u_q, d_q;
+    std::uint64_t ao_s{}, g_s{}, u_s{}, d_s{};
+    std::uint64_t a_t0{}, a_h2{}, a_f{}, a_fin{};
+    std::uint64_t b_h1{}, b_g{}, b_u{}, b_d{};
+    // Device VA of the residual rows (B.h1 = A.t0 + x): the merged front's staged copy
+    // when it already has one, otherwise this plan's own upload buffer.
+    std::uint64_t x_src{};
+    // Whether the record copies the finished residual into the readback buffer. False
+    // while the layer chain keeps it on the device.
+    bool copy_out{true};
+    FfnSlots slots;
+    std::size_t tokens{}, hidden{}, attn_width{}, ffn_rows{}, x_bytes{};
+    std::uint32_t groups_hidden{}, groups_ffn{}, gemm_groups_y{};
+    std::uint32_t addn_groups{}, silu_groups{};
+    ID3D12PipelineState* gemm_pso{};
+    bool attn_on_device{};
+};
+
+bool ffn_prefill_plan_locked(State& s, const std::uint8_t* attn_out_w,
+                             const std::uint8_t* gate_w, const std::uint8_t* up_w,
+                             const std::uint8_t* down_w, const float* norm_weight,
+                             const float* x, const float* attn_out, std::size_t tokens,
+                             std::size_t hidden, std::size_t attn_width,
+                             std::size_t ffn_rows, float epsilon, bool attn_on_device,
+                             bool x_pre_staged, const FfnSlots& slots, FfnPrefillPlan& plan);
+void ffn_prefill_record_locked(State& s, const FfnPrefillPlan& plan);
+
+// Brings the caller's residual rows up to date from the device copy. Only the paths that
+// still compute on the host need it: a declined front, the host FFN half, the end of the
+// prefill. When the merged chain keeps the residual resident this is skipped entirely.
+bool prefill_residual_flush_locked(State& s) {
+    if (!s.prefill_resident || s.prefill_host_valid) return true;
+    zen::diag::Scope sfl("prefill.res_flush", zen::diag::Phase::compute);
+    if (!s.prefill_out_host || !s.ybuf || !s.yread) return false;
+    const std::size_t bytes = s.prefill_res_tokens * s.prefill_res_hidden * sizeof(float);
+    if (bytes == 0 || bytes > s.y_cap) return false;
+    s.allocator->Reset();
+    s.list->Reset(s.allocator.Get(), s.pso_addn.Get());
+    s.list->SetComputeRootSignature(s.root.Get());
+    transition(s, s.ybuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               D3D12_RESOURCE_STATE_COPY_SOURCE);
+    s.list->CopyBufferRegion(s.yread.Get(), 0, s.ybuf.Get(), s.prefill_res_off, bytes);
+    transition(s, s.ybuf.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    s.list->Close();
+    if (!execute_and_wait(s)) return false;
+    void* mapped = nullptr;
+    const D3D12_RANGE read_range{0, bytes};
+    if (FAILED(s.yread->Map(0, &read_range, &mapped))) return false;
+    s.prefill_x_finite =
+        copy_check_finite(static_cast<const float*>(mapped), s.prefill_out_host, bytes);
+    const D3D12_RANGE written{0, 0};
+    s.yread->Unmap(0, &written);
+    s.prefill_host_valid = true;
+    return true;
+}
+
+bool attn_prefill_front_locked(State& s, const float* x, const float* norm_weight,
+                               std::size_t hidden,
+                               const std::uint8_t* q_w, const std::uint8_t* k_w,
+                               const std::uint8_t* v_w, std::size_t q_width,
+                               std::size_t kv_width, const float* q_norm,
+                               const float* k_norm, std::size_t tokens,
+                               std::size_t heads,
+                               std::size_t kv_heads, std::size_t head_dim,
+                               std::size_t pairs, bool interleaved, const float* cos,
+                               const float* sin, std::size_t layer,
+                               std::size_t start_pos, float epsilon, float inv_scale,
+                               const PrefillFfn* ffn) {
+    if (!x || !norm_weight || !q_w || !k_w || !v_w) return false;
+    if (!cos || !sin) return false;
+    if (!tokens || !hidden || !q_width || !kv_width) return false;
+    if (!heads || !kv_heads || !head_dim || !pairs) return false;
+    if (q_width != heads * head_dim || kv_width != kv_heads * head_dim) return false;
+    if (head_dim > 128 || heads > 64 || kv_heads > 16) return false;
+    if ((q_norm == nullptr) != (k_norm == nullptr)) return false;
+    if (!s.kcache || !s.vcache || layer >= s.kv_layers) return false;
+    if (start_pos + tokens > s.kv_context) return false;
+    if (hidden % kElemsPerBlock || q_width % kElemsPerBlock || kv_width % kElemsPerBlock) {
+        return false;
+    }
+    if (!gemm_opted_in()) return false;
+    const bool use_qk = q_norm != nullptr && s.pso_qknorm != nullptr;
+    if (!s.pso_rope_prefill) return false;
+    // The chain now starts with the attention RMS norm, so its kernel is required.
+    if (!s.pso_rms) return false;
+    // The flash dispatch joins this list, so its own preconditions are this function's
+    // preconditions: without them the whole chain declines and the caller keeps the
+    // host path rather than getting attention that never ran.
+    if (!s.pso_flash_attn || !s.kcache || !s.vcache) return false;
+    if (kv_heads != s.kv_heads || head_dim != s.kv_head_dim) return false;
+    if (tokens > 2048) return false;
+
+    // Kernel choice mirrors gemm_batch_locked, so the fused front runs exactly the
+    // arithmetic of the three separate calls it replaces.
+    const bool use_i8 = gemm_i8_enabled() && s.pso_gemm_i8 != nullptr;
+    const bool use_t = !use_i8 && gemm_t_enabled() && s.pso_gemm_t != nullptr;
+    ID3D12PipelineState* gemm_pso = use_i8 ? s.pso_gemm_i8.Get()
+                                  : use_t  ? s.pso_gemm_t.Get()
+                                           : s.pso_gemm.Get();
+    if (!gemm_pso) return false;
+
+    WeightEntry* qe = lookup_weights(s, q_w, q_width, hidden);
+    WeightEntry* ke = lookup_weights(s, k_w, kv_width, hidden);
+    WeightEntry* ve = lookup_weights(s, v_w, kv_width, hidden);
+    if (!qe || !ke || !ve) return false;
+    // Hold the residency records: a later lookup could evict and invalidate a buffer
+    // this list is still reading.
+    ComPtr<ID3D12Resource> qg = qe->quants, kg = ke->quants, vg = ve->quants;
+    const std::uint64_t qsc = qe->scales_va, ksc = ke->scales_va, vsc = ve->scales_va;
+
+    auto span = [](std::uint64_t b) { return (b + 255ull) & ~255ull; };
+    const std::uint64_t q_span = span(static_cast<std::uint64_t>(tokens) * q_width * 4u);
+    const std::uint64_t k_span = span(static_cast<std::uint64_t>(tokens) * kv_width * 4u);
+    const std::uint64_t v_span = k_span;
+    const std::uint64_t total = q_span + k_span + v_span;
+    const std::uint32_t x_tile = (use_i8 || use_t) ? 64u : kTokensPerTile;
+    const std::size_t padded_tokens = (tokens + x_tile - 1u) / x_tile * x_tile;
+    const std::size_t x_bytes = padded_tokens * hidden * sizeof(float);
+    // Flash scratch first: the FFN plan validates it, and without it the very first
+    // layer declines the merge (fa_out does not exist yet) and pays a second fence.
+    // Neither this nor the plan touches what the plan goes on to reserve.
+    const std::size_t q_bytes = tokens * q_width * sizeof(float);
+    if (!ensure_flash_scratch(s, q_bytes, q_bytes)) return false;
+
+    // Plan the FFN half BEFORE the front reserves or stages anything: planning reserves
+    // the shared scratch (it may grow xbuf) and stages its own inputs into wbuf/nbuf, so
+    // running it after the front staged its norm into xbuf would throw that copy away and
+    // leave the QKV GEMM reading a reallocated buffer.
+    FfnPrefillPlan fplan;
+    if (ffn) {
+        if (!ffn->attn_output_w || !ffn->gate_w || !ffn->up_w || !ffn->down_w ||
+            !ffn->norm_weight || !ffn->x || !ffn->out || !ffn->ffn_rows) {
+            return false;
+        }
+        FfnSlots slots;
+        // Shifted past the attention half's slots; see FfnSlots.
+        slots.gemm_base = 4096;
+        slots.rms = 256;
+        slots.silu = 5120;
+        slots.addn0 = 2560;
+        slots.addn1 = 2816;
+        if (!ffn_prefill_plan_locked(s, ffn->attn_output_w, ffn->gate_w, ffn->up_w,
+                                     ffn->down_w, ffn->norm_weight, ffn->x, nullptr,
+                                     tokens, hidden, q_width, ffn->ffn_rows, epsilon,
+                                     true, true, slots, fplan)) {
+            return false;
+        }
+        fplan.copy_out = !ffn->keep_resident;
+    }
+
+    if (!reserve_scratch(s, x_bytes, static_cast<std::size_t>(total))) return false;
+
+    // A merged layer reads its residual straight out of device scratch when the previous
+    // layer left it there, so neither a readback nor a 5.2 MB re-upload happens per
+    // layer. Any other shape needs the caller's rows on the host first.
+    const bool res_in = ffn && s.prefill_resident && s.prefill_res_tokens == tokens &&
+                        s.prefill_res_hidden == hidden;
+    if (!res_in) {
+        if (!prefill_residual_flush_locked(s)) return false;
+        std::memcpy(s.x_cpu, x, tokens * hidden * sizeof(float));
+        if (padded_tokens > tokens) {
+            std::memset(static_cast<std::uint8_t*>(s.x_cpu) + tokens * hidden * sizeof(float), 0,
+                        (padded_tokens - tokens) * hidden * sizeof(float));
+        }
+    }
+    // The rows the norm and the FFN residual add read: device scratch when chaining.
+    const std::uint64_t res_va = res_in ? s.ybuf->GetGPUVirtualAddress() + s.prefill_res_off
+                                       : s.xbuf->GetGPUVirtualAddress();
+    if (ffn) fplan.x_src = res_va;
+
+    // The two qk-norm rows and the two rope tables share one upload buffer: one
+    // allocation and four small memcpys instead of five of each.
+    const std::size_t tab_bytes = tokens * pairs * sizeof(float);
+    const std::size_t wrow = static_cast<std::size_t>(span(head_dim * sizeof(float)));
+    const std::size_t cos_off = 2 * wrow;
+    const std::size_t sin_off = cos_off + static_cast<std::size_t>(span(tab_bytes));
+    // The attention norm weight rides in the same upload buffer as the qk-norm rows
+    // and the rope tables: one allocation instead of a fifth.
+    const std::size_t nw_off = sin_off + static_cast<std::size_t>(span(tab_bytes));
+    const std::size_t tab_total =
+        nw_off + static_cast<std::size_t>(span(static_cast<std::size_t>(hidden) *
+                                               sizeof(float)));
+    // Local, because the shared attn_upload/attn_device helpers are defined further
+    // down inside the file's anonymous namespace and this function is public.
+    auto ensure_upload = [&](ComPtr<ID3D12Resource>& buf, void*& cpu, std::size_t& cap,
+                             std::size_t bytes) -> bool {
+        if (buf && bytes <= cap) return true;
+        buf.Reset();
+        cpu = nullptr;
+        cap = 0;
+        buf = create_buffer(s.device.Get(), bytes, upload_heap_type(), upload_heap_state());
+        if (!buf || FAILED(buf->Map(0, nullptr, &cpu))) {
+            buf.Reset();
+            cpu = nullptr;
+            return false;
+        }
+        cap = bytes;
+        return true;
+    };
+    auto ensure_device = [&](ComPtr<ID3D12Resource>& buf, std::size_t& cap,
+                             std::size_t bytes) -> bool {
+        if (buf && bytes <= cap) return true;
+        buf.Reset();
+        cap = 0;
+        buf = create_buffer(s.device.Get(), bytes, D3D12_HEAP_TYPE_DEFAULT,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        if (!buf) return false;
+        cap = bytes;
+        return true;
+    };
+    if (!ensure_upload(s.front_tab, s.front_tab_cpu, s.front_tab_cap, tab_total)) return false;
+    if (use_qk) {
+        std::memcpy(s.front_tab_cpu, q_norm, head_dim * sizeof(float));
+        std::memcpy(static_cast<std::uint8_t*>(s.front_tab_cpu) + wrow, k_norm,
+                    head_dim * sizeof(float));
+    }
+    std::memcpy(static_cast<std::uint8_t*>(s.front_tab_cpu) + cos_off, cos, tab_bytes);
+    std::memcpy(static_cast<std::uint8_t*>(s.front_tab_cpu) + sin_off, sin, tab_bytes);
+    std::memcpy(static_cast<std::uint8_t*>(s.front_tab_cpu) + nw_off, norm_weight,
+                hidden * sizeof(float));
+    if (!ensure_device(s.front_dev, s.front_dev_cap, static_cast<std::size_t>(total))) {
+        return false;
+    }
+    // The normed rows are padded to whole GEMM tiles and the staged tail is zeroed,
+    // so the tiles read defined values past `tokens` just as they did from the host.
+    if (!ensure_device(s.attn_norm_dev, s.attn_norm_cap, x_bytes)) return false;
+
+
+    // Distinct 256B param slots: GEMMs 3072/3328/3584, qk-norm 7680/7936 (the slots
+    // the decode path already uses), rope 1280/1536. No two dispatches in this list
+    // may share a slot, because upload-heap CBVs are read at execution, not at record.
+    constexpr std::uint64_t kGemmQ = 3072, kGemmK = 3328, kGemmV = 3584;
+    constexpr std::uint64_t kQkQ = 7680, kQkK = 7936;
+    constexpr std::uint64_t kRopeQ = 1280, kRopeK = 1536;
+    // 512 is free in this list: the FFN half uses 256 (rms), 2560/2816 (addn),
+    // 4096-5120 (gemm/silu) and the attention half the slots named here.
+    constexpr std::uint64_t kGemmNorm = 512;
+    auto* pbase = static_cast<std::uint8_t*>(s.params_cpu);
+    auto fill_gemm = [&](std::uint64_t slot, std::size_t rows) {
+        auto* p = reinterpret_cast<GemmParams*>(pbase + slot);
+        p->rows = static_cast<std::uint32_t>(rows);
+        p->blocks_per_row = static_cast<std::uint32_t>(hidden / kElemsPerBlock);
+        p->token_count = static_cast<std::uint32_t>(tokens);
+        p->tokens_per_tile = x_tile;
+    };
+    struct RmsSlot {
+        std::uint32_t count;
+        std::uint32_t rows;
+        float epsilon;
+        std::uint32_t pad;
+    };
+    auto* nrm = reinterpret_cast<RmsSlot*>(pbase + kGemmNorm);
+    nrm->count = static_cast<std::uint32_t>(hidden);
+    nrm->rows = static_cast<std::uint32_t>(padded_tokens);
+    nrm->epsilon = epsilon;
+    nrm->pad = 0;
+    fill_gemm(kGemmQ, q_width);
+    fill_gemm(kGemmK, kv_width);
+    fill_gemm(kGemmV, kv_width);
+
+    const std::uint64_t pb = s.params->GetGPUVirtualAddress();
+    const std::uint64_t yv = s.ybuf->GetGPUVirtualAddress();
+    const std::uint64_t av = s.front_dev->GetGPUVirtualAddress();
+    const std::uint64_t tab_va = s.front_tab->GetGPUVirtualAddress();
+    const std::uint64_t nrm_va = s.attn_norm_dev->GetGPUVirtualAddress();
+    const std::uint64_t out_off[3] = {0, q_span, q_span + k_span};
+
+    s.allocator->Reset();
+    s.list->Reset(s.allocator.Get(), gemm_pso);
+    s.list->SetComputeRootSignature(s.root.Get());
+    if (s.trace) {
+        s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+    }
+
+    // 0. Attention RMS norm, in this submission: the CPU loop this replaces cost
+    // ~0.47 ms/layer, and doing it here adds no fence at all.
+    s.list->SetPipelineState(s.pso_rms.Get());
+    s.list->SetComputeRootConstantBufferView(0, pb + kGemmNorm);
+    s.list->SetComputeRootShaderResourceView(1, res_va);
+    s.list->SetComputeRootShaderResourceView(2, tab_va + nw_off);
+    s.list->SetComputeRootUnorderedAccessView(5, nrm_va);
+    s.list->Dispatch(static_cast<UINT>(padded_tokens), 1, 1);
+    uav_barrier(s, s.attn_norm_dev.Get());
+    transition(s, s.attn_norm_dev.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    if (s.trace) {
+        s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 100);
+    }
+    // The QKV GEMMs below inherit the PSO the list was reset with, so the norm has to
+    // hand it back: leaving pso_rms bound ran all three projections through RmsNorm.
+    s.list->SetPipelineState(gemm_pso);
+
+    // 1. QKV GEMM. Each task writes a disjoint region, so no UAV barrier is needed
+    // between them.
+    ID3D12Resource* wres[3] = {qg.Get(), kg.Get(), vg.Get()};
+    const std::uint64_t wsc[3] = {qsc, ksc, vsc};
+    const std::size_t wrows[3] = {q_width, kv_width, kv_width};
+    const std::uint64_t wslot[3] = {kGemmQ, kGemmK, kGemmV};
+    for (int i = 0; i < 3; ++i) {
+        s.list->SetComputeRootConstantBufferView(0, pb + wslot[i]);
+        s.list->SetComputeRootShaderResourceView(1, wres[i]->GetGPUVirtualAddress());
+        s.list->SetComputeRootShaderResourceView(2, wsc[i]);
+        s.list->SetComputeRootShaderResourceView(3, nrm_va);
+        // v needs no rotation, so its GEMM writes straight into the staging buffer's
+        // v region: one contiguous home for q, k and v that the KV append reads and
+        // flash takes Q from, with no host hop in between.
+        s.list->SetComputeRootUnorderedAccessView(5, i == 2 ? av + out_off[2] : yv + out_off[i]);
+        if (use_i8) {
+            s.list->Dispatch(static_cast<UINT>((wrows[i] + 127u) / 128u),
+                             static_cast<UINT>((tokens + 63u) / 64u), 1);
+        } else if (use_t) {
+            s.list->Dispatch(static_cast<UINT>((wrows[i] + 63u) / 64u),
+                             static_cast<UINT>((tokens + 63u) / 64u), 1);
+        } else {
+            s.list->Dispatch(
+                static_cast<UINT>((wrows[i] + kGemmRowsPerGroup - 1u) / kGemmRowsPerGroup), 1, 1);
+        }
+    }
+
+    // The normed rows are consumed: hand the buffer back for the next layer's norm.
+    transition(s, s.attn_norm_dev.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (s.trace) {
+        s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 101);
+    }
+
+
+    // 2. qk RMS-norm in place on both projectors. rows = tokens * heads: the layout is
+    // [token][head][dim] and each head is normalised on its own, so the row index
+    // spans both axes. A model without qk norm passes null weights and skips this.
+    if (use_qk) {
+        uav_barrier(s, s.ybuf.Get());
+        struct QkNormSlot {
+            std::uint32_t count;
+            std::uint32_t rows;
+            float epsilon;
+            std::uint32_t pad;
+        };
+        auto* qp = reinterpret_cast<QkNormSlot*>(pbase + kQkQ);
+        qp->count = static_cast<std::uint32_t>(head_dim);
+        qp->rows = static_cast<std::uint32_t>(tokens * heads);
+        qp->epsilon = epsilon;
+        qp->pad = 0;
+        auto* kp = reinterpret_cast<QkNormSlot*>(pbase + kQkK);
+        kp->count = static_cast<std::uint32_t>(head_dim);
+        kp->rows = static_cast<std::uint32_t>(tokens * kv_heads);
+        kp->epsilon = epsilon;
+        kp->pad = 0;
+
+        // u0 and u1 are the same UAV range here (slots 5 and 6): the kernel reads and
+        // writes element i only from the thread that owns it, so aliasing is benign,
+        // and two UAV roots are the only legal way to alias one resource in D3D12.
+        s.list->SetPipelineState(s.pso_qknorm.Get());
+        s.list->SetComputeRootConstantBufferView(0, pb + kQkQ);
+        s.list->SetComputeRootShaderResourceView(1, tab_va);
+        s.list->SetComputeRootUnorderedAccessView(6, yv + out_off[0]);
+        s.list->SetComputeRootUnorderedAccessView(5, yv + out_off[0]);
+        s.list->Dispatch(static_cast<UINT>(tokens * heads), 1, 1);
+
+        s.list->SetComputeRootConstantBufferView(0, pb + kQkK);
+        s.list->SetComputeRootShaderResourceView(1, tab_va + wrow);
+        s.list->SetComputeRootUnorderedAccessView(6, yv + out_off[1]);
+        s.list->SetComputeRootUnorderedAccessView(5, yv + out_off[1]);
+        s.list->Dispatch(static_cast<UINT>(tokens * kv_heads), 1, 1);
+        uav_barrier(s, s.ybuf.Get());
+    }
+
+    if (s.trace) {
+        s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 102);
+    }
+
+    // 3. RoPE. Source is the GEMM output (SRV), destination the rotated staging buffer
+    // (UAV): they cannot alias, hence the second buffer.
+    transition(s, s.ybuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    auto* rq = reinterpret_cast<RopePrefillParams*>(pbase + kRopeQ);
+    rq->heads = static_cast<std::uint32_t>(heads);
+    rq->head_dim = static_cast<std::uint32_t>(head_dim);
+    rq->pairs = static_cast<std::uint32_t>(pairs);
+    rq->pad0 = interleaved ? 1u : 0u;
+    rq->tokens = static_cast<std::uint32_t>(tokens);
+    rq->pad1 = rq->pad2 = rq->pad3 = 0;
+    auto* rk = reinterpret_cast<RopePrefillParams*>(pbase + kRopeK);
+    *rk = *rq;
+    rk->heads = static_cast<std::uint32_t>(kv_heads);
+
+    s.list->SetPipelineState(s.pso_rope_prefill.Get());
+    s.list->SetComputeRootConstantBufferView(0, pb + kRopeQ);
+    s.list->SetComputeRootShaderResourceView(1, yv + out_off[0]);
+    s.list->SetComputeRootShaderResourceView(2, tab_va + cos_off);
+    s.list->SetComputeRootShaderResourceView(3, tab_va + sin_off);
+    s.list->SetComputeRootUnorderedAccessView(5, av);
+    s.list->Dispatch(static_cast<UINT>((tokens * q_width + 255u) / 256u), 1, 1);
+
+    s.list->SetComputeRootConstantBufferView(0, pb + kRopeK);
+    s.list->SetComputeRootShaderResourceView(1, yv + out_off[1]);
+    s.list->SetComputeRootShaderResourceView(2, tab_va + cos_off);
+    s.list->SetComputeRootShaderResourceView(3, tab_va + sin_off);
+    s.list->SetComputeRootUnorderedAccessView(5, av + q_span);
+    s.list->Dispatch(static_cast<UINT>((tokens * kv_width + 255u) / 256u), 1, 1);
+
+    if (s.trace) {
+        s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 103);
+    }
+
+    // 4. KV cache append straight from device memory. Both rows come from the staging
+    // buffer now: rope wrote the rotated k into it and the v GEMM wrote v there, so the
+    // append needs no host staging copy at all.
+    const std::size_t kv_bytes = tokens * kv_width * sizeof(float);
+    const std::size_t layer_stride =
+        s.kv_heads * s.kv_context * s.kv_head_dim * sizeof(float);
+    const std::size_t kv_dst = layer * layer_stride + start_pos * kv_width * sizeof(float);
+    // One barrier covers every preceding UAV write to this buffer (the v GEMM and both
+    // rope dispatches) before the copy engine reads it.
+    uav_barrier(s, s.front_dev.Get());
+    transition(s, s.front_dev.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               D3D12_RESOURCE_STATE_COPY_SOURCE);
+    transition(s, s.kcache.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               D3D12_RESOURCE_STATE_COPY_DEST);
+    transition(s, s.vcache.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               D3D12_RESOURCE_STATE_COPY_DEST);
+    s.list->CopyBufferRegion(s.kcache.Get(), kv_dst, s.front_dev.Get(), q_span, kv_bytes);
+    s.list->CopyBufferRegion(s.vcache.Get(), kv_dst, s.front_dev.Get(), out_off[2],
+                             kv_bytes);
+    transition(s, s.kcache.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    transition(s, s.vcache.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (s.trace) {
+        s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 111);
+    }
+
+    // 5. Flash attention in the SAME submission: Q is the buffer rope just filled and
+    // K/V are the cache rows appended a moment ago, so the kernel runs on data that is
+    // already in place. This is the second fence this stage used to pay for, and it is
+    // now free: one submission covers QKV -> norm -> rope -> append -> attention, and
+    // nothing at all comes back to the host.
+    // ZEN_D3D12_ATTN_FRONT_FLASH=0 records the same work without the attention
+    // dispatch, so this one binary can A/B the merge itself: the caller then runs the
+    // standalone flash entry, which finds Q in this buffer (device Q) and leaves its own
+    // output on the device too.
+    static const bool front_flash_off = [] {
+        const char* e = std::getenv("ZEN_D3D12_ATTN_FRONT_FLASH");
+        return e && e[0] == '0';
+    }();
+    if (!front_flash_off) {
+        transition(s, s.front_dev.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        transition(s, s.kcache.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        transition(s, s.vcache.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        transition(s, s.fa_out.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        flash_record_locked(s, av, s.fa_out->GetGPUVirtualAddress(), tokens, heads,
+                            kv_heads, head_dim, inv_scale, layer, start_pos);
+        // Hand the caches back in the state decode and the next front submission assume,
+        // and leave the attention output in UNORDERED_ACCESS: the FFN chain reads it.
+        transition(s, s.kcache.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        transition(s, s.vcache.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        transition(s, s.front_dev.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    } else {
+        // Unrotated Q stays put for the standalone flash entry to read.
+        transition(s, s.front_dev.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+    transition(s, s.ybuf.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (s.trace) {
+        s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 104);
+    }
+
+    if (ffn) {
+        // FFN half in this same list: its attn_output GEMM reads the attention output
+        // flash just wrote into fa_out, so the layer pays ONE fence from the residual
+        // base to the new residual base instead of two.
+        ffn_prefill_record_locked(s, fplan);
+    }
+    if (s.trace) {
+        s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+        s.list->ResolveQueryData(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 100 + 12,
+                                 s.ts_read.Get(), 0);
+    }
+    s.list->Close();
+    if (!execute_and_wait(s)) return false;
+
+    // Split the layer bracket into its stages. A layer with an unstamped or out-of-order
+    // boundary is skipped whole instead of being reported as a bogus delta.
+    static const bool stage_dbg = std::getenv("ZEN_D3D12_STAGE_DEBUG") != nullptr;
+    if (s.trace && s.ts_read) {
+        std::uint64_t* st = nullptr;
+        const D3D12_RANGE range{0, 109 * sizeof(std::uint64_t)};
+        if (SUCCEEDED(s.ts_read->Map(0, &range, reinterpret_cast<void**>(&st)))) {
+            // Slot order, not numeric order: the KV-append boundary lives in slot 111 so
+            // the earlier slots keep their published meaning.
+            static const int kSlot[13] = {0,   100, 101, 102, 103, 111, 104,
+                                          105, 106, 107, 108, 109, 110};
+            std::uint64_t b[13];
+            for (int i = 0; i < 13; ++i) b[i] = st[kSlot[i]];
+            bool ordered = true;
+            for (int i = 0; i < 13; ++i) ordered = ordered && b[i] != 0;
+            for (int i = 0; ordered && i < 12; ++i) ordered = b[i + 1] > b[i];
+            if (stage_dbg && s.stage_layers < 3) {
+                std::printf("[stage] ordered=%d b=", ordered ? 1 : 0);
+                for (int i = 0; i < 13; ++i) std::printf("%llu ", (unsigned long long)b[i]);
+                std::cout << std::endl;
+            }
+            if (ordered) {
+                for (int i = 0; i < 12; ++i) {
+                    s.stage_us[i] += static_cast<std::uint64_t>(
+                        static_cast<double>(b[i + 1] - b[i]) * 1000000.0 /
+                        static_cast<double>(s.ts_freq));
+                }
+                ++s.stage_layers;
+            }
+            const D3D12_RANGE none{0, 0};
+            s.ts_read->Unmap(0, &none);
+        }
+    }
+
+    // How much contiguous device Q the flash path may read out of this buffer.
+
+    s.front_bytes = static_cast<std::size_t>(total);
+    if (s.trace) {
+        std::uint64_t* stamps = nullptr;
+        const D3D12_RANGE stamp_range{0, 2 * sizeof(std::uint64_t)};
+        if (SUCCEEDED(s.ts_read->Map(0, &stamp_range, reinterpret_cast<void**>(&stamps)))) {
+            if (stamps[1] > stamps[0]) {
+                s.stats.gpu_us += static_cast<std::uint64_t>(
+                    static_cast<double>(stamps[1] - stamps[0]) * 1000000.0 /
+                    static_cast<double>(s.ts_freq));
+            }
+            const D3D12_RANGE none{0, 0};
+            s.ts_read->Unmap(0, &none);
+        }
+    }
+    if (ffn) {
+        // The rows stay in ybuf: the next layer's attention norm and its residual add both
+        // read them there, which is what removes the per-layer host round trip.
+        s.prefill_resident = true;
+        s.prefill_res_off = fplan.a_fin;
+        s.prefill_res_tokens = tokens;
+        s.prefill_res_hidden = hidden;
+        s.prefill_out_host = ffn->out;
+        if (ffn->keep_resident) {
+            s.prefill_host_valid = false;
+        } else {
+            zen::diag::Scope srb("prefill.ffn_readback", zen::diag::Phase::compute);
+            void* mapped = nullptr;
+            const D3D12_RANGE read_range{0, fplan.x_bytes};
+            if (FAILED(s.yread->Map(0, &read_range, &mapped))) return false;
+            s.prefill_x_finite = copy_check_finite(static_cast<const float*>(mapped), ffn->out,
+                                                   fplan.x_bytes);
+            const D3D12_RANGE written{0, 0};
+            s.yread->Unmap(0, &written);
+            s.prefill_host_valid = true;
+        }
+    } else {
+        // Attention-only: the caller finishes the layer on the host, so the device copy no
+        // longer holds this layer's output.
+        s.prefill_resident = false;
+        s.prefill_host_valid = true;
+    }
+    // The device cache now holds these positions. The resident record the runtime's
+    // cache-hit fast path consults is left alone on purpose: its helper sits inside the
+    // anonymous namespace further down, and under-reporting residency only makes the
+    // caller append again (correct), while over-reporting would let it skip a write.
+    s.stats.dispatches += ffn ? 16 : 8;
+    ++s.stats.batches;
+    return true;
+}
+
+bool attn_prefill_front(const float* x, const float* norm_weight, std::size_t hidden,
+                        const std::uint8_t* q_w,
+                        const std::uint8_t* k_w, const std::uint8_t* v_w,
+                        std::size_t q_width, std::size_t kv_width, const float* q_norm,
+                        const float* k_norm, std::size_t tokens, std::size_t heads,
+                        std::size_t kv_heads,
+                        std::size_t head_dim, std::size_t pairs, bool interleaved,
+                        const float* cos, const float* sin, std::size_t layer,
+                        std::size_t start_pos, float epsilon, float inv_scale,
+                        const PrefillFfn* ffn) noexcept {
+    State& s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (!init_locked(s)) return false;
+    // Diagnostic: decline one layer on purpose so the host fallback, the device-residual
+    // flush and the invalidation it needs can be exercised end to end.
+    // ZEN_D3D12_FRONT_DECLINE_LAYER=<layer index>.
+    {
+        static const long decline_layer = [] {
+            const char* e = std::getenv("ZEN_D3D12_FRONT_DECLINE_LAYER");
+            return e ? std::strtol(e, nullptr, 10) : -1L;
+        }();
+        if (decline_layer >= 0 && static_cast<long>(layer) == decline_layer) {
+            prefill_residual_flush_locked(s);
+            ++s.stats.fallbacks;
+            return false;
+        }
+    }
+    if (!attn_prefill_front_locked(s, x, norm_weight, hidden, q_w, k_w, v_w, q_width,
+                                   kv_width,
+                                   q_norm, k_norm, tokens, heads, kv_heads, head_dim,
+                                   pairs, interleaved, cos, sin,
+                                   layer, start_pos, epsilon, inv_scale, ffn)) {
+        // Whatever declined, the caller resumes from its own rows: make them current.
+        prefill_residual_flush_locked(s);
         ++s.stats.fallbacks;
         return false;
     }
@@ -4432,16 +5602,43 @@ bool kv_cache_append_batched_locked(State& s,
 
     // Pack all K/V into staging buffer
     std::uint8_t* dst = static_cast<std::uint8_t*>(s.x_cpu);
-    for (std::size_t i = 0; i < num_layers; ++i) {
-        std::memcpy(dst, ks[i], kv_bytes);
-        dst += kv_bytes;
-    }
-    for (std::size_t i = 0; i < num_layers; ++i) {
-        std::memcpy(dst, vs[i], kv_bytes);
-        dst += kv_bytes;
+    // Coalesce entries whose host K/V rows are physically contiguous and whose
+    // destination positions ascend by one. Prefill appends T whole rows of one
+    // layer at consecutive positions, so the 2*T 4 KiB copies per layer collapse
+    // to 2 copies of T*kv_bytes: recording 1024 CopyBufferRegion calls cost more
+    // than the transfer itself (~2 us of CPU per call, measured at 4.1 ms/layer).
+    // Non-contiguous batches (restore paths) keep one run per entry.
+    const std::size_t kv_floats = kv_heads * head_dim;
+    struct KvRun { std::size_t layer, pos, count; const float* k; const float* v; };
+    std::vector<KvRun> runs;
+    runs.reserve(num_layers);
+    for (std::size_t i = 0; i < num_layers;) {
+        KvRun r{layers[i], positions[i], 1, ks[i], vs[i]};
+        while (i + r.count < num_layers &&
+               layers[i + r.count] == r.layer &&
+               positions[i + r.count] == r.pos + r.count &&
+               ks[i + r.count] == r.k + r.count * kv_floats &&
+               vs[i + r.count] == r.v + r.count * kv_floats) {
+            ++r.count;
+        }
+        runs.push_back(r);
+        i += r.count;
     }
 
-    const std::size_t stride = s.kv_heads * s.kv_context * s.kv_head_dim * sizeof(float);
+    std::uint8_t* const staging = static_cast<std::uint8_t*>(s.x_cpu);
+    std::vector<std::size_t> k_off(runs.size()), v_off(runs.size());
+    for (std::size_t i = 0; i < runs.size(); ++i) {
+        k_off[i] = static_cast<std::size_t>(dst - staging);
+        const std::size_t n = runs[i].count * kv_bytes;
+        std::memcpy(dst, runs[i].k, n);
+        dst += n;
+    }
+    for (std::size_t i = 0; i < runs.size(); ++i) {
+        v_off[i] = static_cast<std::size_t>(dst - staging);
+        const std::size_t n = runs[i].count * kv_bytes;
+        std::memcpy(dst, runs[i].v, n);
+        dst += n;
+    }
 
     // Same-queue append: see kv_cache_append_locked for why the copy queue is not
     // usable here. The caches live in UNORDERED_ACCESS, so the COPY_DEST cycles run
@@ -4453,16 +5650,12 @@ bool kv_cache_append_batched_locked(State& s,
     transition(s, s.vcache.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                D3D12_RESOURCE_STATE_COPY_DEST);
 
-    std::uint8_t* src_k = static_cast<std::uint8_t*>(s.x_cpu);
-    std::uint8_t* src_v = src_k + num_layers * kv_bytes;
-    for (std::size_t i = 0; i < num_layers; ++i) {
-        const std::size_t layer = layers[i];
-        const std::size_t pos = positions[i];
-        const std::size_t dst_offset = layer * s.kv_heads * s.kv_context * s.kv_head_dim * sizeof(float) + positions[i] * kv_bytes;
-        s.list->CopyBufferRegion(s.kcache.Get(), dst_offset, s.xbuf.Get(), src_k - static_cast<std::uint8_t*>(s.x_cpu), kv_bytes);
-        s.list->CopyBufferRegion(s.vcache.Get(), dst_offset, s.xbuf.Get(), src_v - static_cast<std::uint8_t*>(s.x_cpu), kv_bytes);
-        src_k += kv_bytes;
-        src_v += kv_bytes;
+    const std::size_t layer_stride = s.kv_heads * s.kv_context * s.kv_head_dim * sizeof(float);
+    for (std::size_t i = 0; i < runs.size(); ++i) {
+        const std::size_t dst_offset = runs[i].layer * layer_stride + runs[i].pos * kv_bytes;
+        const std::size_t n = runs[i].count * kv_bytes;
+        s.list->CopyBufferRegion(s.kcache.Get(), dst_offset, s.xbuf.Get(), k_off[i], n);
+        s.list->CopyBufferRegion(s.vcache.Get(), dst_offset, s.xbuf.Get(), v_off[i], n);
     }
 
     transition(s, s.kcache.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
@@ -4553,7 +5746,15 @@ bool rms_norm_locked(State& s, const float* x, const float* weight, float* y, st
     // One workgroup per row, exactly as rmsnorm.hlsl assumes. Without this call the
     // kernel never ran and the readback returned the zero-initialised buffer.
     s.current_comp = Comp::Norms;
+    if (s.trace) {
+        s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+    }
     s.list->Dispatch(static_cast<UINT>(rows), 1, 1);
+    if (s.trace) {
+        s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+        s.list->ResolveQueryData(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 2,
+                                 s.ts_read.Get(), 0);
+    }
 
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -4576,6 +5777,11 @@ bool rms_norm_locked(State& s, const float* x, const float* weight, float* y, st
     const D3D12_RANGE read_range{0, bytes};
     if (FAILED(s.yread->Map(0, &read_range, &mapped))) {
         return false;
+    }
+    if (s.trace) {
+        std::uint64_t dev = 0;
+        accumulate_gpu_us(s, dev, 0, 1);
+        note_dev(s, Comp::Norms, dev);
     }
     std::memcpy(y, mapped, bytes);
     const D3D12_RANGE written{0, 0};
@@ -4611,6 +5817,17 @@ bool gemv_q8_0_ffn(const std::uint8_t* gate, const std::uint8_t* up, const std::
         return false;
     }
     return true;
+}
+
+void release_q8_0_weights(const std::uint8_t* weights) noexcept {
+    if (!weights) return;
+    State& s=state(); std::lock_guard<std::mutex> lock(s.mutex);
+    auto it=s.weights.find(weights);
+    if (it!=s.weights.end() && it->second.kind==0) {
+        s.weight_bytes-=it->second.quants->GetDesc().Width;
+        s.weights.erase(it);
+        s.stats.weight_bytes=s.weight_bytes;
+    }
 }
 
 void release_kquant_weights(const std::uint8_t* weights) noexcept {
@@ -5199,7 +6416,33 @@ bool layer_decode_pipeline(const LayerDecodeParams* layers, std::size_t num_laye
     // so by execution time it held the last layer's rows for every layer.
     // Distinct per-layer offsets are safe because no write aliases another.
     // The fused LM head appends the final output_norm row after them.
-    const std::size_t nrm_bytes = (2 * num_layers + (lm_active ? 1u : 0u)) * hidden_bytes;
+    const std::size_t nrm_layer_bytes = (2 * num_layers + (lm_active ? 1u : 0u)) * hidden_bytes;
+    // Per-head q/k RMS rows (Qwen3) ride behind the layer norms in the same upload
+    // table: one head_dim row per tensor per layer, each on a 256B boundary because a
+    // root SRV address must be. Enabled only when every layer carries the pair - the
+    // kernel is recorded per layer, but a model with the tensors on some layers only
+    // would need per-layer slots of both kinds, and no such model exists.
+    const bool qk_all =
+        std::all_of(layers, layers + num_layers, [](const LayerDecodeParams& l) {
+            return l.q_norm_w != nullptr && l.k_norm_w != nullptr;
+        });
+    const bool qk_enabled = s.pso_qknorm != nullptr && qk_all;
+    // Refuse rather than run: a model that normalises q/k on SOME layers only would
+    // otherwise get every layer's q/k left unnormalised, which is a wrong answer, not
+    // a slower one. No such model is known, but the gate below would silently drop
+    // the norm for the layers that have it.
+    if (!qk_all && std::any_of(layers, layers + num_layers, [](const LayerDecodeParams& l) {
+            return l.q_norm_w != nullptr || l.k_norm_w != nullptr;
+        })) {
+        if (const char* trace = std::getenv("ZEN_D3D12_TRACE"); trace && trace[0] == '1') {
+            std::printf("[d3d12] pipeline: q/k norm present on only some layers - refusing\n");
+        }
+        return false;
+    }
+    const std::size_t qk_stride = (head_dim * sizeof(float) + 255u) & ~static_cast<std::size_t>(255u);
+    const std::size_t qk_base = (nrm_layer_bytes + 255u) & ~static_cast<std::size_t>(255u);
+    const std::size_t nrm_bytes =
+        qk_enabled ? qk_base + 2 * num_layers * qk_stride : nrm_layer_bytes;
     if (!ensure_upload(s.nrm, s.nrm_cpu, s.nrm_cap, s.device.Get(), nrm_bytes)) {
         return false;
     }
@@ -5212,6 +6455,15 @@ bool layer_decode_pipeline(const LayerDecodeParams* layers, std::size_t num_laye
     if (lm_active) {
         std::memcpy(static_cast<std::uint8_t*>(s.nrm_cpu) + (2 * num_layers) * hidden_bytes,
                     lm->output_norm_w, hidden_bytes);
+    }
+    if (qk_enabled) {
+        const std::size_t qk_row = head_dim * sizeof(float);
+        for (std::size_t li = 0; li < num_layers; ++li) {
+            std::memcpy(static_cast<std::uint8_t*>(s.nrm_cpu) + qk_base + (2 * li) * qk_stride,
+                        layers[li].q_norm_w, qk_row);
+            std::memcpy(static_cast<std::uint8_t*>(s.nrm_cpu) + qk_base + (2 * li + 1) * qk_stride,
+                        layers[li].k_norm_w, qk_row);
+        }
     }
     // Default-heap staging for the per-layer input copy. The previous version
     // copied each layer's output into s.xbuf, an upload-heap resource, in COPY_DEST
@@ -5297,6 +6549,15 @@ bool layer_decode_pipeline(const LayerDecodeParams* layers, std::size_t num_laye
         p->epsilon = epsilon;
         p->pad = 0;
     };
+    // q/k norm reuses RmsParams' layout (count, rows, epsilon, pad): the kernel needs
+    // only a row length, a row count and the epsilon.
+    auto write_qk = [&](std::uint64_t slot, std::size_t row_len, std::size_t rows) {
+        auto* p = reinterpret_cast<RmsParams*>(static_cast<std::uint8_t*>(s.params_cpu) + slot);
+        p->count = static_cast<std::uint32_t>(row_len);
+        p->rows = static_cast<std::uint32_t>(rows);
+        p->epsilon = epsilon;
+        p->pad = 0;
+    };
     auto write_addn = [&](std::uint64_t slot) {
         auto* p = reinterpret_cast<AddnParams*>(static_cast<std::uint8_t*>(s.params_cpu) + slot);
         p->count = static_cast<std::uint32_t>(hidden);
@@ -5358,10 +6619,31 @@ bool layer_decode_pipeline(const LayerDecodeParams* layers, std::size_t num_laye
         const char* t = std::getenv("ZEN_D3D12_OPSTAMPS");
         return t && t[0] == '1';
     }();
-    if (trace_pipe && s.ts_heap && s.ts_read && num_layers <= 24) {
+    // Two independent timestamp regimes share the 128-slot heap, because the
+    // per-layer brackets need 2*num_layers+1 consecutive slots starting at 1 and the
+    // layer-0 op stamps live at 41..57. Past 20 layers the two would overlap, so a
+    // big model keeps the op decomposition and drops the per-layer halves.
+    const bool layer_ts = trace_pipe && s.ts_heap && s.ts_read && num_layers <= 20;
+    const bool op_ts = op_stamps && s.ts_heap && s.ts_read;
+    // End of the whole submission for the op-stamp table when the layer brackets are
+    // off (slot 2*num_layers+1 is not ours to use then). 63 is clear of every other
+    // diagnostic slot.
+    const UINT op_end_slot = 63;
+    if (layer_ts || op_ts) {
         s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
     }
     const UINT op_stamp_first = 41; // layer-0 op stamps live at 41..57
+
+    // datt is the only scratch buffer that alternates state every layer (attention
+    // writes it as a UAV, o-gemv reads it as an SRV). Routing it back through COMMON
+    // between layers made the driver drain the GPU once per layer: with
+    // ZEN_D3D12_OPSTAMPS=1 the stall measured 77-96us at the attention entry on an
+    // RX 9070 XT, worth ~1.35ms per 16-layer token, and it moved between the datt
+    // transition and the attention dispatch from run to run (drain signature, not
+    // work). Keep it in a live state for the whole token and take the single
+    // COMMON->UAV step here, where it costs once instead of once per layer.
+    transition(s, s.datt.Get(), D3D12_RESOURCE_STATE_COMMON,
+               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     for (std::size_t li = 0; li < num_layers; ++li) {
         const auto& p = layers[li];
@@ -5401,6 +6683,10 @@ bool layer_decode_pipeline(const LayerDecodeParams* layers, std::size_t num_laye
         // Used by the per-layer write loop below and the LM-head recording after it.
         const std::uint64_t kGemvLm = 7168;
         const std::uint64_t kRmsLm = 7424;
+        // q/k norm slots: layer-invariant (row length, rows, epsilon are model
+        // constants), so one pair of slots serves every layer.
+        const std::uint64_t kQkNormQ = 7680;
+        const std::uint64_t kQkNormK = 7936;
         // The attention cbuffer is the ONLY per-layer-varying parameter set in this
         // loop (kv_base/v_base). Every other slot carries layer-invariant values, so
         // the record-time CPU overwrites are idempotent; a shared attention slot is
@@ -5458,7 +6744,7 @@ bool layer_decode_pipeline(const LayerDecodeParams* layers, std::size_t num_laye
         // may be read by copy commands without transitions. From layer 1 on the
         // source is s.ybuf's a_fin region, which sits in UAV after the previous
         // layer's residual add; a pair of transitions makes it a COPY_SOURCE.
-        if (trace_pipe && s.ts_heap && s.ts_read && num_layers <= 24) {
+        if (layer_ts || (op_ts && li == 0)) {
             s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1 + 2 * li);
         }
         transition_on(list, s.hin.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
@@ -5649,6 +6935,37 @@ bool layer_decode_pipeline(const LayerDecodeParams* layers, std::size_t num_laye
             qact_to_uav();  // restore the staging write state for the next site
         }
 
+        // 4b. Per-head q/k RMS normalisation (Qwen3: attn_q_norm / attn_k_norm),
+        // between the matvecs and RoPE exactly as the CPU path orders it. The kernel
+        // normalises in place, so it reads and rewrites the rows the matvecs just
+        // produced: no third arena buffer, and fbuf is already UNORDERED_ACCESS here,
+        // so this costs two dispatches and two GPU-scoped UAV barriers instead of four
+        // state transitions. In place is safe by construction - each element is read
+        // and then written by the one thread that owns it - and both views of the
+        // buffer are UAV roots, which is the only way to alias them under D3D12's
+        // one-state-per-resource rule.
+        if (qk_enabled) {
+            uav_barrier(s, s.fbuf.Get());  // Q/K matvec outputs before the norm reads
+            const std::uint64_t qk_va = s.nrm->GetGPUVirtualAddress() + qk_base;
+            list->SetPipelineState(s.pso_qknorm.Get());
+
+            write_qk(kQkNormQ, head_dim, heads);
+            list->SetComputeRootConstantBufferView(0, pb + kQkNormQ);
+            list->SetComputeRootShaderResourceView(1, qk_va + (2 * li) * qk_stride);
+            list->SetComputeRootUnorderedAccessView(6, b_base + b_q);
+            list->SetComputeRootUnorderedAccessView(5, b_base + b_q);
+            list->Dispatch(static_cast<UINT>(heads), 1, 1);
+
+            write_qk(kQkNormK, head_dim, kv_heads);
+            list->SetComputeRootConstantBufferView(0, pb + kQkNormK);
+            list->SetComputeRootShaderResourceView(1, qk_va + (2 * li + 1) * qk_stride);
+            list->SetComputeRootUnorderedAccessView(6, b_base + b_k);
+            list->SetComputeRootUnorderedAccessView(5, b_base + b_k);
+            list->Dispatch(static_cast<UINT>(kv_heads), 1, 1);
+
+            uav_barrier(s, s.fbuf.Get());  // normalised rows before rope reads them
+        }
+
         // 5/6. RoPE on q and k. Rope-k writes its output straight into the kcache row
         // when the append is direct: the kernel stores heads*head_dim (= kv_width)
         // floats at the bound UAV, which is exactly the [context][kv_heads][head_dim]
@@ -5689,7 +7006,15 @@ bool layer_decode_pipeline(const LayerDecodeParams* layers, std::size_t num_laye
                 s.list->CopyBufferRegion(s.yread.Get(), 0, s.xbuf.Get(), 0, 2048);
                 s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 35);
             }
+            // Straddle the barrier: slots 61/62 isolate its own GPU cost from the
+            // QKV/rope drain it waits on (58/59/60 keep their historic meaning).
+            if (op_stamps && li == 0 && s.ts_heap && s.ts_read) {
+                s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 61);
+            }
             uav_barrier(s, nullptr);
+            if (op_stamps && li == 0 && s.ts_heap && s.ts_read) {
+                s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 62);
+            }
             if (op_stamps && li == 0 && s.ts_heap && s.ts_read) {
                 s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 58);
                 s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 59);
@@ -5725,6 +7050,16 @@ bool layer_decode_pipeline(const LayerDecodeParams* layers, std::size_t num_laye
             }
         }
 
+        // Diagnostic split of the pre-attention transitions (slots 36/37/38): the
+        // layer-0 cache bucket spans everything up to the attn stamp, and these two
+        // barriers were the only unmeasured work inside it.
+        if (op_stamps && li == 0 && s.ts_heap && s.ts_read) {
+            s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 36);
+        }
+        if (op_stamps && li == 0 && s.ts_heap && s.ts_read) {
+            s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 39);
+        }
+
         // 8. Attention over the whole visible window. The caches are bound as UAVs at
         // the buffer base (always 256B aligned); the layer slice offset rides in the
         // attention cbuffer (kv_base/v_base).
@@ -5733,7 +7068,18 @@ bool layer_decode_pipeline(const LayerDecodeParams* layers, std::size_t num_laye
             // kernel reads it as an SRV.
             transition(s, s.ybuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         }
-        transition(s, s.datt.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (op_stamps && li == 0 && s.ts_heap && s.ts_read) {
+            s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 37);
+        }
+        // (datt stays in UNORDERED_ACCESS across layers: the previous layer's
+        // o-gemv handed it back in UAV, so the attention dispatch needs no barrier.)
+        if (op_stamps && li == 0 && s.ts_heap && s.ts_read) {
+            s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 38);
+        }
+        if (op_stamps && li == 0 && s.ts_heap && s.ts_read) {
+            s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 40);
+            s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 70);
+        }
         stamp_op(7); // attn = [48, 49)
         if (use_fuseq_attn) {
             list->SetPipelineState(s.pso_attn_fuse.Get());
@@ -5746,22 +7092,38 @@ bool layer_decode_pipeline(const LayerDecodeParams* layers, std::size_t num_laye
             list->SetComputeRootUnorderedAccessView(9, qact_base + qact_acts_span);
             list->Dispatch(static_cast<UINT>(heads), 1, 1);
         } else {
-            // attention2 (a2): two heads per 64-thread group, grid = ceil(heads/2).
+            // attention3 (a3): one 256-thread workgroup per head, the KV window split
+            // across its waves - the default decode kernel. attention2 (a2): two
+            // heads per 64-thread group. attention.hlsl: one 32-lane group per head.
             // The fuseq variant above has its own 1-head grid and is untouched:
             // it only runs under ZEN_D3D12_DP4A=1, out of scope for this gate.
-            const bool a2 = use_attn2(s, pos);
-            list->SetPipelineState(a2 ? s.pso_attn2.Get() : s.pso_attn.Get());
+            const bool a3 = use_attn3(s);
+            const bool a2 = !a3 && use_attn2(s, pos);
+            list->SetPipelineState(a3 ? s.pso_attn3.Get()
+                                      : (a2 ? s.pso_attn2.Get() : s.pso_attn.Get()));
             list->SetComputeRootConstantBufferView(0, pb + kAttnParamSlot);
             list->SetComputeRootShaderResourceView(1, a_base + a_qr);
             list->SetComputeRootUnorderedAccessView(6, s.kcache->GetGPUVirtualAddress());
             list->SetComputeRootUnorderedAccessView(7, s.vcache->GetGPUVirtualAddress());
             list->SetComputeRootUnorderedAccessView(5, s.datt->GetGPUVirtualAddress());
-            list->Dispatch(a2 ? static_cast<UINT>((heads + 1) / 2) : static_cast<UINT>(heads), 1, 1);
+            // attention3 keeps the historical one-workgroup-per-head grid; the
+            // split across the KV window lives inside the workgroup.
+            list->Dispatch((a2 && !a3) ? static_cast<UINT>((heads + 1) / 2)
+                                       : static_cast<UINT>(heads), 1, 1);
+        }
+        if (op_stamps && li == 0 && s.ts_heap && s.ts_read) {
+            s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 71);
         }
         if (kv_direct) {
             // Order this layer's cache reads before the next layer's cache writes
             // (WAR hazard on the shared cache buffers).
+            if (op_stamps && li == 0 && s.ts_heap && s.ts_read) {
+                s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 72);
+            }
             uav_barrier(s, nullptr);
+            if (op_stamps && li == 0 && s.ts_heap && s.ts_read) {
+                s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 73);
+            }
         }
 
         // 9. attn_output matvec
@@ -5785,10 +7147,11 @@ bool layer_decode_pipeline(const LayerDecodeParams* layers, std::size_t num_laye
         } else {
             gemv(kGemvBase + 768, w.oq.Get(), w.os_, s.datt->GetGPUVirtualAddress() + scores_floats * sizeof(float), a_base + a_t0, hidden);
         }
-        transition(s, s.datt.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        // Hand datt back to the next layer's attention without a COMMON round trip.
+        transition(s, s.datt.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
         // 10. C.h1 = A.t0 + x
-        if (trace_pipe && s.ts_heap && s.ts_read && num_layers <= 24) {
+        if (layer_ts) {
             s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2 + 2 * li);
         }
         transition(s, s.ybuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -5919,7 +7282,7 @@ bool layer_decode_pipeline(const LayerDecodeParams* layers, std::size_t num_laye
     // rmsnorm/GEMV kernels and parameter shapes, the norm table comes from the same
     // upload, the head weights from the same repacked residency, epsilon from the
     // caller. ybuf ends the layer loop in UNORDERED_ACCESS (a_fin written by addn2);
-    // datt was returned to COMMON after the last o-gemv.
+    // datt is left in UAV by the last layer's o-gemv.
     // Parameter slots sit past every per-layer slot (7168/7424 < 8192); the per-layer
     // attention slots start at 8192.
     constexpr std::uint64_t kGemvLm = 7168;
@@ -5931,8 +7294,6 @@ bool layer_decode_pipeline(const LayerDecodeParams* layers, std::size_t num_laye
             static_cast<std::uint64_t>(2 * num_layers) * hidden_bytes;
         transition(s, s.ybuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        transition(s, s.datt.Get(), D3D12_RESOURCE_STATE_COMMON,
-                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         s.list->SetPipelineState(s.pso_rms.Get());
         s.list->SetComputeRootConstantBufferView(0, pb_lm + kRmsLm);
         s.list->SetComputeRootShaderResourceView(1, a_base_lm + a_fin);
@@ -5940,10 +7301,10 @@ bool layer_decode_pipeline(const LayerDecodeParams* layers, std::size_t num_laye
         s.list->SetComputeRootUnorderedAccessView(5, s.datt->GetGPUVirtualAddress());
         s.list->Dispatch(1, 1, 1);
 
-        // The GEMV reads the normed activation as an SRV: buffers promote from COMMON
-        // on first use, so datt only needs to leave UAV.
+        // The GEMV reads the normed activation as an SRV, so datt goes straight from
+        // UAV to SRV (no COMMON stop: that cost a GPU drain in the layer loop).
         transition(s, s.datt.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                   D3D12_RESOURCE_STATE_COMMON);
+                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         transition(s, s.ybuf.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         s.list->SetPipelineState(s.pso_gemv.Get());
@@ -5965,14 +7326,25 @@ bool layer_decode_pipeline(const LayerDecodeParams* layers, std::size_t num_laye
                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
 
+    // Return datt to COMMON so the next call's prologue barrier is honest. This sits
+    // at the tail of the list, where the existing submit-and-wait absorbs the cost.
+    transition(s, s.datt.Get(),
+               lm_active ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                         : D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+               D3D12_RESOURCE_STATE_COMMON);
+
     // Submit the single command list, then wait once for all layers.
-    if (trace_pipe && s.ts_heap && s.ts_read && num_layers <= 24) {
+    if (layer_ts) {
         s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2 * num_layers + 1);
-        // Resolve the whole heap (64 slots): layer-0 op stamps sit at 41..57, so
+    } else if (op_ts) {
+        s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, op_end_slot);
+    }
+    if (layer_ts || op_ts) {
+        // Resolve the whole heap (128 slots): layer-0 op stamps sit at 41..57, so
         // a count large enough to cover them removes count bookkeeping. Slots
         // that were never stamped resolve as stale values and go unused.
         s.list->ResolveQueryData(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0,
-                                 64, s.ts_read.Get(), 0);
+                                 128, s.ts_read.Get(), 0);
     }
     if (FAILED(s.list->Close())) return false;
     {
@@ -6013,21 +7385,26 @@ bool layer_decode_pipeline(const LayerDecodeParams* layers, std::size_t num_laye
         s.stats.ffn_wait_us += pipe_us;
         if (const char* trace = std::getenv("ZEN_D3D12_TRACE"); trace && trace[0] == '1') {
             std::printf("[d3d12] pipeline: gpu %.3f ms num_layers=%zu\n", pipe_us / 1000.0, num_layers);
-            if (trace_pipe && s.ts_heap && s.ts_read) {
+            if (layer_ts || op_ts) {
                 std::uint64_t* stamps = nullptr;
-                const D3D12_RANGE ts_range{0, sizeof(std::uint64_t) * 64};
+                const D3D12_RANGE ts_range{0, sizeof(std::uint64_t) * 128};
                 if (SUCCEEDED(s.ts_read->Map(0, &ts_range, reinterpret_cast<void**>(&stamps)))) {
                     const auto stamp_us = [freq = s.ts_freq](std::uint64_t a, std::uint64_t b) {
                         return a <= b ? static_cast<double>(b - a) * 1e6 /
                                         static_cast<double>(freq) : 0.0;
                     };
                     const double device_ms =
-                        stamp_us(stamps[0], stamps[2 * num_layers + 1]) / 1000.0;
+                        stamp_us(stamps[0], stamps[layer_ts ? 2 * num_layers + 1 : op_end_slot]) /
+                        1000.0;
                     if (device_ms >= 0.0) {
                         s.stats.gpu_us += static_cast<std::uint64_t>(device_ms * 1000.0);
                         std::printf("[d3d12] pipeline: device %.3f ms wall %.3f ms overhead %.3f ms\n",
                                     device_ms, pipe_us / 1000.0,
                                     std::max(0.0, pipe_us / 1000.0 - device_ms));
+                    // The halves need the per-layer brackets; with only op stamps the
+                    // slots past 57 hold no layer boundaries, so the attribution below
+                    // would read stale values and report nonsense.
+                    if (layer_ts) {
                         double attn_us = 0.0, ffn_us = 0.0;
                         for (std::size_t li = 0; li < num_layers; ++li) {
                             const double a = stamp_us(stamps[1 + 2 * li], stamps[2 + 2 * li]);
@@ -6043,8 +7420,39 @@ bool layer_decode_pipeline(const LayerDecodeParams* layers, std::size_t num_laye
                         }
                         std::printf("[d3d12] pipeline: attn-half=%.0f us ffn-half+copy=%.0f us total=%.0f us (walls include inter-layer gaps)\n",
                                     attn_us, ffn_us, attn_us + ffn_us);
+                        // Attribute this token's single multi-layer submission to the
+                        // components it is actually made of. This path waits directly
+                        // instead of through execute_and_wait(), so nothing here used
+                        // to reach comp_stats: the whole decode step reported dev=0 and
+                        // an idle share of 100%. One submission covers every layer, so
+                        // submits is recorded once on the component that owns the list
+                        // and the per-layer halves split the device time.
+                        note_group(s, Comp::Projections,
+                                   static_cast<std::uint64_t>(num_layers),
+                                   static_cast<std::uint64_t>(attn_us));
+                        note_group(s, Comp::FfnFused,
+                                   static_cast<std::uint64_t>(num_layers),
+                                   static_cast<std::uint64_t>(ffn_us));
+                        {
+                            // One fence wait covers both halves, so split it in
+                            // proportion to their measured device time; charging it
+                            // all to one row would make that row's idle column read
+                            // as pure overhead.
+                            auto& p = s.comp_stats[static_cast<int>(Comp::Projections)];
+                            auto& f = s.comp_stats[static_cast<int>(Comp::FfnFused)];
+                            ++p.submits;
+                            const double total = attn_us + ffn_us;
+                            if (total > 0.0) {
+                                p.wait_us += static_cast<std::uint64_t>(
+                                    static_cast<double>(pipe_us) * attn_us / total);
+                                f.wait_us += static_cast<std::uint64_t>(
+                                    static_cast<double>(pipe_us) * ffn_us / total);
+                            } else {
+                                p.wait_us += pipe_us;
+                            }
+                        }
                     }
-                    if (op_stamps && device_ms >= 0.0) {
+                    if (op_ts && device_ms >= 0.0) {
                         // Layer-0 per-op decomposition: op i spans stamps
                         // (41+i) -> (42+i); copy-in spans layer start (1) -> 41.
                         static const char* const op_names[] = {
@@ -6053,7 +7461,7 @@ bool layer_decode_pipeline(const LayerDecodeParams* layers, std::size_t num_laye
                             "addn1", "rms2", "gate-gemv", "up-gemv", "silu",
                             "down-gemv", "addn2"};
                         double op_total = 0.0;
-                        std::printf("[d3d12] layer0 ops:");
+                        std::printf("[d3d12] layer0 ops(pos=%zu):", layers[0].pos);
                         for (std::size_t oi = 0; oi < 17; ++oi) {
                             const std::size_t beg = oi == 0 ? 1 : op_stamp_first + oi - 1;
                             const std::size_t end = op_stamp_first + oi;
@@ -6065,9 +7473,22 @@ bool layer_decode_pipeline(const LayerDecodeParams* layers, std::size_t num_laye
                         const double kcopy = stamp_us(stamps[op_stamp_first + 6], stamps[58]);
                         const double vcopy = stamp_us(stamps[58], stamps[59]);
                         const double cacheback = stamp_us(stamps[59], stamps[60]);
-                        std::printf(" | probe0=%.1f kcopy=%.1f vcopy=%.1f cache-transitions=%.1f us\n",
-                                    probe0, kcopy, vcopy, cacheback);
+                        const double bar = stamp_us(stamps[61], stamps[62]);
+                        const double tail = stamp_us(stamps[60], stamps[36]);
+                        const double ybtr = stamp_us(stamps[36], stamps[37]);
+                        const double dattr = stamp_us(stamps[37], stamps[38]);
+                        std::printf(" | probe0=%.1f kcopy=%.1f vcopy=%.1f cache-transitions=%.1f barrier=%.1f us\n",
+                                    probe0, kcopy, vcopy, cacheback, bar);
+                        std::printf(" | pre-attn: tail=%.1f ybuf-tr=%.1f datt-tr=%.1f us\n",
+                                    tail, ybtr, dattr);
+                        std::printf(" | bisect: nop=%.1f pre-pso=%.1f attn-disp=%.1f bar-in=%.1f bar=%.1f\n",
+                                    stamp_us(stamps[38], stamps[40]),
+                                    stamp_us(stamps[40], stamps[70]),
+                                    stamp_us(stamps[70], stamps[71]),
+                                    stamp_us(stamps[71], stamps[72]),
+                                    stamp_us(stamps[72], stamps[73]));
                         std::printf(" | ops=%.0f us\n", op_total);
+                    }
                     }
                     s.ts_read->Unmap(0, &ts_range);
                 } else {
@@ -6893,16 +8314,26 @@ bool silu_mul(const float* gate, const float* up, float* out, std::size_t count)
 // fbuf = B) alternate reader/writer roles so no dispatch both reads and
 // writes the same resource; every swap is an explicit full-resource
 // transition, same pattern as the decode fused path.
-bool ffn_prefill_fused_locked(State& s, const std::uint8_t* attn_out_w, const std::uint8_t* gate_w,
-                               const std::uint8_t* up_w, const std::uint8_t* down_w,
-                               const float* norm_weight, const float* x, const float* attn_out,
-                               float* out, std::size_t tokens, std::size_t hidden,
-                               std::size_t attn_width, std::size_t ffn_rows, float epsilon) {
-    // The fused path is fp32-only: with DP4A on the single-GEMM path runs
-    // int8-activation math while the fused input never passes through the
-    // host quantizer. Mirror the single-gemm gate (gemm_opted_in) so
-    // ZEN_D3D12_GEMM_EXPERIMENTAL=0 still disables every GPU GEMM.
-    if (dp4a_enabled() || !gemm_opted_in()) {
+bool ffn_prefill_plan_locked(State& s, const std::uint8_t* attn_out_w,
+                             const std::uint8_t* gate_w, const std::uint8_t* up_w,
+                             const std::uint8_t* down_w, const float* norm_weight,
+                             const float* x, const float* attn_out, std::size_t tokens,
+                             std::size_t hidden, std::size_t attn_width,
+                             std::size_t ffn_rows, float epsilon, bool attn_on_device,
+                             bool x_pre_staged, const FfnSlots& slots, FfnPrefillPlan& plan) {
+    // The legacy DP4A path quantises activations on the host, so it cannot run here:
+    // this chain never brings an intermediate back to the host between stages. The
+    // integer kernel quantises on the device and keeps every intermediate in device
+    // scratch, so this fused chain is exactly where it belongs - three device-resident
+    // GEMMs at ~28 TFLOP/s instead of three fp32 GEMMs at ~12 (measured with
+    // zen_d3d12_gemm_bench's stamped kernel time: 28-31 vs 12-14 TFLOP/s at t=512).
+    // Mirror the single-gemm gate (gemm_opted_in) so ZEN_D3D12_GEMM_EXPERIMENTAL=0
+    // still disables every GPU GEMM.
+    if (!gemm_opted_in()) {
+        return false;
+    }
+    const bool use_i8 = gemm_i8_enabled() && s.pso_gemm_i8 != nullptr;
+    if (!use_i8 && dp4a_enabled()) {
         return false;
     }
     if (!tokens || !hidden || !attn_width || !ffn_rows) {
@@ -6922,6 +8353,15 @@ bool ffn_prefill_fused_locked(State& s, const std::uint8_t* attn_out_w, const st
     const std::uint64_t tf = static_cast<std::uint64_t>(tokens) * ffn_rows;
     if (th > 0xFFFFFFFFu || tf > 0xFFFFFFFFu) {
         return false;
+    }
+    // Attention already on the device (flash wrote fa_out and skipped its readback):
+    // the chain reads it there, which is what removes the attention readback and the
+    // re-upload of the same buffer per layer.
+    if (attn_on_device) {
+        if (!s.fa_out ||
+            s.fa_cap < static_cast<std::size_t>(tokens) * attn_width * sizeof(float)) {
+            return false;
+        }
     }
     // Same minimum-work gate the single GEMM honours, applied per projection.
     if (tokens * hidden * attn_width < kMinElements ||
@@ -7000,24 +8440,33 @@ bool ffn_prefill_fused_locked(State& s, const std::uint8_t* attn_out_w, const st
     }
 
     const std::size_t x_bytes = tokens * hidden * sizeof(float);
-    if (!ensure_upload(s.wbuf, s.w_cpu, s.w_cap, s.device.Get(), x_bytes) ||
-        !ensure_upload(s.nbuf, s.n_cpu, s.n_cap, s.device.Get(), hidden * sizeof(float))) {
+    if (!x_pre_staged && !ensure_upload(s.wbuf, s.w_cpu, s.w_cap, s.device.Get(), x_bytes)) {
         return false;
     }
-    std::memcpy(s.x_cpu, attn_out, tokens * attn_width * sizeof(float));
-    std::memcpy(s.w_cpu, x, x_bytes);
+    if (!ensure_upload(s.nbuf, s.n_cpu, s.n_cap, s.device.Get(), hidden * sizeof(float))) {
+        return false;
+    }
+    if (!attn_on_device) {
+        std::memcpy(s.x_cpu, attn_out, tokens * attn_width * sizeof(float));
+    }
+    // The merged front stages the same residual rows for its attention norm, so staging
+    // them again here spent a second 5.2 MB host copy per layer (T=512) on bytes that
+    // were already in an upload buffer. It fills in x_src once its own copy is made.
+    if (!x_pre_staged) {
+        std::memcpy(s.w_cpu, x, x_bytes);
+        plan.x_src = s.wbuf->GetGPUVirtualAddress();
+    }
     std::memcpy(s.n_cpu, norm_weight, hidden * sizeof(float));
 
-    // Distinct 256B param slots per dispatch (upload-heap CBVs are read at
-    // execution, so a shared slot would make every dispatch use the last
-    // written values): GEMMs 1024+256*i, RMS 256 (single-rms slot), SiLU
-    // 3072, adds 2560/2816. No rope/attention dispatch shares this list, so
-    // the gemm-batch slot convention is safe here.
-    constexpr std::uint64_t kGemmBase = 1024;
-    constexpr std::uint64_t kRmsSlot = 256;
-    constexpr std::uint64_t kSiluSlot = 3072;
-    constexpr std::uint64_t kAddn0 = 2560;
-    constexpr std::uint64_t kAddn1 = 2816;
+    // Distinct 256B param slots per dispatch (upload-heap CBVs are read at execution,
+    // so a shared slot would make every dispatch use the last written values). The
+    // caller supplies them, because the single-submission path shares this parameter
+    // buffer with the attention half; FfnSlots{} is the standalone layout.
+    const std::uint64_t kGemmBase = slots.gemm_base;
+    const std::uint64_t kRmsSlot = slots.rms;
+    const std::uint64_t kSiluSlot = slots.silu;
+    const std::uint64_t kAddn0 = slots.addn0;
+    const std::uint64_t kAddn1 = slots.addn1;
     auto* base = static_cast<std::uint8_t*>(s.params_cpu);
     // Tiling mirrors gemm_batch_locked (v3 > v2 > v1, all bit-identical fp32).
     const bool use_v3 = gemm_v3_enabled() && s.pso_gemm_v3 != nullptr;
@@ -7026,7 +8475,8 @@ bool ffn_prefill_fused_locked(State& s, const std::uint8_t* attn_out_w, const st
                                       : (use_v2 ? kTokensPerTileV2 : kTokensPerTile);
     const std::uint32_t rpg = use_v3 ? kGemmRowsPerGroupV3
                                      : (use_v2 ? kGemmRowsPerGroupV2 : kGemmRowsPerGroup);
-    ID3D12PipelineState* gemm_pso = use_v3 ? s.pso_gemm_v3.Get()
+    ID3D12PipelineState* gemm_pso = use_i8 ? s.pso_gemm_i8.Get()
+                                  : use_v3 ? s.pso_gemm_v3.Get()
                                            : (use_v2 ? s.pso_gemm_v2.Get() : s.pso_gemm.Get());
     auto fill_gemm = [&](std::uint64_t slot, std::size_t rows, std::size_t cols) {
         auto* params = reinterpret_cast<GemmParams*>(base + slot);
@@ -7059,27 +8509,109 @@ bool ffn_prefill_fused_locked(State& s, const std::uint8_t* attn_out_w, const st
     const std::uint64_t a_base = s.ybuf->GetGPUVirtualAddress();
     const std::uint64_t b_base = s.fbuf->GetGPUVirtualAddress();
 
-    const UINT attn_groups = static_cast<UINT>((hidden + rpg - 1) / rpg);
-    const UINT ffn_groups = static_cast<UINT>((ffn_rows + rpg - 1) / rpg);
-    const UINT down_groups = static_cast<UINT>((hidden + rpg - 1) / rpg);
+    // Tile geometry differs: the integer kernel is a 2-D grid of 128-row x 64-token
+    // workgroups, the fp32 tiles are 1-D row tiles with an internal token loop.
+    constexpr std::uint32_t kRowsI8 = 128;
+    constexpr std::uint32_t kTokI8 = 64;
+    auto gemm_groups_x = [&](std::size_t r) {
+        return use_i8 ? static_cast<UINT>((r + kRowsI8 - 1) / kRowsI8)
+                      : static_cast<UINT>((r + rpg - 1) / rpg);
+    };
+    const UINT gemm_groups_y =
+        use_i8 ? static_cast<UINT>((tokens + kTokI8 - 1) / kTokI8) : 1u;
     const UINT addn_groups = static_cast<UINT>((th + 255u) / 256u);
     const UINT silu_groups = static_cast<UINT>((tf + 255u) / 256u);
 
-    s.allocator->Reset();
-    s.list->Reset(s.allocator.Get(), gemm_pso);
-    s.list->SetComputeRootSignature(s.root.Get());
-    if (s.trace) {
-        s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
-    }
+    plan.ao_q = ao_q;
+    plan.g_q = g_q;
+    plan.u_q = u_q;
+    plan.d_q = d_q;
+    plan.ao_s = ao_s;
+    plan.g_s = g_s;
+    plan.u_s = u_s;
+    plan.d_s = d_s;
+    plan.a_t0 = a_t0;
+    plan.a_h2 = a_h2;
+    plan.a_f = a_f;
+    plan.a_fin = a_fin;
+    plan.b_h1 = b_h1;
+    plan.b_g = b_g;
+    plan.b_u = b_u;
+    plan.b_d = b_d;
+    plan.slots = slots;
+    plan.tokens = tokens;
+    plan.hidden = hidden;
+    plan.attn_width = attn_width;
+    plan.ffn_rows = ffn_rows;
+    plan.x_bytes = x_bytes;
+    plan.groups_hidden = static_cast<std::uint32_t>(gemm_groups_x(hidden));
+    plan.groups_ffn = static_cast<std::uint32_t>(gemm_groups_x(ffn_rows));
+    plan.gemm_groups_y = static_cast<std::uint32_t>(gemm_groups_y);
+    plan.addn_groups = static_cast<std::uint32_t>(addn_groups);
+    plan.silu_groups = static_cast<std::uint32_t>(silu_groups);
+    plan.gemm_pso = gemm_pso;
+    plan.attn_on_device = attn_on_device;
+    return true;
+}
 
-    // 1. attn_output GEMM: A.t0 = W_attn @ att  (input staged on xbuf).
+// Records the FFN half into the command list that is already open (the standalone entry
+// opens it; the merged front has it open already). The shared scratch addresses are read
+// here rather than captured, because the front may have grown them after the plan.
+void ffn_prefill_record_locked(State& s, const FfnPrefillPlan& plan) {
+    const std::uint64_t params_base = s.params->GetGPUVirtualAddress();
+    const std::uint64_t a_base = s.ybuf->GetGPUVirtualAddress();
+    const std::uint64_t b_base = s.fbuf->GetGPUVirtualAddress();
+    const std::uint64_t a_t0 = plan.a_t0;
+    const std::uint64_t a_h2 = plan.a_h2;
+    const std::uint64_t a_f = plan.a_f;
+    const std::uint64_t a_fin = plan.a_fin;
+    const std::uint64_t b_h1 = plan.b_h1;
+    const std::uint64_t b_g = plan.b_g;
+    const std::uint64_t b_u = plan.b_u;
+    const std::uint64_t b_d = plan.b_d;
+    const std::uint64_t kGemmBase = plan.slots.gemm_base;
+    const std::uint64_t kRmsSlot = plan.slots.rms;
+    const std::uint64_t kSiluSlot = plan.slots.silu;
+    const std::uint64_t kAddn0 = plan.slots.addn0;
+    const std::uint64_t kAddn1 = plan.slots.addn1;
+    const auto& ao_q = plan.ao_q;
+    const auto& g_q = plan.g_q;
+    const auto& u_q = plan.u_q;
+    const auto& d_q = plan.d_q;
+    const std::uint64_t ao_s = plan.ao_s;
+    const std::uint64_t g_s = plan.g_s;
+    const std::uint64_t u_s = plan.u_s;
+    const std::uint64_t d_s = plan.d_s;
+    const std::size_t tokens = plan.tokens;
+    const std::size_t x_bytes = plan.x_bytes;
+    const UINT gemm_groups_y = static_cast<UINT>(plan.gemm_groups_y);
+    const UINT addn_groups = static_cast<UINT>(plan.addn_groups);
+    const UINT silu_groups = static_cast<UINT>(plan.silu_groups);
+    const bool attn_on_device = plan.attn_on_device;
+    ID3D12PipelineState* gemm_pso = plan.gemm_pso;
+
+    // The merged layer closes its attention half with the flash (or rope) PSO still
+    // current, so bind the projection kernel here instead of inheriting whatever the
+    // caller left. A standalone FFN list happened to start on this PSO, which is why
+    // the merged layer's first stage ran the attention shader and produced garbage.
+    s.list->SetPipelineState(gemm_pso);
+
+    // 1. attn_output GEMM: A.t0 = W_attn @ att  (input staged on xbuf, or read
+    // straight out of fa_out when flash left it on the device).
+    const std::uint64_t attn_va = attn_on_device
+                                      ? s.fa_out->GetGPUVirtualAddress()
+                                      : s.xbuf->GetGPUVirtualAddress();
+    if (attn_on_device) {
+        transition(s, s.fa_out.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
     s.list->SetComputeRootConstantBufferView(0, params_base + kGemmBase);
     s.list->SetComputeRootShaderResourceView(1, ao_q->GetGPUVirtualAddress());
     s.list->SetComputeRootShaderResourceView(2, ao_s);
-    s.list->SetComputeRootShaderResourceView(3, s.xbuf->GetGPUVirtualAddress());
-    s.list->SetComputeRootShaderResourceView(4, s.xbuf->GetGPUVirtualAddress());
+    s.list->SetComputeRootShaderResourceView(3, attn_va);
+    s.list->SetComputeRootShaderResourceView(4, attn_va);
     s.list->SetComputeRootUnorderedAccessView(5, a_base + a_t0);
-    s.list->Dispatch(attn_groups, 1, 1);
+    s.list->Dispatch(static_cast<UINT>(plan.groups_hidden), gemm_groups_y, 1);
 
     // 2. residual: B.h1 = A.t0 + x  (addn reads A.t0, so A becomes an SRV).
     transition(s, s.ybuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -7087,7 +8619,7 @@ bool ffn_prefill_fused_locked(State& s, const std::uint8_t* attn_out_w, const st
     s.list->SetPipelineState(s.pso_addn.Get());
     s.list->SetComputeRootConstantBufferView(0, params_base + kAddn0);
     s.list->SetComputeRootShaderResourceView(1, a_base + a_t0);
-    s.list->SetComputeRootShaderResourceView(2, s.wbuf->GetGPUVirtualAddress());
+    s.list->SetComputeRootShaderResourceView(2, plan.x_src);
     s.list->SetComputeRootUnorderedAccessView(5, b_base + b_h1);
     s.list->Dispatch(addn_groups, 1, 1);
 
@@ -7103,6 +8635,10 @@ bool ffn_prefill_fused_locked(State& s, const std::uint8_t* attn_out_w, const st
     s.list->SetComputeRootUnorderedAccessView(5, a_base + a_h2);
     s.list->Dispatch(static_cast<UINT>(tokens), 1, 1);
 
+    if (s.trace) {
+        s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 105);
+    }
+
     // 4/5. gate and up GEMMs from the normed rows into B (no state change
     // between them: both read the same A.h2 and write the same B resource).
     transition(s, s.ybuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -7116,7 +8652,10 @@ bool ffn_prefill_fused_locked(State& s, const std::uint8_t* attn_out_w, const st
     s.list->SetComputeRootShaderResourceView(3, a_base + a_h2);
     s.list->SetComputeRootShaderResourceView(4, a_base + a_h2);
     s.list->SetComputeRootUnorderedAccessView(5, b_base + b_g);
-    s.list->Dispatch(ffn_groups, 1, 1);
+    s.list->Dispatch(static_cast<UINT>(plan.groups_ffn), gemm_groups_y, 1);
+    if (s.trace) {
+        s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 106);
+    }
 
     s.list->SetComputeRootConstantBufferView(0, params_base + kGemmBase + 512);
     s.list->SetComputeRootShaderResourceView(1, u_q->GetGPUVirtualAddress());
@@ -7124,7 +8663,10 @@ bool ffn_prefill_fused_locked(State& s, const std::uint8_t* attn_out_w, const st
     s.list->SetComputeRootShaderResourceView(3, a_base + a_h2);
     s.list->SetComputeRootShaderResourceView(4, a_base + a_h2);
     s.list->SetComputeRootUnorderedAccessView(5, b_base + b_u);
-    s.list->Dispatch(ffn_groups, 1, 1);
+    s.list->Dispatch(static_cast<UINT>(plan.groups_ffn), gemm_groups_y, 1);
+    if (s.trace) {
+        s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 107);
+    }
 
     // 6. SiLU(gate)*up into A.f  (B becomes the SRV again).
     transition(s, s.fbuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -7138,6 +8680,10 @@ bool ffn_prefill_fused_locked(State& s, const std::uint8_t* attn_out_w, const st
     s.list->SetComputeRootUnorderedAccessView(5, a_base + a_f);
     s.list->Dispatch(silu_groups, 1, 1);
 
+    if (s.trace) {
+        s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 108);
+    }
+
     // 7. down GEMM: B.d = W_down @ A.f
     transition(s, s.ybuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -7150,7 +8696,10 @@ bool ffn_prefill_fused_locked(State& s, const std::uint8_t* attn_out_w, const st
     s.list->SetComputeRootShaderResourceView(3, a_base + a_f);
     s.list->SetComputeRootShaderResourceView(4, a_base + a_f);
     s.list->SetComputeRootUnorderedAccessView(5, b_base + b_d);
-    s.list->Dispatch(down_groups, 1, 1);
+    s.list->Dispatch(static_cast<UINT>(plan.groups_hidden), gemm_groups_y, 1);
+    if (s.trace) {
+        s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 109);
+    }
 
     // 8. final residual: A.fin = B.h1 + B.d
     transition(s, s.fbuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -7166,16 +8715,50 @@ bool ffn_prefill_fused_locked(State& s, const std::uint8_t* attn_out_w, const st
     s.list->Dispatch(addn_groups, 1, 1);
 
     if (s.trace) {
+        s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 110);
         s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
     }
     transition(s, s.ybuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                D3D12_RESOURCE_STATE_COPY_SOURCE);
-    s.list->CopyBufferRegion(s.yread.Get(), 0, s.ybuf.Get(), a_fin, x_bytes);
+    if (plan.copy_out) {
+        s.list->CopyBufferRegion(s.yread.Get(), 0, s.ybuf.Get(), a_fin, x_bytes);
+    }
     transition(s, s.ybuf.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (attn_on_device) {
+        // fa_out's resting state between calls, which is where flash expects to find it.
+        transition(s, s.fa_out.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                   D3D12_RESOURCE_STATE_COPY_SOURCE);
+    }
+}
+
+// The whole FFN half in its own submission: plan (stage + reserve) -> record -> submit.
+bool ffn_prefill_fused_locked(State& s, const std::uint8_t* attn_out_w, const std::uint8_t* gate_w,
+                              const std::uint8_t* up_w, const std::uint8_t* down_w,
+                              const float* norm_weight, const float* x, const float* attn_out,
+                              float* out, std::size_t tokens, std::size_t hidden,
+                              std::size_t attn_width, std::size_t ffn_rows, float epsilon,
+                              bool attn_on_device) {
+    FfnPrefillPlan plan;
+    if (!ffn_prefill_plan_locked(s, attn_out_w, gate_w, up_w, down_w, norm_weight, x, attn_out,
+                                 tokens, hidden, attn_width, ffn_rows, epsilon, attn_on_device,
+                                 false, FfnSlots{}, plan)) {
+        return false;
+    }
+    s.allocator->Reset();
+    s.list->Reset(s.allocator.Get(), plan.gemm_pso);
+    s.list->SetComputeRootSignature(s.root.Get());
+    // This path finishes on the host: the device copy is not this layer's output.
+    s.prefill_resident = false;
+    s.prefill_host_valid = true;
     if (s.trace) {
-        s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2);
-        s.list->ResolveQueryData(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 3,
+        s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+    }
+    ffn_prefill_record_locked(s, plan);
+    const std::size_t x_bytes = plan.x_bytes;
+    if (s.trace) {
+        s.list->EndQuery(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+        s.list->ResolveQueryData(s.ts_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 2,
                                  s.ts_read.Get(), 0);
     }
     s.list->Close();
@@ -7194,7 +8777,7 @@ bool ffn_prefill_fused_locked(State& s, const std::uint8_t* attn_out_w, const st
         accumulate_gpu_us(s, dev, 0, 1);
         note_dev(s, Comp::FfnFused, dev);
     }
-    std::memcpy(out, mapped, x_bytes);
+    s.prefill_x_finite = copy_check_finite(static_cast<const float*>(mapped), out, x_bytes);
     const D3D12_RANGE written{0, 0};
     s.yread->Unmap(0, &written);
     s.stats.dispatches += 8;
@@ -7206,8 +8789,10 @@ bool ffn_prefill_fused(const std::uint8_t* attn_out_w, const std::uint8_t* gate_
                        const std::uint8_t* up_w, const std::uint8_t* down_w,
                        const float* norm_weight, const float* x, const float* attn_out,
                        float* out, std::size_t tokens, std::size_t hidden,
-                       std::size_t attn_width, std::size_t ffn_rows, float epsilon) noexcept {
-    if (!attn_out_w || !gate_w || !up_w || !down_w || !norm_weight || !x || !attn_out || !out) {
+                       std::size_t attn_width, std::size_t ffn_rows, float epsilon,
+                       bool attn_on_device) noexcept {
+    if (!attn_out_w || !gate_w || !up_w || !down_w || !norm_weight || !x ||
+        (!attn_out && !attn_on_device) || !out) {
         return false;
     }
     State& s = state();
@@ -7216,10 +8801,25 @@ bool ffn_prefill_fused(const std::uint8_t* attn_out_w, const std::uint8_t* gate_
         return false;
     }
     if (!ffn_prefill_fused_locked(s, attn_out_w, gate_w, up_w, down_w, norm_weight, x, attn_out,
-                                  out, tokens, hidden, attn_width, ffn_rows, epsilon)) {
+                                  out, tokens, hidden, attn_width, ffn_rows, epsilon,
+                                  attn_on_device)) {
         ++s.stats.fallbacks;
         return false;
     }
+    return true;
+}
+
+bool prefill_x_finite() noexcept {
+    State& s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    return s.prefill_x_finite;
+}
+
+bool prefill_residual_invalidate() noexcept {
+    State& s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    s.prefill_resident = false;
+    s.prefill_host_valid = true;
     return true;
 }
 
