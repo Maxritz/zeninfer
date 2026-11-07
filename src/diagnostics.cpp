@@ -144,4 +144,9 @@ void dump_breadcrumbs(std::ostream& out, std::size_t count) {
             << " arg0=" << b.arg0 << " arg1=" << b.arg1 << '\n';
     }
 }
+
+#if defined(_WIN32)
+#include "diagnostics_winpostmortem.inl"
+#endif
+
 } // namespace zen::diag

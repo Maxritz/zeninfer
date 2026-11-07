@@ -1521,6 +1521,12 @@ bool init_locked(State& s) {
         }
     }
     if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_1, IID_PPV_ARGS(&s.device)))) {
+        // The shipped device-open used 12_1 only. On some machines the first
+        // attempt fails even though a real adapter is present; fall back to 12_0
+        // so the backend can come up on the installed adapter instead of skipping.
+        std::fprintf(stderr, "[d3d12] init: D3D12CreateDevice(12_1) failed, trying 12_0
+");
+        if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&s.device)))) {
         return fail();
     }
 
