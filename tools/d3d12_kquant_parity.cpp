@@ -59,10 +59,61 @@ bool check(const Shape& shape, bool q5) {
     zen::d3d12::release_kquant_weights(w.data());
     return true;
 }
+bool check_q1q6(const Shape& shape, bool q6) {
+    const auto& f=*zen::quant::find(q6?"Q6_K":"Q1_0");
+    const std::size_t elem=q6?256u:128u, blk=q6?210u:18u;
+    const std::size_t rb=zen::quant::row_bytes(f,shape.columns);
+    std::vector<std::uint8_t> w(shape.rows*rb);
+    std::vector<float> x(shape.tokens*shape.columns), result(shape.tokens*shape.rows), decoded(shape.columns);
+    std::uint32_t seed=43u;
+    auto rnd=[&](){seed=seed*1664525u+1013904223u;return std::uint8_t(seed>>24);};
+    for(auto& v:w)v=rnd();
+    for(std::size_t r=0;r<shape.rows;++r)for(std::size_t b=0;b<shape.columns/elem;++b){
+        // Sane finite fp16 scales (incl. negative and small-magnitude cases).
+        const std::uint16_t d=(b%4==0?0x0001u:(r%2?0xa800u:0x2c00u));
+        auto* p=w.data()+r*rb+b*blk;
+        const std::size_t doff=q6?208u:0u;
+        p[doff]=std::uint8_t(d);p[doff+1]=std::uint8_t(d>>8);
+    }
+    for(auto& v:x)v=float(int(rnd())-128)*0.007f;
+    zen::d3d12::release_kquant_weights(w.data());
+    const bool direct=q6?zen::d3d12::gemm_q6_k(w.data(),x.data(),result.data(),shape.tokens,shape.rows,shape.columns)
+                       :zen::d3d12::gemm_q1_0(w.data(),x.data(),result.data(),shape.tokens,shape.rows,shape.columns);
+    if(!direct) {
+        std::printf("GPU declined %s rows=%zu cols=%zu tokens=%zu\n",f.name.c_str(),shape.rows,shape.columns,shape.tokens); return false;
+    }
+    double worst=0;
+    for(std::size_t r=0;r<shape.rows;++r){
+        if(!zen::quant::dequantize(f,w.data()+r*rb,shape.columns,decoded.data()))return false;
+        for(std::size_t t=0;t<shape.tokens;++t){
+            double ref=0, magnitude=0;
+            for(std::size_t c=0;c<shape.columns;++c){const double v=double(decoded[c])*x[t*shape.columns+c];ref+=v;magnitude+=std::abs(v);}
+            const float actual=result[t*shape.rows+r];
+            const double err=std::abs(double(actual)-ref);worst=std::max(worst,err);
+            if(!std::isfinite(actual)||err>2e-5*std::max(1.0,magnitude)){
+                std::printf("FAIL %s t=%zu row=%zu actual=%g expected=%g error=%g\n",f.name.c_str(),t,r,actual,ref,err);return false;
+            }
+        }
+    }
+    const auto before=zen::d3d12::stats().dispatches;
+    std::vector<float> routed(result.size());
+    const bool ok=shape.tokens==1
+        ? zen::quant::gemv(f,w.data(),x.data(),routed.data(),shape.rows,shape.columns,1.0f,1)
+        : zen::quant::gemm(f,w.data(),x.data(),routed.data(),shape.tokens,shape.rows,shape.columns,1.0f,1);
+    if(!ok || zen::d3d12::stats().dispatches!=before+1){std::printf("FAIL %s dispatch fell back\n",f.name.c_str());return false;}
+    for(std::size_t i=0;i<result.size();++i)if(!std::isfinite(routed[i]) || std::abs(routed[i]-result[i])>1e-5f*std::max(1.0f,std::abs(result[i])))return false;
+    std::printf("PASS %s rows=%zu cols=%zu tokens=%zu max_abs=%g\n",f.name.c_str(),shape.rows,shape.columns,shape.tokens,worst);
+    zen::d3d12::release_kquant_weights(w.data());
+    return true;
+}
 int main(){
     if(!zen::d3d12::init()){std::printf("SKIP: D3D12 device unavailable\n");return 77;}
     const Shape shapes[]={{1,256,1},{7,512,3},{9,768,5},{33,1024,7},{65,4096,8}};
     for(bool q5:{false,true})for(const auto& shape:shapes)if(!check(shape,q5))return 1;
+    const Shape shapes_q1[]={{1,128,1},{7,256,3},{9,512,5},{33,1024,7},{65,4096,8}};
+    for(const auto& shape:shapes_q1)if(!check_q1q6(shape,false))return 1;
+    const Shape shapes_q6[]={{1,256,1},{7,512,3},{9,768,5},{33,1024,7},{65,4096,8}};
+    for(const auto& shape:shapes_q6)if(!check_q1q6(shape,true))return 1;
     // Reusing an address for a different format must replace its residency;
     // explicit release must also allow replacement with the same format/shape.
     std::vector<std::uint8_t> shared(176);

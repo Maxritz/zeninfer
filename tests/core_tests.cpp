@@ -37,8 +37,7 @@ int main(){
         std::string adapter_error;CHECK(runtime::create_model_runtime(c,&adapter_error)!=nullptr);
         c.architecture=model::Architecture::qwen;c.architecture_name="qwen2";CHECK(runtime::create_model_runtime(c,&adapter_error)!=nullptr);
         c.architecture_name="qwen3";CHECK(runtime::create_model_runtime(c,&adapter_error)!=nullptr);
-        c.architecture_name="qwen3moe";CHECK(runtime::create_model_runtime(c,&adapter_error)==nullptr);
-        CHECK(adapter_error.find("qwen3moe")!=std::string::npos);
+        c.architecture_name="qwen3moe";CHECK(runtime::create_model_runtime(c,&adapter_error)!=nullptr);
         c.architecture=model::Architecture::bitnet;c.architecture_name="bitnet";CHECK(runtime::create_model_runtime(c,&adapter_error)!=nullptr); // ZI-003 GREEN: BitNet adapter registered
         c.architecture=model::Architecture::bonsai;c.architecture_name="bonsai";CHECK(runtime::create_model_runtime(c,&adapter_error)==nullptr);
     }

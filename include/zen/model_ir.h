@@ -34,6 +34,19 @@ struct ModelConfig {
     std::uint32_t vocabulary_size{};
     std::uint32_t expert_count{};
     std::uint32_t expert_used_count{};
+    // Per-layer array metadata (hybrid arches: lfm2moe/laguna/nemotron_h).
+    // When present, the scalar above keeps the max/first-nonzero for
+    // validation; forward branches per layer on these vectors.
+    std::vector<std::uint32_t> ffn_per_layer;
+    std::vector<std::uint32_t> kv_per_layer;
+    std::vector<std::uint32_t> heads_per_layer;
+    // Per-layer head dimensions (gemma4: full layers 512, SWA layers 256).
+    // Populated from attn_q widths in load; empty means uniform head_dim.
+    std::vector<std::uint32_t> head_dim_per_layer;
+    // Per-layer SWA pattern (spark2_5: 1 = sliding-window layer, 0 = full).
+    std::vector<std::uint8_t> swa_pattern;
+    // Per-layer rope enable pattern (flint: 0 = layer applies no RoPE).
+    std::vector<std::uint8_t> rope_pattern;
     bool has_rope{};
     bool has_sliding_window{};
     std::uint32_t bos_token_id{1}, eos_token_id{2}, unknown_token_id{};

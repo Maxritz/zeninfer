@@ -35,6 +35,8 @@
 
 #include "q8_0_gemm_cso.h"
 #include "q8_0_gemm_q4k_cso.h"
+#include "q1_0_gemm_cso.h"
+#include "q6_k_gemm_cso.h"
 #include "q8_0_gemm_sh_cso.h"
 #include "q8_0_gemm_v2_cso.h"
 #include "q8_0_gemm_v3_cso.h"
@@ -379,6 +381,8 @@ struct State {
     std::size_t dcos_cap{}, dsin_cap{}, datt_cap{};
     ComPtr<ID3D12PipelineState> pso_gemm;
     ComPtr<ID3D12PipelineState> pso_gemm_q4k;
+    ComPtr<ID3D12PipelineState> pso_gemm_q1_0;
+    ComPtr<ID3D12PipelineState> pso_gemm_q6_k;
     ComPtr<ID3D12PipelineState> pso_gemm_sh;
     ComPtr<ID3D12PipelineState> pso_gemm_v2;
     ComPtr<ID3D12PipelineState> pso_gemm_v3;
@@ -871,14 +875,12 @@ bool gemm_v2_enabled() {
     return e && e[0] == '1';
 }
 
-// GEMM v3 switch (speculative verify): ZEN_D3D12_GEMM_V3=1 selects the
-// 8-token-tile kernel (q8_0_gemm_v3). Bit-identical math; v1 stays default
-// until validated. Takes precedence over v2 (it also changes tiling, but
-// v3's tile is the one verify T=4..8 wants); DP4A still outranks both
-// because it changes the arithmetic.
+// GEMM v3 switch: 8-token-tile kernel, bit-identical math. Default ON
+// (ZEN_D3D12_GEMM_V3=0 opts out to v1); measured +6% prefill on Qwen3-4B.
+// Takes precedence over v2; DP4A still outranks both (different arithmetic).
 bool gemm_v3_enabled() {
     const char* e = std::getenv("ZEN_D3D12_GEMM_V3");
-    return e && e[0] == '1';
+    return !(e && e[0] == '0');
 }
 
 bool gemm_rt_enabled() {
@@ -960,18 +962,27 @@ bool gemm_opted_in() {
 
 bool opted_in() {
     static const bool value = [] {
+        // DirectX workload runs on GPU only by default when a 12.1 device
+        // opens (init fails → CPU fallback, so headless machines stay CPU).
+        // Opt out with ZEN_BACKEND=cpu|none or ZEN_D3D12=0.
         const char* backend = std::getenv("ZEN_BACKEND");
         if (backend) {
             std::string name(backend);
             for (char& c : name) {
                 c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
             }
+            if (name == "cpu" || name == "none") {
+                return false;
+            }
             if (name == "d3d12" || name == "dx12" || name == "gpu") {
                 return true;
             }
         }
         const char* flag = std::getenv("ZEN_D3D12");
-        return flag && flag[0] == '1';
+        if (flag && flag[0] == '0') {
+            return false;
+        }
+        return true;
     }();
     return value;
 }
@@ -1524,12 +1535,11 @@ bool init_locked(State& s) {
         // The shipped device-open used 12_1 only. On some machines the first
         // attempt fails even though a real adapter is present; fall back to 12_0
         // so the backend can come up on the installed adapter instead of skipping.
-        std::fprintf(stderr, "[d3d12] init: D3D12CreateDevice(12_1) failed, trying 12_0
-");
+        std::fprintf(stderr, "[d3d12] init: D3D12CreateDevice(12_1) failed, trying 12_0\n");
         if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&s.device)))) {
         return fail();
     }
-
+    }
     D3D_FEATURE_LEVEL requested[] = {D3D_FEATURE_LEVEL_12_2, D3D_FEATURE_LEVEL_12_1};
     D3D12_FEATURE_DATA_FEATURE_LEVELS levels{};
     levels.pFeatureLevelsRequested = requested;
@@ -1644,6 +1654,8 @@ bool init_locked(State& s) {
     s.pso_silu = build_pso(s, zen_dx12_shaders::kSiluMulCso, zen_dx12_shaders::kSiluMulCsoSize);
     s.pso_gemm = build_pso(s, zen_dx12_shaders::kQ8_0GemmCso, zen_dx12_shaders::kQ8_0GemmCsoSize);
     s.pso_gemm_q4k = build_pso(s, zen_dx12_shaders::kQ8_0GemmQ4kCso, zen_dx12_shaders::kQ8_0GemmQ4kCsoSize);
+    s.pso_gemm_q1_0 = build_pso(s, zen_dx12_shaders::kQ1_0GemmCso, zen_dx12_shaders::kQ1_0GemmCsoSize);
+    s.pso_gemm_q6_k = build_pso(s, zen_dx12_shaders::kQ6_KGemmCso, zen_dx12_shaders::kQ6_KGemmCsoSize);
     s.pso_gemm_sh = build_pso(s, zen_dx12_shaders::kQ8_0GemmShCso, zen_dx12_shaders::kQ8_0GemmShCsoSize);
     // GEMM v2 (256-thread groups, halved accumulators, bit-identical): optional,
     // selected by ZEN_D3D12_GEMM_V2=1; v1 stays the default until validated.
@@ -2332,9 +2344,10 @@ WeightEntry* lookup_weights(State& s, const std::uint8_t* weights, std::size_t r
 
 // Keep GGML K-quants in their original byte layout in VRAM. They share the
 // residency budget and eviction map with Q8, but carry a distinct layout tag.
+// (Q1_0 and Q6_K use the same path: kind 1/6, blocks zero-padded to 24/216B
+// so shader loads stay 4-byte aligned.)
 WeightEntry* lookup_kquant_weights(State& s, const std::uint8_t* weights,
-                                  std::size_t rows, std::size_t columns, bool q5) {
-    const unsigned kind = q5 ? 5u : 4u;
+                                  std::size_t rows, std::size_t columns, unsigned kind) {
     auto it = s.weights.find(weights);
     if (it != s.weights.end() && it->second.rows == rows &&
         it->second.columns == columns && it->second.kind == kind) return &it->second;
@@ -2343,7 +2356,9 @@ WeightEntry* lookup_kquant_weights(State& s, const std::uint8_t* weights,
         s.weights.erase(it);
     }
     // The public entry has already checked all products and shader address bounds.
-    const std::size_t bytes = rows * (columns / 256) * (q5 ? 176u : 144u);
+    const std::size_t block_elems = (kind == 1u) ? 128u : 256u;
+    const std::size_t block_bytes = (kind == 1u) ? 24u : ((kind == 6u) ? 216u : ((kind == 5u) ? 176u : 144u));
+    const std::size_t bytes = rows * (columns / block_elems) * block_bytes;
     if (s.adapter.dedicated_vram) {
         const std::uint64_t budget = s.adapter.dedicated_vram / 100 * kVRAMBudgetPercent;
         if (bytes > budget) return nullptr;
@@ -2359,7 +2374,18 @@ WeightEntry* lookup_kquant_weights(State& s, const std::uint8_t* weights,
         if (!s.stage || FAILED(s.stage->Map(0, nullptr, &s.stage_cpu))) return nullptr;
         s.stage_cap = bytes;
     }
-    std::memcpy(s.stage_cpu, weights, bytes);
+    if (kind == 1u || kind == 6u) {
+        // Padded layout: each raw block copied into zero-padded slot.
+        const std::size_t raw = (kind == 1u) ? 18u : 210u;
+        const std::size_t per_row = columns / block_elems;
+        auto* dst = static_cast<std::uint8_t*>(s.stage_cpu);
+        for (std::size_t i = 0; i < rows * per_row; ++i) {
+            std::memcpy(dst + i * block_bytes, weights + i * raw, raw);
+            std::memset(dst + i * block_bytes + raw, 0, block_bytes - raw);
+        }
+    }else{
+        std::memcpy(s.stage_cpu, weights, bytes);
+    }
     if (FAILED(s.allocator->Reset()) || FAILED(s.list->Reset(s.allocator.Get(), nullptr))) return nullptr;
     s.list->CopyBufferRegion(entry.quants.Get(), 0, s.stage.Get(), 0, bytes);
     D3D12_RESOURCE_BARRIER barrier{};
@@ -2380,19 +2406,21 @@ WeightEntry* lookup_kquant_weights(State& s, const std::uint8_t* weights,
 // read back: this API returns host data even when NO_READBACK benchmarking is set.
 bool gemm_kquant_locked(State& s, const std::uint8_t* weights, const float* input,
                          float* output, std::size_t tokens, std::size_t rows,
-                         std::size_t columns, bool q5) {
-    if (!s.pso_gemm_q4k) return false;
-    WeightEntry* entry=lookup_kquant_weights(s,weights,rows,columns,q5);
+                         std::size_t columns, unsigned kind) {
+    ID3D12PipelineState* pso_raw = (kind == 1u) ? s.pso_gemm_q1_0.Get() : ((kind == 6u) ? s.pso_gemm_q6_k.Get() : s.pso_gemm_q4k.Get());
+    if (!pso_raw) return false;
+    const std::size_t block_elems = (kind == 1u) ? 128u : 256u;
+    WeightEntry* entry=lookup_kquant_weights(s,weights,rows,columns,kind);
     if (!entry) return false;
     const std::size_t x_bytes=tokens*columns*sizeof(float), y_bytes=tokens*rows*sizeof(float);
     if (!reserve_scratch(s,x_bytes,y_bytes)) return false;
     std::memcpy(s.x_cpu,input,x_bytes);
     auto* p=static_cast<GemmParams*>(s.params_cpu);
     p->rows=static_cast<std::uint32_t>(rows);
-    p->blocks_per_row=static_cast<std::uint32_t>(columns/256);
+    p->blocks_per_row=static_cast<std::uint32_t>(columns/block_elems);
     p->token_count=static_cast<std::uint32_t>(tokens);
-    p->tokens_per_tile=q5?1u:0u; // shader field is_q5
-    if (FAILED(s.allocator->Reset()) || FAILED(s.list->Reset(s.allocator.Get(),s.pso_gemm_q4k.Get()))) return false;
+    p->tokens_per_tile=(kind==5u)?1u:0u; // shader field is_q5
+    if (FAILED(s.allocator->Reset()) || FAILED(s.list->Reset(s.allocator.Get(),pso_raw))) return false;
     s.list->SetComputeRootSignature(s.root.Get());
     s.list->SetComputeRootConstantBufferView(0,s.params->GetGPUVirtualAddress());
     s.list->SetComputeRootShaderResourceView(1,entry->quants->GetGPUVirtualAddress());
@@ -3914,6 +3942,8 @@ void shutdown() noexcept {
     s.pso_gemv.Reset();
     s.pso_gemm.Reset();
     s.pso_gemm_q4k.Reset();
+    s.pso_gemm_q1_0.Reset();
+    s.pso_gemm_q6_k.Reset();
     s.pso_gemm_v2.Reset();
     s.pso_gemm_v3.Reset();
     s.pso_gemm_t.Reset();
@@ -5982,10 +6012,39 @@ bool gemm_kquant(const std::uint8_t* weights, const float* input, float* output,
         rows > max_bytes/sizeof(float) || tokens > max_bytes/(rows*sizeof(float))) return false;
     State& s=state(); std::lock_guard<std::mutex> lock(s.mutex);
     if (!init_locked(s)) return false;
-    if (!gemm_kquant_locked(s,weights,input,output,tokens,rows,columns,q5)) {
+    if (!gemm_kquant_locked(s,weights,input,output,tokens,rows,columns,q5?5u:4u)) {
         ++s.stats.fallbacks; return false;
     }
     return true;
+}
+
+static bool gemm_quant_native(const std::uint8_t* weights, const float* input, float* output,
+                              std::size_t tokens, std::size_t rows, std::size_t columns,
+                              unsigned kind) noexcept {
+    const std::size_t elem = (kind == 1u) ? 128u : 256u;
+    const std::size_t blk  = (kind == 1u) ? 24u  : 216u;
+    if (!weights || !input || !output || !tokens || !rows || !columns || columns % elem) return false;
+    constexpr std::size_t max_bytes=std::numeric_limits<std::uint32_t>::max();
+    const std::size_t blocks=columns/elem;
+    if (rows > 65535u*8u || tokens > 65535u*4u ||
+        blocks > max_bytes/blk || rows > max_bytes/(blocks*blk) ||
+        columns > max_bytes/sizeof(float) || tokens > max_bytes/(columns*sizeof(float)) ||
+        rows > max_bytes/sizeof(float) || tokens > max_bytes/(rows*sizeof(float))) return false;
+    State& s=state(); std::lock_guard<std::mutex> lock(s.mutex);
+    if (!init_locked(s)) return false;
+    if (!gemm_kquant_locked(s,weights,input,output,tokens,rows,columns,kind)) {
+        ++s.stats.fallbacks; return false;
+    }
+    return true;
+}
+
+bool gemm_q1_0(const std::uint8_t* weights, const float* input, float* output,
+               std::size_t tokens, std::size_t rows, std::size_t columns) noexcept {
+    return gemm_quant_native(weights,input,output,tokens,rows,columns,1u);
+}
+bool gemm_q6_k(const std::uint8_t* weights, const float* input, float* output,
+               std::size_t tokens, std::size_t rows, std::size_t columns) noexcept {
+    return gemm_quant_native(weights,input,output,tokens,rows,columns,6u);
 }
 
 bool gemv_q8_0(const std::uint8_t* weights, const float* x, float* y, std::size_t rows,

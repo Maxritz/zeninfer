@@ -1,5 +1,11 @@
 #include "zen/diagnostics.h"
 #include <algorithm>
+#ifdef min
+#undef min
+#endif
+#ifdef max
+#undef max
+#endif
 #include <chrono>
 #include <fstream>
 #include <iomanip>
@@ -55,8 +61,8 @@ void record_operation(std::string_view name, Phase phase, double exclusive_us, d
     try {
         std::lock_guard lock(g_mutex);
         auto& a = g_aggregates[Key{std::string(name), phase}];
-        if (a.calls == 0) a.min_us = exclusive_us; else a.min_us = std::min(a.min_us, exclusive_us);
-        a.max_us = std::max(a.max_us, exclusive_us);
+        if (a.calls == 0) a.min_us = exclusive_us; else a.min_us = (std::min)(a.min_us, exclusive_us);
+        a.max_us = (std::max)(a.max_us, exclusive_us);
         a.total_us += exclusive_us;
         a.inclusive_total_us += inclusive_us;
         ++a.calls;
@@ -133,7 +139,7 @@ void reset_breadcrumbs() noexcept {
 }
 void dump_breadcrumbs(std::ostream& out, std::size_t count) {
     const auto end = g_breadcrumb_next.load(std::memory_order_acquire);
-    const auto limit = std::min(count, kBreadcrumbCapacity);
+    const auto limit = (std::min)(count, kBreadcrumbCapacity);
     const auto begin = end > limit ? end - limit : 0;
     out << "Breadcrumbs (global, cross-thread, oldest first; event IDs are defined by caller)\n";
     for (auto seq = begin; seq < end; ++seq) {

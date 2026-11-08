@@ -49,6 +49,7 @@ inline std::vector<std::uint8_t> quant_fixture(const zen::quant::Format& f,
             case E::nvfp4:for(unsigned i=0;i<4;++i)p[i]=std::uint8_t(1+(rnd()%126));break;
             case E::rocmfp4:p[16]=48;p[17]=48;break;
             case E::rocmfp4_fast:p[16]=48;break;
+            case E::pq2_0:half(32);break;
             default:half(0);if(f.encoding==E::q4_1||f.encoding==E::q5_1||f.encoding==E::q4_k||f.encoding==E::q5_k)half(2);break;
             }
         }

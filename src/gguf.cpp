@@ -61,7 +61,7 @@ std::uint64_t tensor_bytes(std::uint32_t type,std::uint64_t elements,Q8_1Layout 
         {16,256,66},{17,256,74},{18,256,98},{19,256,50},{20,32,18},{21,256,110},
         {22,256,82},{23,256,136},{24,1,1},{25,1,2},{26,1,4},{27,1,8},{28,1,8},
         {29,256,56},{30,1,2},{34,256,54},{35,256,66},
-        {39,32,17},{40,64,36},{41,128,18},{42,64,18},{43,1,1},{100,32,18},{101,32,17},{143,128,28}
+        {39,32,17},{40,64,36},{41,128,18},{42,64,18},{43,1,1},{100,32,18},{101,32,17},{142,128,34},{143,128,28}
     };
     for(auto t:ts)if(t.id==type){
         if(elements%t.block)return 0;
@@ -137,6 +137,45 @@ LoadReport parse_gguf(R& r,std::uint64_t file_size,InspectOptions options){
             }
             continue;
         }
+        // Hybrid per-layer arrays (lfm2moe/laguna/nemotron_h): U32 arrays of
+        // per-block widths/head counts. Stored for validation/branching;
+        // scalar fields keep max/first-nonzero when only the array exists.
+        // Per-layer SWA pattern (spark2_5): BOOL array flagged via
+        // *.attention.sliding_window_pattern.
+        {
+            auto suffix_is=[&](const char* suf){std::string s=suf;return key.size()>=s.size()&&key.compare(key.size()-s.size(),s.size(),s)==0;};
+            if(type==ARRAY&&suffix_is(".attention.sliding_window_pattern")){
+                std::uint32_t subtype{};std::uint64_t count{};
+                if(!r.read(subtype)||!r.read(count)||count>100000){out.error="Invalid sliding-window pattern array: "+key;return out;}
+                if(subtype!=BOOL&&subtype!=U32&&subtype!=I32){out.error="Sliding-window pattern array is not BOOL: "+key;return out;}
+                out.config.swa_pattern.clear();out.config.swa_pattern.reserve(static_cast<std::size_t>(count));
+                for(std::uint64_t j=0;j<count;++j){std::uint32_t v{};if(subtype==BOOL){std::uint8_t b{};if(!r.read(b)){out.error="Truncated sliding-window pattern array";return out;}v=b;}else if(!r.read(v)){out.error="Truncated sliding-window pattern array";return out;}out.config.swa_pattern.push_back(v?1:0);}
+                continue;
+            }
+            // Per-layer rope enable pattern (flint): similarly a bool array
+            // flagged via *.attention.rope_pattern; layers marked 0 apply no
+            // rotary offset (Q/K stay unrotated).
+            if(type==ARRAY&&suffix_is(".attention.rope_pattern")){
+                std::uint32_t subtype{};std::uint64_t count{};
+                if(!r.read(subtype)||!r.read(count)||count>100000){out.error="Invalid rope pattern array: "+key;return out;}
+                if(subtype!=BOOL&&subtype!=U32&&subtype!=I32){out.error="Rope pattern array is not BOOL: "+key;return out;}
+                out.config.rope_pattern.clear();out.config.rope_pattern.reserve(static_cast<std::size_t>(count));
+                for(std::uint64_t j=0;j<count;++j){std::uint32_t v{};if(subtype==BOOL){std::uint8_t b{};if(!r.read(b)){out.error="Truncated rope pattern array";return out;}v=b;}else if(!r.read(v)){out.error="Truncated rope pattern array";return out;}out.config.rope_pattern.push_back(v?1:0);}
+                continue;
+            }
+            const bool is_ffn_arr=type==ARRAY&&suffix_is(".feed_forward_length");
+            const bool is_kv_arr=type==ARRAY&&suffix_is(".attention.head_count_kv");
+            const bool is_heads_arr=type==ARRAY&&suffix_is(".attention.head_count");
+            if(is_ffn_arr||is_kv_arr||is_heads_arr){
+                std::uint32_t subtype{};std::uint64_t count{};
+                if(!r.read(subtype)||!r.read(count)||count>100000){out.error="Invalid per-layer metadata array: "+key;return out;}
+                if(subtype!=U32&&subtype!=I32){out.error="Per-layer metadata array is not U32/I32: "+key;return out;}
+                auto& dst=is_ffn_arr?out.config.ffn_per_layer:(is_kv_arr?out.config.kv_per_layer:out.config.heads_per_layer);
+                dst.clear();dst.reserve(static_cast<std::size_t>(count));
+                for(std::uint64_t j=0;j<count;++j){std::uint32_t v{};if(!r.read(v)){out.error="Truncated per-layer metadata array";return out;}dst.push_back(v);}
+                continue;
+            }
+        }
         if(key=="prism.hadamard.block_size"&&number==0&&type!=ARRAY){/* fall through to generic handling */}
         if(type==ARRAY&&(key=="tokenizer.ggml.tokens"||key=="tokenizer.ggml.scores"||key=="tokenizer.ggml.token_type")){
             std::uint32_t subtype{};std::uint64_t count{};
@@ -148,7 +187,12 @@ LoadReport parse_gguf(R& r,std::uint64_t file_size,InspectOptions options){
                 for(std::uint64_t j=0;j<count;++j){std::string token;if(!r.string(token)){out.error="Truncated tokenizer token array";return out;}out.config.tokenizer_tokens.push_back(std::move(token));}
                 out.config.vocabulary_size=static_cast<std::uint32_t>(count);
             }else if(key=="tokenizer.ggml.scores"){
-                if(subtype!=F32){out.error="Tokenizer scores array is not FP32";return out;}
+                // Some files store tokenizer scores as 32-bit ints (recovered
+                // file with subtype I32, e.g. Ministral-3): the zero-filled
+                // arrays carry no calibration data either way, so accept any
+                // 32-bit numeric subtype and reinterpret the bits (zeros stay
+                // zeros in every one of these encodings).
+                if(subtype!=F32&&subtype!=I32&&subtype!=U32){out.error="Tokenizer scores array is not a 32-bit numeric array";return out;}
                 out.config.tokenizer_scores.reserve(static_cast<std::size_t>(count));
                 for(std::uint64_t j=0;j<count;++j){std::uint32_t bits{};if(!r.read(bits)){out.error="Truncated tokenizer scores array";return out;}out.config.tokenizer_scores.push_back(std::bit_cast<float>(bits));}
             }else{
@@ -189,6 +233,16 @@ LoadReport parse_gguf(R& r,std::uint64_t file_size,InspectOptions options){
         set("qwen35.feed_forward_length",out.config.feed_forward_length);set("qwen35.context_length",out.config.context_length);
         set("qwen2moe.expert_count",out.config.expert_count);set("qwen2moe.expert_used_count",out.config.expert_used_count);
         set("qwen3moe.expert_count",out.config.expert_count);set("qwen3moe.expert_used_count",out.config.expert_used_count);
+        // Hybrid families (lfm2moe/laguna/nemotron_h/nemotron_h_moe/dflash/olmoe/
+        // qwen35moe): scalar keys for dims; per-layer arrays handled above.
+        // Scalars stay 0 when only arrays exist; load derives max/nonzero later.
+        for(const char* p:{"lfm2moe","laguna","nemotron_h","nemotron_h_moe","dflash","olmoe","qwen35moe","qwen2moe","gemma4","phi3","deepseek2","starcoder2","k2-horizon","gpt-oss","spark2_5","mistral3","llada-moe","mellum","muse-glimmer","qwen3vl","flint"}){
+            const std::string pr=std::string(p)+".";
+            set((pr+"embedding_length").c_str(),out.config.embedding_length);set((pr+"block_count").c_str(),out.config.block_count);
+            set((pr+"attention.head_count").c_str(),out.config.attention_head_count);set((pr+"attention.head_count_kv").c_str(),out.config.kv_head_count);
+            set((pr+"feed_forward_length").c_str(),out.config.feed_forward_length);set((pr+"context_length").c_str(),out.config.context_length);
+            set((pr+"expert_count").c_str(),out.config.expert_count);set((pr+"expert_used_count").c_str(),out.config.expert_used_count);
+        }
         if(key=="prism.hadamard.block_size"&&type!=ARRAY)out.config.hadamard_block_size=static_cast<std::uint32_t>(number);
         if(key=="prism.hadamard.version"&&type!=ARRAY)out.config.hadamard_version=static_cast<std::uint32_t>(number);
         if(key=="prism.hadamard.tied_output")out.config.hadamard_tied_output=number!=0;
@@ -206,8 +260,8 @@ LoadReport parse_gguf(R& r,std::uint64_t file_size,InspectOptions options){
         if(key=="tokenizer.ggml.add_bos_token")out.config.add_bos_token=number!=0;
         if(key=="tokenizer.ggml.add_eos_token")out.config.add_eos_token=number!=0;
         if(key=="tokenizer.ggml.add_space_prefix")out.config.add_space_prefix=number!=0;
-        if(key=="llama.expert_count"||key=="qwen2.expert_count"||key=="qwen3.expert_count"||key=="qwen2moe.expert_count"||key=="qwen3moe.expert_count")out.config.expert_count=static_cast<std::uint32_t>(number);
-        if(key=="llama.expert_used_count"||key=="qwen2.expert_used_count"||key=="qwen3.expert_used_count"||key=="qwen2moe.expert_used_count"||key=="qwen3moe.expert_used_count")out.config.expert_used_count=static_cast<std::uint32_t>(number);
+        if(key=="llama.expert_count"||key=="qwen2.expert_count"||key=="qwen3.expert_count"||key=="qwen2moe.expert_count"||key=="qwen3moe.expert_count"||key=="nemotron_h_moe.expert_count"||key=="nemotron_h.expert_count"||key=="qwen35moe.expert_count"||key=="qwen35.expert_count"||key=="gemma4.expert_count"||key=="deepseek2.expert_count"||key=="k2-horizon.expert_count"||key=="llada-moe.expert_count"||key=="mellum.expert_count"||key=="flint.expert_count")out.config.expert_count=static_cast<std::uint32_t>(number);
+        if(key=="llama.expert_used_count"||key=="qwen2.expert_used_count"||key=="qwen3.expert_used_count"||key=="qwen2moe.expert_used_count"||key=="qwen3moe.expert_used_count"||key=="nemotron_h_moe.expert_used_count"||key=="nemotron_h.expert_used_count"||key=="qwen35moe.expert_used_count"||key=="qwen35.expert_used_count"||key=="gemma4.expert_used_count"||key=="deepseek2.expert_used_count"||key=="k2-horizon.expert_used_count"||key=="llada-moe.expert_used_count"||key=="mellum.expert_used_count"||key=="flint.expert_used_count")out.config.expert_used_count=static_cast<std::uint32_t>(number);
     }
     out.tensors.reserve(static_cast<std::size_t>(tensors));
     for(std::uint64_t i=0;i<tensors;++i){
@@ -335,6 +389,7 @@ bool read_tensor_f32(const std::filesystem::path& path,const LoadReport& report,
         case 43:format_name="F8_E4M3";break;
         case 100:format_name="Q4_0_ROCMFP4";break;
         case 101:format_name="Q4_0_ROCMFP4_FAST";break;
+        case 142:format_name="PQ2_0";break;
         case 143:format_name="PTQ1_0";break;
         default:return fail("GGML tensor type has no implemented FP32 decoder");
     }

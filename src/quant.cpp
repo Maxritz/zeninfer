@@ -36,10 +36,12 @@ namespace {
 // taking the GPU gemm?" - the aggregated d3d12 stats line mixes every other
 // op into the same dispatch count, so it cannot answer route questions.
 #ifdef ZEN_HAS_D3D12
-// Opt in until D3D12 parity and real-model benchmarks have been run on the
-// target hardware. The old CPU paths remain the default and fallback.
+// Default on (opt out ZEN_D3D12_KQUANT=0): the D3D12 K-quant shaders are
+// covered by the zen_d3d12_kquant_parity suite and token-identical
+// on real models; without this, Q4_K/Q5_K (~most quantised models) silently
+// run the host AVX2 fallback even when the GPU is enabled.
 bool d3d12_kquant_enabled() noexcept {
-    static const bool enabled=[](){const char* e=std::getenv("ZEN_D3D12_KQUANT");return e && e[0]=='1';}();
+    static const bool enabled=[](){const char* e=std::getenv("ZEN_D3D12_KQUANT");return !(e&&e[0]=='0');}();
     return enabled;
 }
 #endif
@@ -283,6 +285,7 @@ const std::vector<Format>& registry() {
         v.push_back({"Q4_0_ROCMFP4",Encoding::rocmfp4,4,32,18,true,"ROCmFP4 dual-scale: two UE4M3 half-block scales plus 16 packed Codebook10 nibbles (ciru-ai/ROCmFPX)"});
         v.push_back({"Q4_0_ROCMFP4_FAST",Encoding::rocmfp4_fast,4,32,17,true,"ROCmFP4 fast: one UE4M3 scale plus 16 packed Codebook10 nibbles (ciru-ai/ROCmFPX)"});
         v.push_back({"PTQ1_0",Encoding::ptq1_0,2,128,28,true,"Prism PTQ1_0: TQ1_0 base-3 trit packing at group size 128, one f16 scale per 128 weights (PrismML fork)"});
+        v.push_back({"PQ2_0",Encoding::pq2_0,2,128,34,true,"Prism PQ2_0 (GGUF type 142): 2-bit slots per weight at group size 128, one f16 scale per 128 weights; slots carry {-d,0,+d,+2d} (TQ2_0 plane layout at half width)"});
         return v;
     }();
     return f;
@@ -849,6 +852,20 @@ bool dequantize(const Format& f,const std::uint8_t* src,std::size_t n,float* dst
             dst[i]=(code==0?-1.0f:code==2?1.0f:0.0f)*scale;
         }
         return true;
+    case Encoding::pq2_0: {
+        // Prism PQ2_0 (GGUF type 142, block_pq2_0 = { qs[32]; f16 d; },
+        // 34 B): 2-bit slots per weight at group size 128 (2.125 bpw). Same
+        // TQ2_0 plane layout at half width: code c maps to (c-1)*d with
+        // c in {0,1,2,3} -> {-d,0,+d,+2d}.
+        if(n%128)return false;
+        for(std::size_t b=0;b<n/128;++b){
+            const auto* p=src+b*34; const float d=half_to_float(read16(p+32)); const auto* qs=p;
+            unsigned out=0;
+            for(unsigned j=0;j<32;j+=16)for(std::size_t l=0;l<4;++l)for(unsigned m=0;m<16;++m)
+                dst[b*128+out++]=float(int((qs[j+m]>>(2*l))&3u)-1)*d;
+        }
+        return true;
+    }
     case Encoding::signed_uniform: {
         const unsigned bits=f.bits;
         if(bits<1||bits>18||f.block_elements==0)return false;
@@ -914,6 +931,7 @@ std::size_t row_bytes(const Format& f,std::size_t columns) noexcept {
     case Encoding::rocmfp4:return blocks(32,18);
     case Encoding::rocmfp4_fast:return blocks(32,17);
     case Encoding::ptq1_0:return blocks(128,28);
+    case Encoding::pq2_0:return blocks(128,34);
     case Encoding::q6_k:return blocks(256,210);
     case Encoding::iq4_nl:return blocks(32,18);
     case Encoding::ternary:return columns>(std::numeric_limits<std::size_t>::max()-7)/2?0:(columns*2+7)/8;
@@ -941,6 +959,7 @@ static bool iq_ptq_kind(Encoding encoding,zen::NewQuantKind& kind){
     }
 }
 #endif
+namespace { std::shared_ptr<std::vector<std::uint8_t>> ensure_gpu_q8(const Format& f,const std::uint8_t* w,std::size_t rows,std::size_t cols); }
 bool gemv(const Format& f,const std::uint8_t*w,const float*x,float*y,
           std::size_t rows,std::size_t cols,float scale,unsigned requested_workers) {
     zen::diag::Scope trace("quant.gemv",zen::diag::Phase::compute);
@@ -962,6 +981,26 @@ bool gemv(const Format& f,const std::uint8_t*w,const float*x,float*y,
         if(zen::d3d12::gemv_q8_0(w,x,y,rows,cols)){
             g_gemv_routes.gpu_ok.fetch_add(1,std::memory_order_relaxed);
             return true;
+        }
+    }
+    static const bool gpu_q8_fallback_on_gemv=[](){const char* e=std::getenv("ZEN_GPU_Q8_FALLBACK");return e&&e[0]=='1';}();
+    // Native Q1_0/Q6_K HLSL decoders (raw GGML blocks in VRAM, in-shader decode).
+    // Default-on: exact dequant values (no Q8 requantization), so greedy parity
+    // with the CPU path holds by construction up to fp summation order.
+    if((f.encoding==Encoding::q1_0||f.encoding==Encoding::q6_k)&&scale==1.0f&&zen::d3d12::enabled()){
+        g_gemv_routes.gpu_try.fetch_add(1,std::memory_order_relaxed);
+        const bool ok=f.encoding==Encoding::q1_0
+            ?zen::d3d12::gemm_q1_0(w,x,y,1,rows,cols)
+            :zen::d3d12::gemm_q6_k(w,x,y,1,rows,cols);
+        if(ok){g_gemv_routes.gpu_ok.fetch_add(1,std::memory_order_relaxed);return true;}
+    }
+    if(gpu_q8_fallback_on_gemv&&(f.encoding==Encoding::q1_0||f.encoding==Encoding::q6_k)&&scale==1.0f&&zen::d3d12::enabled()){
+        if(auto q8=ensure_gpu_q8(f,w,rows,cols)){
+            g_gemv_routes.gpu_try.fetch_add(1,std::memory_order_relaxed);
+            if(zen::d3d12::gemv_q8_0(q8->data(),x,y,rows,cols)){
+                g_gemv_routes.gpu_ok.fetch_add(1,std::memory_order_relaxed);
+                return true;
+            }
         }
     }
 #endif
@@ -1094,14 +1133,14 @@ bool gemv(const Format& f,const std::uint8_t*w,const float*x,float*y,
 bool q8_kblk_enabled() noexcept {
     static const bool v=[](){
         const char* e=std::getenv("ZEN_CPU_Q8_KBLK");
-        return (e&&e[0]=='1');
+        return !(e&&e[0]=='0');
     }();
     return v;
 }
 bool q8_repack_enabled() noexcept {
     static const bool v=[](){
         const char* e=std::getenv("ZEN_CPU_Q8_REPACK_KBLK");
-        return (e&&e[0]=='1');
+        return !(e&&e[0]=='0');
     }();
     return v;
 }
@@ -1156,6 +1195,56 @@ struct RepackEntry {
 };
 std::mutex g_repack_mutex;
 std::unordered_map<const std::uint8_t*,RepackEntry> g_repack_registry;
+// Dequant-to-Q8 GPU fallback cache: converts Q1_0/Q6_K weights to Q8_0 once
+// per weight pointer so the existing Q8_0 HLSL kernels can run them on GPU
+// (submits>0) instead of falling back to CPU (submits=0). Size-neutral:
+// Q1_0 18B/128 vs Q8_0 34B/32 (~1.1B/param both).
+std::mutex g_gpu_q8_mutex;
+std::unordered_map<const std::uint8_t*,RepackEntry> g_gpu_q8_registry;
+std::shared_ptr<std::vector<std::uint8_t>> ensure_gpu_q8(const Format& f,const std::uint8_t* w,std::size_t rows,std::size_t cols){
+    {
+        std::lock_guard<std::mutex> lock(g_gpu_q8_mutex);
+        auto it=g_gpu_q8_registry.find(w);
+        if(it!=g_gpu_q8_registry.end()&&it->second.rows==rows&&it->second.cols==cols)return it->second.buf;
+    }
+    if(cols%32)return nullptr;
+    const auto rb=row_bytes(f,cols);if(!rb)return nullptr;
+    const auto q8rb=(cols/32)*34;
+    auto buf=std::make_shared<std::vector<std::uint8_t>>(rows*q8rb);
+    // Parallel dequant: rows are independent (Bonsai is 800+ tensors; a
+    // serial conversion of the whole 3.8GB took >2min and hung DX runs).
+    std::atomic<bool> ok{true};
+    const unsigned conv_workers=std::max(1u,zen::ResourceGovernor{}.current_policy().worker_threads);
+    const unsigned conv_count=(rows>=64&&conv_workers>1)?std::min<unsigned>(conv_workers,static_cast<unsigned>(rows)):1u;
+    auto conv_body=[&](std::size_t rfirst,std::size_t rlast){
+        std::vector<float> row(cols);
+        for(std::size_t r=rfirst;r<rlast&&ok.load(std::memory_order_relaxed);++r){
+        if(!dequantize(f,w+r*rb,cols,row.data(),1.0f)){ok.store(false,std::memory_order_relaxed);break;}
+        std::uint8_t* dst=buf->data()+r*q8rb;
+        for(std::size_t b=0;b<cols/32;++b){
+            float mx=0.0f;
+            for(unsigned j=0;j<32;++j)mx=std::max(mx,std::fabs(row[b*32+j]));
+            const float scale=mx>0.0f?mx/127.0f:0.0f;
+            const std::uint16_t h=float_to_half(scale);
+            dst[b*34]=static_cast<std::uint8_t>(h&0xff);dst[b*34+1]=static_cast<std::uint8_t>((h>>8)&0xff);
+            const float inv=scale>0.0f?1.0f/scale:0.0f;
+            for(unsigned j=0;j<32;++j){
+                long v=std::lround(row[b*32+j]*inv);
+                v=std::max<long>(-127,std::min<long>(127,v));
+                dst[b*34+2+j]=static_cast<std::uint8_t>(static_cast<std::int8_t>(v));
+            }
+        }
+        }
+    };
+    if(conv_count>1)zen::ComputePool::instance().parallel_for(rows,conv_count,conv_body);
+    else conv_body(0,rows);
+    if(!ok.load())return nullptr;
+    std::lock_guard<std::mutex> lock(g_gpu_q8_mutex);
+    auto it=g_gpu_q8_registry.find(w);
+    if(it!=g_gpu_q8_registry.end()&&it->second.rows==rows&&it->second.cols==cols)return it->second.buf;
+    g_gpu_q8_registry[w]=RepackEntry{buf,rows,cols};
+    return buf;
+}
 } // namespace
 void register_q8_repack(const std::uint8_t* raw, std::size_t rows, std::size_t cols,
                         std::vector<std::uint8_t> packed) {
@@ -1340,17 +1429,16 @@ bool gemv_batch(const Format& format,const std::uint8_t* const* weights,const fl
         if(!gemv(format,weights[i],input,outputs[i],rows[i],columns,scale,workers))return false;
     return true;
 }
-// ZEN_D3D12_BATCH=1 opts in to the batched prefill GEMM submission. The single
-// gemm path is the parity default, and the batch path is only bit-identical
-// when the same fp32 kernels run: the batch backend has no DP4A variant, so
-// with ZEN_D3D12_DP4A=1 the batch attempt is skipped and the caller falls
-// back to the single path (which does honour DP4A). V2/V3 tiling is shared
-// between the single and batch paths, so those gates remain bit-identical.
+// Batched prefill GEMM submission is default ON (ZEN_D3D12_BATCH=0 opts out):
+// one fence for QKV/gate-up groups, ~+5% prefill on Qwen3-4B, bit-identical
+// outputs verified. The batch path has no DP4A variant, so with
+// ZEN_D3D12_DP4A=1 the batch attempt is skipped and the caller falls back
+// to the single path (which does honour DP4A).
 #if defined(ZEN_HAS_D3D12)
 static bool d3d12_batch_enabled() {
     static const bool v=[](){
         const char* e=std::getenv("ZEN_D3D12_BATCH");
-        return (e&&e[0]=='1');
+        return !(e&&e[0]=='0');
     }();
     return v;
 }
@@ -1469,6 +1557,28 @@ bool gemm(const Format& f,const std::uint8_t*w,const float*input,float*output,
         if(zen::d3d12::gemm_q8_0(w,input,output,tokens,rows,cols)){
             g_gemm_routes.gpu_ok.fetch_add(1,std::memory_order_relaxed);
             return true;
+        }
+    }
+    // Native Q1_0/Q6_K HLSL decoders (prefill too, not just decode).
+    if((f.encoding==Encoding::q1_0||f.encoding==Encoding::q6_k)&&scale==1.0f&&zen::d3d12::enabled()){
+        g_gemm_routes.gpu_try.fetch_add(1,std::memory_order_relaxed);
+        const bool ok=f.encoding==Encoding::q1_0
+            ?zen::d3d12::gemm_q1_0(w,input,output,tokens,rows,cols)
+            :zen::d3d12::gemm_q6_k(w,input,output,tokens,rows,cols);
+        if(ok){g_gemm_routes.gpu_ok.fetch_add(1,std::memory_order_relaxed);return true;}
+    }
+    static const bool gpu_q8_fallback_on=[](){const char* e=std::getenv("ZEN_GPU_Q8_FALLBACK");return e&&e[0]=='1';}();
+    if(gpu_q8_fallback_on&&(f.encoding==Encoding::q1_0||f.encoding==Encoding::q6_k)&&scale==1.0f&&zen::d3d12::enabled()){
+        // Opt-in (ZEN_GPU_Q8_FALLBACK=1): convert once to cached Q8_0 and run
+        // the existing Q8_0 kernels. Cold prefill pays the conversion
+        // (Bonsai 27B: 26s) so default stays CPU fallback (1.6s); warm
+        // server runs amortise it. Native Q1_0/Q6_K HLSL is the real fix.
+        if(auto q8=ensure_gpu_q8(f,w,rows,cols)){
+            g_gemm_routes.gpu_try.fetch_add(1,std::memory_order_relaxed);
+            if(zen::d3d12::gemm_q8_0(q8->data(),input,output,tokens,rows,cols)){
+                g_gemm_routes.gpu_ok.fetch_add(1,std::memory_order_relaxed);
+                return true;
+            }
         }
     }
 #endif

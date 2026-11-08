@@ -123,6 +123,34 @@ void rms_norm(const float* x,const float* weight,float* y,std::size_t n,float ep
     const float inv=1.0f/std::sqrt(static_cast<float>(ss/n)+eps);
     for(std::size_t i=0;i<n;++i)y[i]=x[i]*inv*weight[i];
 }
+// GELU (ggml gelu): x/2 * (1 + tanh(0.79788456 * (x + 0.044715*x^3))).
+// starcoder2's sequential FFN uses LLM_FFN_GELU -> ggml_gelu (the tanh
+// approximation; exact erf gelu is the LLM_FFN_GELU_ERF variant).
+void gelu_exact(float* x,std::size_t n){
+    for(std::size_t i=0;i<n;++i){const float v=x[i];x[i]=0.5f*v*(1.0f+std::tanh(0.79788456f*(v+0.044715f*v*v*v)));}
+}
+// Plain LayerNorm (mean-centered) with weight+bias: starcoder2's norm type
+// (llama.cpp LLM_NORM, not LLM_NORM_RMS): (x-mean)/sqrt(var+eps)*w+b.
+void layernorm(const float* x,const float* weight,const float* bias,float* y,std::size_t n,float eps){
+    double mean=0.0;for(std::size_t i=0;i<n;++i)mean+=x[i];
+    mean/=double(n);
+    double var=0.0;for(std::size_t i=0;i<n;++i){const double d=x[i]-mean;var+=d*d;}
+    var/=double(n);
+    const float inv=1.0f/std::sqrt(static_cast<float>(var)+eps);
+    for(std::size_t i=0;i<n;++i)y[i]=(float((x[i]-mean)*inv)*weight[i]+bias[i]);
+}
+// Group RMSNorm (k2-horizon): RMS-normalise each of `groups` equal slices of
+// n independently, then scale by the full-width weight. ggml reshapes to 3D
+// [n/groups, groups, T], rms_norms, reshapes back, muls weight.
+void group_rms_norm(const float* x,const float* weight,float* y,std::size_t n,std::uint32_t groups,float eps){
+    const std::size_t gsize=groups?size_t(n)/groups:n/1;
+    for(std::size_t g=0;g<groups;++g){
+        double ss=0.0;
+        for(std::size_t i=0;i<gsize;++i)ss+=double(x[g*gsize+i])*x[g*gsize+i];
+        const float inv=1.0f/std::sqrt(static_cast<float>(ss/gsize)+eps);
+        for(std::size_t i=0;i<gsize;++i)y[g*gsize+i]=x[g*gsize+i]*inv*weight[g*gsize+i];
+    }
+}
 void qk_rms_norm(float* values,std::uint32_t heads,std::uint32_t head_dim,
                  const float* weight,float epsilon){
     for(std::uint32_t h=0;h<heads;++h)
@@ -657,38 +685,142 @@ bool DenseTransformerRuntime::load(const std::filesystem::path& path,std::string
     zen::diag::Scope trace("model.load",zen::diag::Phase::io);
     auto fail=[&](const std::string& e){if(error)*error=e;loaded_=false;tensors_.clear();mapping_.reset();{std::lock_guard<std::mutex> lock(prefix_cache_mutex_);prefix_cache_.reset();}return false;};
     auto report=gguf::inspect(path);if(!report.ok)return fail("GGUF: "+report.error);
-    const auto adapter=std::find_if(model::architecture_descriptors().begin(),model::architecture_descriptors().end(),[&](const model::ArchitectureDescriptor& a){return a.recognises&&a.recognises(report.config);});
-    if(adapter==model::architecture_descriptors().end())return fail("No architecture descriptor recognises this GGUF architecture");
     architecture_name_=report.config.architecture_name;chat_template_.clear();auto chat_it=report.config.metadata.find("tokenizer.chat_template");if(chat_it!=report.config.metadata.end())chat_template_=chat_it->second;
+    // Hybrid families (nemotron_h/lfm2moe/dflash) have no descriptor yet;
+    // let the precise hybrid check below report instead of a generic miss.
+    if(!(architecture_name_=="nemotron_h"||architecture_name_=="nemotron_h_moe"||architecture_name_=="lfm2moe"||architecture_name_=="dflash")){
+        const auto adapter=std::find_if(model::architecture_descriptors().begin(),model::architecture_descriptors().end(),[&](const model::ArchitectureDescriptor& a){return a.recognises&&a.recognises(report.config);});
+        if(adapter==model::architecture_descriptors().end())return fail("No architecture descriptor recognises this GGUF architecture");
+    }
     const bool llama_arch=report.config.architecture==model::Architecture::llama;
     const bool qwen2_arch=report.config.architecture==model::Architecture::qwen&&architecture_name_=="qwen2";
-    const bool qwen3_arch=report.config.architecture==model::Architecture::qwen&&architecture_name_=="qwen3";
+    // qwen3vl broadcasts rope sections (M-RoPE) as text-only positions for
+    // text generation, so standard dense attention (head_dim rope) applies.
+    const bool qwen3_arch=report.config.architecture==model::Architecture::qwen&&(architecture_name_=="qwen3"||architecture_name_=="qwen3vl");
     // BitNet b1.58 (arXiv 2504.12285): dense transformer with ternary BitLinear
     // projections and subln RMS norms; executed by this adapter with the
     // bitnet_variant branch. Reference: ggml-org/llama.cpp src/models/bitnet.cpp.
     const bool bitnet_arch=report.config.architecture==model::Architecture::bitnet;
     config_.bitnet_variant=bitnet_arch;
     // Qwen3.5 hybrid (Bonsai 2): gated delta-net + full-attention interleave.
-    const bool qwen35_arch=report.config.architecture==model::Architecture::qwen_hybrid;
+    const bool qwen35_arch=(report.config.architecture==model::Architecture::qwen_hybrid&&architecture_name_!="nemotron_h"&&architecture_name_!="nemotron_h_moe");
     config_.qwen35_variant=qwen35_arch;
     // Llama-family RoPE rotates consecutive pairs (llama.cpp LLAMA_ROPE_TYPE_NORM);
     // qwen-family (qwen2/3, qwen35) rotate half-split pairs (NEOX/IMROPE).
-    config_.rope_pairs_adjacent=llama_arch;
-    if(!llama_arch&&!qwen2_arch&&!qwen3_arch&&!bitnet_arch&&!qwen35_arch)return fail("Recognised architecture '"+architecture_name_+"' has no executable runtime adapter yet (dense Llama, Qwen2, Qwen3, BitNet and Qwen3.5-hybrid are supported)");
-    if(report.config.expert_count>0||architecture_name_.find("moe")!=std::string::npos)return fail("MoE execution is not supported by this dense-model adapter");
+    const bool deepseek_arch=(report.config.architecture==model::Architecture::qwen&&architecture_name_=="deepseek2");
+    const bool starcoder2_arch=(report.config.architecture==model::Architecture::qwen&&architecture_name_=="starcoder2");
+    const bool k2_arch=(report.config.architecture==model::Architecture::qwen&&architecture_name_=="k2-horizon");
+    const bool gpt_oss_arch=(report.config.architecture==model::Architecture::qwen&&architecture_name_=="gpt-oss");
+    const bool spark_arch=(report.config.architecture==model::Architecture::qwen&&architecture_name_=="spark2_5");
+    const bool flint_arch=(report.config.architecture==model::Architecture::qwen&&architecture_name_=="flint");
+    config_.rope_pairs_adjacent=llama_arch||deepseek_arch||starcoder2_arch||k2_arch||gpt_oss_arch||spark_arch||flint_arch;
+    if(flint_arch){config_.rope_pattern=report.config.rope_pattern;config_.has_attn_sinks=true;}
+    if(starcoder2_arch){config_.layernorm_variant=true;config_.gelu_variant=true;}
+    if(spark_arch){config_.spark2_5_variant=true;config_.gelu_par_variant=true;}
+    if(gpt_oss_arch){config_.gpt_oss_variant=true;config_.moe_norm_w=false;config_.has_attn_sinks=(std::getenv("ZEN_GPTOSS_SINKS")==nullptr);config_.has_expert_bias=true;}
+    const bool qwen3moe_arch=(report.config.architecture==model::Architecture::qwen&&architecture_name_=="qwen3moe");
+    const bool olmoe_arch=(report.config.architecture==model::Architecture::qwen&&architecture_name_=="olmoe");
+    const bool qwen2moe_arch=(report.config.architecture==model::Architecture::qwen&&architecture_name_=="qwen2moe");
+    const bool dflash_arch=(report.config.architecture==model::Architecture::qwen&&architecture_name_=="dflash");
+    const bool laguna_arch=(report.config.architecture==model::Architecture::qwen&&architecture_name_=="laguna"&&report.config.expert_count>0);
+    const bool lfm2moe_arch=(report.config.architecture==model::Architecture::qwen&&architecture_name_=="lfm2moe");
+    const bool llama_moe_arch=(report.config.architecture==model::Architecture::llama&&report.config.expert_count>0);
+    const bool nemotron_arch=(architecture_name_=="nemotron_h"||architecture_name_=="nemotron_h_moe");
+    const bool gemma_arch=(report.config.architecture==model::Architecture::qwen&&architecture_name_=="gemma4");
+    const bool muse_arch=(report.config.architecture==model::Architecture::qwen&&architecture_name_=="muse-glimmer");
+    const bool mellum_arch=(report.config.architecture==model::Architecture::qwen&&architecture_name_=="mellum");
+    const bool phi3_arch=(report.config.architecture==model::Architecture::qwen&&architecture_name_=="phi3");
+    const bool hybrid_stmt=(architecture_name_=="nemotron_h_moe"&&false);
+    if(!llama_arch&&!qwen2_arch&&!qwen3_arch&&!bitnet_arch&&!qwen35_arch&&!qwen3moe_arch&&!olmoe_arch&&!qwen2moe_arch&&!laguna_arch&&!lfm2moe_arch&&!llama_moe_arch&&!nemotron_arch&&!dflash_arch&&!gemma_arch&&!phi3_arch&&!deepseek_arch&&!starcoder2_arch&&!k2_arch&&!gpt_oss_arch&&!spark_arch&&!mellum_arch&&!muse_arch&&!flint_arch&&!hybrid_stmt)return fail("Recognised architecture '"+architecture_name_+"' has no executable runtime adapter yet (dense Llama, Qwen2, Qwen3, BitNet, Qwen3.5-hybrid, Phi3, DeepSeek2, Starcoder2, K2-Horizon, GPT-OSS, Spark-X2.5, Mellum, Muse-Glimmer, DFlash/LFM2MoE/Nemotron/Gemma4 and Qwen2/3/Llama/OLMoE/Laguna-MoE are supported)");
+    if(hybrid_stmt)return fail("Hybrid SSM/shortconv forward not yet implemented for '"+architecture_name_+"' (per-layer arrays parsed; needs mamba2/shortconv kernels)");
+    const bool moe_arch=qwen3moe_arch||olmoe_arch||qwen2moe_arch||laguna_arch||lfm2moe_arch||llama_moe_arch||(architecture_name_=="nemotron_h_moe")||(architecture_name_=="qwen35moe")||(gemma_arch&&report.config.expert_count>0)||(deepseek_arch&&report.config.expert_count>0)||(k2_arch&&report.config.expert_count>0)||(gpt_oss_arch&&report.config.expert_count>0)||(mellum_arch&&report.config.expert_count>0)||(flint_arch&&report.config.expert_count>0);
+    if((report.config.expert_count>0||architecture_name_.find("moe")!=std::string::npos)&&!moe_arch)return fail("MoE execution is not supported by this dense-model adapter");
+    if(moe_arch){config_.moe_expert_count=report.config.expert_count;config_.moe_used_count=report.config.expert_used_count;config_.moe_sigmoid=laguna_arch||(architecture_name_=="nemotron_h_moe")||k2_arch||flint_arch;}
+    config_.moe_nemotron=(architecture_name_=="nemotron_h_moe");
+    config_.moe_gemma=(architecture_name_=="gemma4"&&report.config.expert_count>0);
+    if(config_.moe_gemma){config_.moe_norm_w=true;config_.moe_w_scale=1.0f;}
+    if(k2_arch){config_.k2_variant=true;config_.moe_norm_w=true;
+        config_.moe_w_scale=meta_float_arch(report.config,architecture_name_,"expert_weights_scale",1.0f);
+        config_.group_norm_groups=meta_uint_arch(report.config,architecture_name_,"attention.group_norm_groups",1);
+        config_.value_expert_count=meta_uint_arch(report.config,architecture_name_,"attention.value_expert_count",0);
+        config_.value_expert_used=meta_uint_arch(report.config,architecture_name_,"attention.value_expert_used_count",0);
+    }
+    if(spark_arch){
+        // Spark-X2.5: SWA layers carry their own rope base/dims; the pattern
+        // alternates 3 SWA : 1 full-attention per ramp.
+        config_.rope_base_swa=meta_float_arch(report.config,architecture_name_,"rope.freq_base_swa",1.0e4f);
+        config_.rope_dim_swa=meta_uint_arch(report.config,architecture_name_,"rope.dimension_count_swa",0);
+        if(!config_.rope_dim_swa)config_.rope_dim_swa=config_.head_dim;
+        config_.swa_pattern=report.config.swa_pattern;
+    }
+    if(config_.moe_nemotron){config_.moe_norm_w=meta_bool_arch(report.config,architecture_name_,"expert_weights_norm",false);config_.moe_w_scale=meta_float_arch(report.config,architecture_name_,"expert_weights_scale",1.0f);}
     config_.embedding=report.config.embedding_length;config_.layers=report.config.block_count;
     config_.heads=report.config.attention_head_count;config_.kv_heads=report.config.kv_head_count;
     config_.ffn=report.config.feed_forward_length;config_.context=report.config.context_length;
     config_.vocab=report.config.vocabulary_size;
+    if(qwen35_arch){
+        // MTP (nextn) layers are extra blocks at the end, not part of the
+        // dense trunk. Exclude them so a T-4B+1 file loads as its 32-layer
+        // trunk instead of failing on the MTP layer's nextn.* tensors.
+        const auto nextn=meta_uint_arch(report.config,architecture_name_,"nextn_predict_layers",0);
+        if(nextn&&nextn<config_.layers)config_.layers-=nextn;
+    }
+    // Hybrid per-layer arrays (laguna/nemotron_h/lfm2moe): when scalars are
+    // zero but arrays exist, validation scalars are the array maxima.
+    // Forward still needs per-layer dispatch for those families, so load
+    // succeeds but forward fails closed below until that lands. For now,
+    // derive maxima so the failure names the real missing piece instead of
+    // zero dims; dense/MoE families (scalars present) are unaffected.
+    if(!config_.heads&&!report.config.heads_per_layer.empty()){
+        config_.heads=*std::max_element(report.config.heads_per_layer.begin(),report.config.heads_per_layer.end());
+    }
+    if(!config_.kv_heads&&!report.config.kv_per_layer.empty()){
+        config_.kv_heads=*std::max_element(report.config.kv_per_layer.begin(),report.config.kv_per_layer.end());
+    }
+    if(!config_.ffn&&!report.config.ffn_per_layer.empty()){
+        config_.ffn=*std::max_element(report.config.ffn_per_layer.begin(),report.config.ffn_per_layer.end());
+    }
     // Validate divisors before deriving head_dim and rotary defaults. A malformed
     // model with zero heads must fail to load rather than divide by zero.
-    if(!config_.embedding||!config_.layers||!config_.heads||!config_.kv_heads||!config_.ffn||!config_.context||!config_.vocab||config_.embedding%config_.heads||config_.heads%config_.kv_heads)
+    if(!config_.embedding||!config_.layers||!config_.heads||!config_.kv_heads||(!config_.ffn&&report.config.expert_count==0)||!config_.context||!config_.vocab||(!config_.qwen35_variant&&!dflash_arch&&!nemotron_arch&&!deepseek_arch&&!laguna_arch&&config_.embedding%config_.heads)||config_.heads%config_.kv_heads){
         return fail("Incomplete or inconsistent dense transformer dimensions");
+    }
     // Head dimension: explicit attention.key_length metadata when present,
     // otherwise derived from the block attention-Q projection width (which
     // accommodates models whose q width is heads*head_dim != embedding), and
     // finally the classic embedding/heads.
     config_.head_dim=meta_uint_arch(report.config,architecture_name_,"attention.key_length",0);
+    if(gemma_arch||muse_arch){
+        // Gemma4/Muse-Glimmer: QW (attn_q width) defines the head dim;
+        // key_length metadata reports the full-attention value length
+        // instead (256-near).
+        config_.head_dim=0;
+        for(const auto& d:report.tensors)if(d.name=="blk.0.attn_q.weight"&&d.dimensions.size()>=2&&config_.heads){
+            const auto width=(d.dimensions[0]==config_.embedding)?d.dimensions[1]:d.dimensions[0];
+            if(width)config_.head_dim=static_cast<std::uint32_t>(width/config_.heads);
+            break;}
+        if(!config_.head_dim)config_.head_dim=config_.embedding/config_.heads;
+        config_.gemma_variant=true;
+        config_.attn_scale=1.0f; // f_attention_scale = 1.0 (no pre-attn scaling)
+        config_.emb_scale=static_cast<float>(std::sqrt(double(config_.embedding)));
+        config_.logit_softcap=meta_float_arch(report.config,architecture_name_,"final_logit_softcapping",0.0f);
+        config_.rms_epsilon=meta_float_arch(report.config,architecture_name_,"attention.layer_norm_rms_epsilon",1.0e-6f);
+    }
+    if(deepseek_arch){
+        // DeepSeek2 MLA: head_dim = attention.key_length (192),
+        // rope_dim = rope.dimension_count (64) parsed generically above;
+        // value_length + kv_lora_rank feed the MLA validation and forward.
+        // GLM-style files publish key_length_mla / value_length_mla (256) and
+        // use a q_lora + split k_b/v_b variant of the same MLA math.
+        config_.deepseek_variant=true;
+        config_.kv_lora_rank=meta_uint_arch(report.config,architecture_name_,"attention.kv_lora_rank",0);
+        if(!config_.kv_lora_rank)return fail("DeepSeek MLA kv_lora_rank metadata missing/invalid");
+        config_.head_dim=meta_uint_arch(report.config,architecture_name_,"attention.key_length_mla",0);
+        if(!config_.head_dim)config_.head_dim=meta_uint_arch(report.config,architecture_name_,"attention.key_length",0);
+        if(!config_.head_dim)return fail("DeepSeek MLA attention.key_length metadata missing/invalid");
+        config_.moe_norm_w=meta_bool_arch(report.config,architecture_name_,"expert_weights_norm",true);
+        config_.moe_w_scale=meta_float_arch(report.config,architecture_name_,"expert_weights_scale",1.0f);
+    }
     if(qwen35_arch){
         // qwen35: fused wq outputs Q+gate (2*QW). GGUF dims are ggml-order
         // {ne0=input, ne1=output}, so read the fused OUTPUT dim: dims[1].
@@ -723,6 +855,19 @@ bool DenseTransformerRuntime::load(const std::filesystem::path& path,std::string
     config_.rope_yarn_beta_fast=meta_float_arch(report.config,architecture_name_,"rope.scaling.beta_fast",32.0f);
     config_.rope_yarn_beta_slow=meta_float_arch(report.config,architecture_name_,"rope.scaling.beta_slow",1.0f);
     config_.rope_original_context=meta_uint_arch(report.config,architecture_name_,"rope.scaling.original_context_length",report.config.context_length);
+    if(deepseek_arch){
+        // MLA attention scale (llama.cpp deepseek2.cpp graph):
+        //   kq_scale = mscale^2 / sqrt(n_embd_head_k)
+        //   mscale   = attn_factor_org * (1 + 0.1*logmul*ln(1/freq_scale))
+        // with attn_factor_org = 1 (the user/default factor after cancelling
+        // the yarn adjustment), freq_scale = context/original, and logmul =
+        // rope.scaling.yarn_log_multiplier (0.0707 => kq_scale 0.06845 at
+        // freq_scale 40 vs the naive 1/sqrt(192) = 0.0722).
+        const float yarn_log_mul=meta_float_arch(report.config,architecture_name_,"rope.scaling.yarn_log_multiplier",0.0f);
+        const float freq_scale=config_.rope_original_context?float(config_.context)/float(config_.rope_original_context):1.0f;
+        const float mscale=1.0f+0.1f*yarn_log_mul*std::log(1.0f/freq_scale);
+        config_.attn_scale=mscale*mscale/std::sqrt(float(config_.head_dim));
+    }
     config_.sliding_window=meta_uint_arch(report.config,architecture_name_,"attention.sliding_window",0);
     // Qwen3.5 GDN hyperparameters (meta key unit test: qwen35.ssm.*).
     config_.ssm_state=meta_uint_arch(report.config,architecture_name_,"ssm.state_size",0);
@@ -768,6 +913,7 @@ bool DenseTransformerRuntime::load(const std::filesystem::path& path,std::string
     }
     std::string tokenizer_error;tokenizer_loaded_=tokenizer_.load(report.config,&tokenizer_error);
     const auto head_dim=config_.head_dim;
+    if(gemma_arch&&config_.rope_dim>config_.head_dim)config_.rope_dim=config_.head_dim; // clamp: rope entries rotate head-dim pairs only
     if(config_.rope_dim==0||config_.rope_dim>head_dim||config_.rope_dim%2)return fail("Invalid rotary dimension");
     if(!std::isfinite(config_.rope_base)||config_.rope_base<=0.0f||!std::isfinite(config_.rms_epsilon)||config_.rms_epsilon<=0.0f||!std::isfinite(config_.rope_scaling_factor)||config_.rope_scaling_factor<1.0f||!std::isfinite(config_.rope_low_freq_factor)||config_.rope_low_freq_factor<=0.0f||!std::isfinite(config_.rope_high_freq_factor)||config_.rope_high_freq_factor<=config_.rope_low_freq_factor||!std::isfinite(config_.rope_yarn_beta_fast)||config_.rope_yarn_beta_fast<=0.0f||!std::isfinite(config_.rope_yarn_beta_slow)||config_.rope_yarn_beta_slow<=0.0f)return fail("Invalid RoPE base, scaling factor or RMS normalisation epsilon");
     if(!config_.rope_scaling_type.empty()&&config_.rope_scaling_type!="linear"&&config_.rope_scaling_type!="dynamic"&&config_.rope_scaling_type!="dynamic_ntk"&&config_.rope_scaling_type!="ntk"&&config_.rope_scaling_type!="yarn"&&config_.rope_scaling_type!="llama3")return fail("Unsupported RoPE scaling type: "+config_.rope_scaling_type);
@@ -841,7 +987,7 @@ bool DenseTransformerRuntime::load(const std::filesystem::path& path,std::string
         if(hadamard_.tied_output&&!report.config.hadamard_tied_output)return fail("Invalid prism.hadamard.tied_output");
     }
     for(const auto& d:report.tensors){Tensor t;t.dims=d.dimensions;t.elements=1;for(auto dim:d.dimensions)t.elements*=static_cast<std::size_t>(dim);t.raw_bytes=static_cast<std::size_t>(d.byte_size);t.format=format_for_ggml(d.ggml_type,report.q8_1_layout);
-        const bool matrix=d.name.find(".bias")==std::string::npos&&(d.role==model::TensorRole::token_embedding||d.role==model::TensorRole::output||d.role==model::TensorRole::query||d.role==model::TensorRole::key||d.role==model::TensorRole::value||d.role==model::TensorRole::attention_output||d.role==model::TensorRole::ffn_gate||d.role==model::TensorRole::ffn_up||d.role==model::TensorRole::ffn_down);
+        const bool matrix=d.name.find(".bias")==std::string::npos&&(d.role==model::TensorRole::token_embedding||d.role==model::TensorRole::output||d.role==model::TensorRole::query||d.role==model::TensorRole::key||d.role==model::TensorRole::value||d.role==model::TensorRole::attention_output||d.role==model::TensorRole::ffn_gate||d.role==model::TensorRole::ffn_up||d.role==model::TensorRole::ffn_down||d.role==model::TensorRole::expert_gate||d.role==model::TensorRole::expert_up||d.role==model::TensorRole::expert_down);
         // Per-tensor map trace. Flushed per line: the point of this trace is that it
         // survives a crash, and an abort on the next tensor discards a buffered
         // stderr stream (which is exactly why the probe appeared to "die silently").
@@ -853,15 +999,147 @@ bool DenseTransformerRuntime::load(const std::filesystem::path& path,std::string
         if(map_trace)std::fflush(stderr);
         tensors_.emplace(d.name,std::move(t));
     }
+    // Per-layer head arrays with varying widths (laguna 48/64): zero-pad
+    // smaller layers' attention projections to the max head count so the
+    // uniform-max forward (buffer stride, KV cache) stays exact. Extra heads
+    // are all-zero weights: Q/K/V zeros -> zero attention out, zero output
+    // rows -> right-hand zero contribution. FP32 values path (matvec)
+    // handles the padded tensors; correctness > speed for these files.
+    {
+        const auto& hpl=report.config.heads_per_layer;
+        if(!hpl.empty()){
+            const std::uint32_t max_heads=*std::max_element(hpl.begin(),hpl.end());
+            const std::uint32_t max_kv=!report.config.kv_per_layer.empty()?*std::max_element(report.config.kv_per_layer.begin(),report.config.kv_per_layer.end()):config_.kv_heads;
+            for(std::uint32_t l=0;l<config_.layers;++l){
+                if(l>=hpl.size())break;
+                const std::uint32_t hl=hpl[l];
+                if(hl>=max_heads)continue;
+                const std::string p="blk."+std::to_string(l)+".";
+                const std::size_t maxQW=std::size_t(max_heads)*head_dim,maxKW=std::size_t(max_kv)*head_dim;
+                auto pad_one=[&](const char* name,std::size_t rows_l,std::size_t rows_max,std::size_t cols)->bool{
+                    auto it=tensors_.find(p+name);
+                    if(it==tensors_.end())return true; // no attention tensor on this layer (e.g. kv=0 blocks); per-layer validation reports true misses
+                    auto* t=&it->second;
+                    if(t->elements==rows_max*cols)return true; // already max
+                    if(t->elements!=rows_l*cols)return false;
+                    std::vector<float> orig;
+                    if(t->raw&&t->format){
+                        const auto rb=quant::row_bytes(*t->format,cols);if(!rb)return false;
+                        orig.assign(rows_l*cols,0.0f);
+                        for(std::size_t r=0;r<rows_l;++r)if(!quant::dequantize(*t->format,t->raw+r*rb,cols,orig.data()+r*cols,1.0f))return false;
+                    }else{
+                        if(t->values.size()!=rows_l*cols)return false;
+                        orig=t->values;
+                    }
+                    std::vector<float> padded(rows_max*cols,0.0f);
+                    for(std::size_t r=0;r<rows_l;++r)std::copy_n(orig.data()+r*cols,cols,padded.data()+r*cols);
+                    t->values=std::move(padded);
+                    t->raw=nullptr;t->format=nullptr;
+                    t->elements=rows_max*cols;
+                    t->dims={cols,rows_max};
+                    return true;
+                };
+                const std::size_t QWl=std::size_t(hl)*head_dim,KWl=std::size_t((l<report.config.kv_per_layer.size()&&report.config.kv_per_layer[l])?report.config.kv_per_layer[l]:max_kv)*head_dim;
+                if(!pad_one("attn_q.weight",QWl,maxQW,config_.embedding))return fail("Laguna Q pad failed");
+                if(!pad_one("attn_k.weight",KWl,maxKW,config_.embedding))return fail("Laguna K pad failed");
+                if(!pad_one("attn_v.weight",KWl,maxKW,config_.embedding))return fail("Laguna V pad failed");
+                // attn_output is [QWl, E]: input width is QWl, output E is
+                // uniform. Pad columns (input) with zeros; extra-head inputs
+                // are zero (Q/V zero-padded above), so columns don't matter.
+                {
+                    auto oit=tensors_.find(p+"attn_output.weight");
+                    if(oit==tensors_.end())return fail("Laguna O missing");
+                    auto* t=&oit->second;
+                    if(t->elements!=QWl*config_.embedding&&t->elements!=maxQW*config_.embedding)return fail("Laguna O malformed");
+                    if(t->elements!=maxQW*config_.embedding){
+                        std::vector<float> orig;
+                        if(t->raw&&t->format){
+                            const auto rb=quant::row_bytes(*t->format,QWl);if(!rb)return fail("Laguna O dequant fail");
+                            orig.assign(config_.embedding*QWl,0.0f);
+                            // attn_output dequant order: rows are outputs (E rows,
+                            // QWl cols) per matvec convention.
+                            for(std::size_t r=0;r<config_.embedding;++r)if(!quant::dequantize(*t->format,t->raw+r*rb,QWl,orig.data()+r*QWl,1.0f))return fail("Laguna O dequant fail");
+                        }else{
+                            if(t->values.size()!=QWl*config_.embedding)return fail("Laguna O malformed");
+                            orig=t->values;
+                        }
+                        std::vector<float> padded(std::size_t(config_.embedding)*maxQW,0.0f);
+                        for(std::size_t r=0;r<config_.embedding;++r)std::copy_n(orig.data()+r*QWl,QWl,padded.data()+r*maxQW);
+                        t->values=std::move(padded);
+                        t->raw=nullptr;t->format=nullptr;
+                        t->elements=maxQW*config_.embedding;
+                        t->dims={maxQW,config_.embedding};
+                    }
+                }
+            }
+        }
+    }
     auto require=[&](const std::string& n,std::size_t count){auto* t=tensor(n);return t&&t->elements==count&&(t->raw||t->values.size()==count);};
     if(!require("token_embd.weight",std::size_t(config_.vocab)*config_.embedding)||
-       !require("output_norm.weight",config_.embedding))return fail("Missing or malformed embedding/output tensors");
+       !(require("output_norm.weight",config_.embedding)||require("token_embd_norm.weight",config_.embedding)))return fail("Missing or malformed embedding/output tensors");
+    // LFM2 uses token_embd_norm as the final norm; alias it so forward
+    // lookups for output_norm.weight keep working.
+    if(!tensor("output_norm.weight")&&tensor("token_embd_norm.weight")){
+        auto it=tensors_.find("token_embd_norm.weight");
+        Tensor alias_t=it->second;
+        if(alias_t.values.empty()&&alias_t.raw&&alias_t.format){
+            std::string deq_err;
+            alias_t.values.assign(config_.embedding,0.0f);
+            if(!quant::dequantize(*alias_t.format,alias_t.raw,config_.embedding,alias_t.values.data(),1.0f))return fail("LFM output norm dequant failed");
+            alias_t.raw=nullptr;alias_t.format=nullptr;
+        }
+        tensors_.emplace("output_norm.weight",std::move(alias_t));
+    }
     // GGUF files may omit output.weight when the vocabulary projection is tied to token embeddings.
     if(const auto* output=tensor("output.weight")){
         if(output->elements!=std::size_t(config_.vocab)*config_.embedding)return fail("Malformed output.weight tensor");
     }
+    // Gemma4/Muse-Glimmer: per-layer head dims from attn_q widths (full 512 / SWA 256).
+    // The scalar head_dim is maxed at load so buffers size to the widest layer;
+    // per-layer values drive validation and attention in forward.
+    if(gemma_arch||muse_arch){
+        report.config.head_dim_per_layer.assign(config_.layers,config_.head_dim);
+        for(std::uint32_t l=0;l<config_.layers;++l){
+            const std::string p="blk."+std::to_string(l)+".";
+            if(const auto* tq=tensor(p+"attn_q.weight")){
+                const std::size_t qw=tq->elements/config_.embedding;
+                if(qw%config_.heads==0)report.config.head_dim_per_layer[l]=static_cast<std::uint32_t>(qw/config_.heads);
+            }
+        }
+        // Scalar head_dim becomes the per-layer maximum (buffer sizing).
+        config_.head_dim=*std::max_element(report.config.head_dim_per_layer.begin(),report.config.head_dim_per_layer.end());
+        config_.head_dim_per_layer=report.config.head_dim_per_layer;
+    }
     for(std::uint32_t l=0;l<config_.layers;++l){const std::string p="blk."+std::to_string(l)+".";
-        const std::size_t QW=std::size_t(config_.heads)*head_dim,KW=std::size_t(config_.kv_heads)*head_dim;
+        // Per-layer head arrays (laguna): QW/KW vary per layer; validation
+        // must use that layer's heads, not the max scalar.
+        const std::size_t layer_heads=(!report.config.heads_per_layer.empty()&&l<report.config.heads_per_layer.size()&&report.config.heads_per_layer[l])?report.config.heads_per_layer[l]:config_.heads;
+        const std::size_t layer_kv=(!report.config.kv_per_layer.empty()&&l<report.config.kv_per_layer.size()&&report.config.kv_per_layer[l])?report.config.kv_per_layer[l]:config_.kv_heads;
+        const std::size_t hd_layer=((gemma_arch||muse_arch)&&l<report.config.head_dim_per_layer.size())?report.config.head_dim_per_layer[l]:head_dim;
+        const std::size_t QW=std::size_t(layer_heads)*hd_layer,KW=std::size_t(layer_kv)*hd_layer;
+        if(phi3_arch){
+            if(!require(p+"attn_norm.weight",config_.embedding)||!require(p+"attn_qkv.weight",(QW+2*KW)*config_.embedding)||
+               !require(p+"attn_output.weight",QW*config_.embedding)||
+               !require(p+"ffn_norm.weight",config_.embedding)||!require(p+"ffn_up.weight",2*config_.ffn*config_.embedding)||
+               !require(p+"ffn_down.weight",config_.embedding*config_.ffn))return fail("Missing or malformed Phi3 block tensors: "+p);
+            continue;
+        }
+        if(gemma_arch||muse_arch){
+            // Gemma4/Muse-Glimmer block (llama.cpp gemma4.cpp / muse-spark.cpp): q/k/v projections,
+            // per-head q/k norms, attn output projection, sandwich norms on
+            // both halves, GEGLU FFN, optional per-layer output scale.
+            // attn_v.weight is optional: absent means v = k (reused).
+            if(!require(p+"attn_norm.weight",config_.embedding)||!require(p+"attn_q.weight",QW*config_.embedding)||
+               !require(p+"attn_k.weight",KW*config_.embedding)||
+               !require(p+"attn_output.weight",QW*config_.embedding)||
+               !require(p+"attn_q_norm.weight",hd_layer)||!require(p+"attn_k_norm.weight",hd_layer)||
+               !require(p+"post_attention_norm.weight",config_.embedding)||
+               !require(p+"ffn_norm.weight",config_.embedding)||!require(p+"ffn_gate.weight",config_.ffn*config_.embedding)||
+               !require(p+"ffn_up.weight",config_.ffn*config_.embedding)||!require(p+"ffn_down.weight",config_.embedding*config_.ffn)||
+               !require(p+"post_ffw_norm.weight",config_.embedding))return fail("Missing or malformed Gemma4 block tensors: "+p);
+            if(const auto* os=tensor(p+"layer_output_scale.weight")){if(os->elements!=1)return fail("Malformed Gemma4 layer_output_scale: "+p);}
+            continue;
+        }
         if(qwen35_arch){
             // Qwen3.5 hybrid: full-attention blocks every full_attention_interval
             // (0-based: (l+1)%interval!=0 is GDN), sandwich norms everywhere.
@@ -885,9 +1163,20 @@ bool DenseTransformerRuntime::load(const std::filesystem::path& path,std::string
                 r("ssm_norm.weight",config_.ssm_state);
                 r("ssm_out.weight",config_.embedding*value_dim);
                 r("post_attention_norm.weight",config_.embedding);
-                r("ffn_gate.weight",config_.ffn*config_.embedding);
-                r("ffn_up.weight",config_.ffn*config_.embedding);
-                r("ffn_down.weight",config_.embedding*config_.ffn);
+                if(tensor(p+"ffn_gate_exps.weight")){
+                    // MoE FFN (qwen35moe): router + gated experts + shared.
+                    const auto* ge2=tensor(p+"ffn_gate_exps.weight");
+                    const auto* ue2=tensor(p+"ffn_up_exps.weight");
+                    const auto* de2=tensor(p+"ffn_down_exps.weight");
+                    const auto* rt=tensor(p+"ffn_gate_inp.weight");
+                    if(!ge2||!ue2||!de2||!rt||ge2->dims.size()!=3||ue2->dims.size()!=3||de2->dims.size()!=3||ge2->dims[0]!=config_.embedding||ue2->dims[0]!=config_.embedding||de2->dims[1]!=config_.embedding)return fail("Missing or malformed Qwen3.5-MoE GDN block tensors: "+p);
+                    if(config_.moe_ffn==0){config_.moe_ffn=static_cast<std::uint32_t>(ge2->dims[1]);if(!config_.moe_expert_count||!config_.moe_used_count)return fail("Qwen3.5-MoE router hyperparameters invalid");}
+                    if(ge2->dims[2]!=config_.moe_expert_count||ue2->dims[2]!=config_.moe_expert_count||de2->dims[2]!=config_.moe_expert_count)return fail("Qwen3.5-MoE expert count mismatch: "+p);
+                }else{
+                    r("ffn_gate.weight",config_.ffn*config_.embedding);
+                    r("ffn_up.weight",config_.ffn*config_.embedding);
+                    r("ffn_down.weight",config_.embedding*config_.ffn);
+                }
                 if(!failed.empty())return fail("Missing or malformed Qwen3.5 GDN block tensors: "+p+" ["+failed+"]");
             }else{
                 auto r=[&](const char* n,std::size_t c){if(!req(n,c)&&failed.empty())failed=n;};
@@ -899,9 +1188,19 @@ bool DenseTransformerRuntime::load(const std::filesystem::path& path,std::string
                 r("attn_output.weight",QW*config_.embedding);
                 r("attn_q_norm.weight",head_dim);r("attn_k_norm.weight",head_dim);
                 r("post_attention_norm.weight",config_.embedding);
-                r("ffn_gate.weight",config_.ffn*config_.embedding);
-                r("ffn_up.weight",config_.ffn*config_.embedding);
-                r("ffn_down.weight",config_.embedding*config_.ffn);
+                if(tensor(p+"ffn_gate_exps.weight")){
+                    const auto* ge2=tensor(p+"ffn_gate_exps.weight");
+                    const auto* ue2=tensor(p+"ffn_up_exps.weight");
+                    const auto* de2=tensor(p+"ffn_down_exps.weight");
+                    const auto* rt=tensor(p+"ffn_gate_inp.weight");
+                    if(!ge2||!ue2||!de2||!rt||ge2->dims.size()!=3||ue2->dims.size()!=3||de2->dims.size()!=3||ge2->dims[0]!=config_.embedding||ue2->dims[0]!=config_.embedding||de2->dims[1]!=config_.embedding)return fail("Missing or malformed Qwen3.5-MoE attention block tensors: "+p);
+                    if(config_.moe_ffn==0){config_.moe_ffn=static_cast<std::uint32_t>(ge2->dims[1]);if(!config_.moe_expert_count||!config_.moe_used_count)return fail("Qwen3.5-MoE router hyperparameters invalid");}
+                    if(ge2->dims[2]!=config_.moe_expert_count||ue2->dims[2]!=config_.moe_expert_count||de2->dims[2]!=config_.moe_expert_count)return fail("Qwen3.5-MoE expert count mismatch: "+p);
+                }else{
+                    r("ffn_gate.weight",config_.ffn*config_.embedding);
+                    r("ffn_up.weight",config_.ffn*config_.embedding);
+                    r("ffn_down.weight",config_.embedding*config_.ffn);
+                }
                 if(!failed.empty())return fail("Missing or malformed Qwen3.5 attention block tensors: "+p+" ["+failed+"]");
             }
             continue;
@@ -921,6 +1220,317 @@ bool DenseTransformerRuntime::load(const std::filesystem::path& path,std::string
                !require(p+"ffn_down.weight",config_.embedding*config_.ffn))return fail("Missing or malformed BitNet block tensors: "+p);
             continue;
         }
+                if(config_.moe_nemotron&&tensor(p+"ffn_up_exps.weight")){
+            // Nemotron-H MoE layer: router + gated experts (no gate tensor,
+            // RELU_SQR) + shared expert. Validate the expert set; attention
+            // shape checks are done per-layer below via the split handlers.
+            const auto* ue2=tensor(p+"ffn_up_exps.weight");
+            const auto* de2=tensor(p+"ffn_down_exps.weight");
+            if(!ue2||!de2||ue2->dims.size()!=3||de2->dims.size()!=3)return fail("Missing or malformed nemotron MoE expert tensors: "+p);
+            const std::size_t EF2=ue2->dims[1],EN2=ue2->dims[2];
+            if(EN2!=config_.moe_expert_count)return fail("Nemotron MoE expert count mismatch: "+p);
+            if(config_.moe_ffn==0)config_.moe_ffn=static_cast<std::uint32_t>(EF2);
+            if(!require(p+"attn_norm.weight",config_.embedding)||!require(p+"ffn_gate_inp.weight",config_.embedding*EN2))return fail("Missing or malformed nemotron MoE router tensors: "+p);
+            if(tensor(p+"ffn_down_shexp.weight")){
+                const auto* sh_up=tensor(p+"ffn_up_shexp.weight");
+                const auto* sh_dn=tensor(p+"ffn_down_shexp.weight");
+                if(!sh_up||!sh_dn||sh_up->elements%config_.embedding||sh_dn->elements%config_.embedding)return fail("Missing or malformed nemotron MoE shared expert tensors: "+p);
+                const std::size_t SFEF=sh_up->elements/config_.embedding;
+                if(sh_dn->elements!=SFEF*config_.embedding)return fail("Missing or malformed nemotron MoE shared expert tensors: "+p);
+            }
+            continue;
+        }
+        if(deepseek_arch){
+            // DeepSeek MLA block (llama.cpp deepseek2.cpp, is_mla path).
+            // Two file shapes:
+            //  (1) classic: attn_q [QW x E], attn_kv_a_mqa [L x E] (latent +
+            //      rope), attn_kv_a_norm [rank], attn_kv_b [rank x H*(nope+Dv)],
+            //      attn_output [E x H*Dv].
+            //  (2) GLM-style split: q_a [q_lora x E] + attn_q_a_norm + q_b
+            //      [QW x q_lora], attn_k_b [nope x rank x H], attn_v_b
+            //      [rank x Dv x H] (absorbed attention).
+            // FFN: dense on leading layers, MoE + shared expert after
+            // (leading_dense_block_count layers differ only in FFN, dispatch
+            // by tensor presence).
+            const std::uint32_t val_len=meta_uint_arch(report.config,architecture_name_,"attention.value_length_mla",0);
+            const std::uint32_t val_len2=meta_uint_arch(report.config,architecture_name_,"attention.value_length",0);
+            const std::uint32_t valL=val_len?val_len:val_len2;
+            if(!valL||config_.head_dim<=config_.rope_dim||!config_.kv_lora_rank)return fail("DeepSeek MLA attention metadata invalid: "+p);
+            const std::size_t nope=config_.head_dim-config_.rope_dim;
+            const std::size_t L=std::size_t(config_.kv_lora_rank)+config_.rope_dim;
+            const std::size_t Dv=valL;
+            const std::size_t rank=config_.kv_lora_rank;
+            const bool split=tensor(p+"attn_k_b.weight")!=nullptr;
+            bool ok=false;
+            if(split){
+                const auto* qqa=tensor(p+"attn_q_a.weight");
+                const auto* qqb=tensor(p+"attn_q_b.weight");
+                if(qqa&&qqb){
+                    const std::size_t qlora=qqa->elements/config_.embedding;
+                    const std::size_t qw=qqb->elements/qlora;
+                    ok=require(p+"attn_norm.weight",config_.embedding)&&
+                       require(p+"attn_q_a.weight",qlora*config_.embedding)&&
+                       require(p+"attn_q_a_norm.weight",qlora)&&
+                       require(p+"attn_q_b.weight",qw*qlora)&&qw==QW&&
+                       require(p+"attn_kv_a_mqa.weight",L*config_.embedding)&&
+                       require(p+"attn_kv_a_norm.weight",rank)&&
+                       require(p+"attn_k_b.weight",nope*rank*config_.heads)&&
+                       require(p+"attn_v_b.weight",rank*Dv*config_.heads)&&
+                       require(p+"attn_output.weight",config_.heads*Dv*config_.embedding)&&
+                       require(p+"ffn_norm.weight",config_.embedding);
+                }
+            }else{
+                ok=require(p+"attn_norm.weight",config_.embedding)&&require(p+"attn_q.weight",QW*config_.embedding)&&
+                   require(p+"attn_kv_a_mqa.weight",L*config_.embedding)&&
+                   require(p+"attn_kv_a_norm.weight",rank)&&
+                   require(p+"attn_kv_b.weight",rank*config_.heads*(nope+Dv))&&
+                   require(p+"attn_output.weight",config_.heads*Dv*config_.embedding)&&
+                   require(p+"ffn_norm.weight",config_.embedding);
+            }
+            if(!ok)return fail("Missing or malformed DeepSeek MLA block tensors: "+p);
+            if(tensor(p+"ffn_gate_exps.weight")){
+                const auto* ge2=tensor(p+"ffn_gate_exps.weight");
+                const auto* ue2=tensor(p+"ffn_up_exps.weight");
+                const auto* de2=tensor(p+"ffn_down_exps.weight");
+                if(!ge2||!ue2||!de2||ge2->dims.size()!=3||ue2->dims.size()!=3||de2->dims.size()!=3)return fail("Missing or malformed DeepSeek MoE expert tensors: "+p);
+                if(ge2->dims[2]!=config_.moe_expert_count||ue2->dims[2]!=config_.moe_expert_count||de2->dims[2]!=config_.moe_expert_count)return fail("DeepSeek MoE expert count mismatch: "+p);
+                if(config_.moe_ffn==0)config_.moe_ffn=static_cast<std::uint32_t>(ge2->dims[1]);
+                if(!require(p+"ffn_gate_inp.weight",config_.embedding*config_.moe_expert_count))return fail("Missing or malformed DeepSeek MoE router tensors: "+p);
+                if(tensor(p+"ffn_down_shexp.weight")){
+                    const auto* sg2=tensor(p+"ffn_gate_shexp.weight");
+                    const auto* su2=tensor(p+"ffn_up_shexp.weight");
+                    const auto* sd2=tensor(p+"ffn_down_shexp.weight");
+                    if(!sg2||!su2||!sd2)return fail("Missing or malformed DeepSeek MoE shared expert tensors: "+p);
+                }
+            }else{
+                if(!require(p+"ffn_gate.weight",config_.ffn*config_.embedding)||!require(p+"ffn_up.weight",config_.ffn*config_.embedding)||!require(p+"ffn_down.weight",config_.embedding*config_.ffn))return fail("Missing or malformed DeepSeek dense FFN tensors: "+p);
+            }
+            continue;
+        }
+        if(spark_arch){
+            // Spark-X2.5 (llama.cpp spark2-5.cpp): dense attention with fused
+            // attn_qkv (Q|K|V in one projection), per-head sigmoid attention
+            // gate (attn_gate [E x H]), standard dense FFN with gelu PAR.
+            if(!require(p+"attn_norm.weight",config_.embedding)||
+               !require(p+"attn_qkv.weight",(QW+2*KW)*config_.embedding)||
+               !require(p+"attn_output.weight",QW*config_.embedding)||
+               !require(p+"attn_gate.weight",config_.embedding*config_.heads)||
+               !require(p+"ffn_norm.weight",config_.embedding)||
+               !require(p+"ffn_gate.weight",config_.ffn*config_.embedding)||
+               !require(p+"ffn_up.weight",config_.ffn*config_.embedding)||
+               !require(p+"ffn_down.weight",config_.embedding*config_.ffn))return fail("Missing or malformed Spark-X2.5 block tensors: "+p);
+            continue;
+        }
+        if(flint_arch){
+            // Flint (llama.cpp flint.cpp): dense attention with per-head norms
+            // and sinks, optional per-layer RoPE (attention.rope_pattern
+            // False means that layer applies no rotary offset), leading
+            // dense layers, then sigmoid MoE (+ shared experts below).
+            if(!require(p+"attn_norm.weight",config_.embedding)||
+               !require(p+"attn_q.weight",QW*config_.embedding)||
+               !require(p+"attn_k.weight",KW*config_.embedding)||
+               !require(p+"attn_v.weight",KW*config_.embedding)||
+               !require(p+"attn_output.weight",QW*config_.embedding)||
+               !require(p+"attn_sinks.weight",config_.heads)||
+               !require(p+"attn_q_norm.weight",head_dim)||
+               !require(p+"attn_k_norm.weight",head_dim)||
+               !require(p+"ffn_norm.weight",config_.embedding))return fail("Missing or malformed Flint block tensors: "+p);
+            if(tensor(p+"ffn_gate_exps.weight")){
+                const auto* ge2=tensor(p+"ffn_gate_exps.weight");
+                const auto* ue2=tensor(p+"ffn_up_exps.weight");
+                const auto* de2=tensor(p+"ffn_down_exps.weight");
+                if(!ge2||!ue2||!de2||ge2->dims.size()!=3||ue2->dims.size()!=3||de2->dims.size()!=3)return fail("Missing or malformed Flint MoE expert tensors: "+p);
+                if(ge2->dims[2]!=config_.moe_expert_count||ue2->dims[2]!=config_.moe_expert_count||de2->dims[2]!=config_.moe_expert_count)return fail("Flint MoE expert count mismatch: "+p);
+                if(config_.moe_ffn==0)config_.moe_ffn=static_cast<std::uint32_t>(ge2->dims[1]);
+                if(!require(p+"ffn_gate_inp.weight",config_.embedding*config_.moe_expert_count))return fail("Missing or malformed Flint router tensor: "+p);
+                if(tensor(p+"ffn_down_shexp.weight")){
+                    const auto* sg2=tensor(p+"ffn_gate_shexp.weight");
+                    const auto* su2=tensor(p+"ffn_up_shexp.weight");
+                    const auto* sd2=tensor(p+"ffn_down_shexp.weight");
+                    if(!sg2||!su2||!sd2)return fail("Missing or malformed Flint shared expert tensors: "+p);
+                }
+            }
+            continue;
+        }
+        if(starcoder2_arch){
+            // starcoder2.cpp: LayerNorm blocks (weight+bias), Q/K/V/O dense
+            // projections with optional biases, sequential GELU FFN
+            // (up+bias, gelu, down+bias). No ffn_gate tensor.
+            if(!require(p+"attn_norm.weight",config_.embedding)||!require(p+"attn_norm.bias",config_.embedding)||
+               !require(p+"attn_q.weight",QW*config_.embedding)||
+               !require(p+"attn_k.weight",KW*config_.embedding)||
+               !require(p+"attn_v.weight",KW*config_.embedding)||
+               !require(p+"attn_output.weight",QW*config_.embedding)||
+               !require(p+"ffn_norm.weight",config_.embedding)||!require(p+"ffn_norm.bias",config_.embedding)||
+               !require(p+"ffn_up.weight",config_.ffn*config_.embedding)||
+               !require(p+"ffn_down.weight",config_.embedding*config_.ffn))return fail("Missing or malformed Starcoder2 block tensors: "+p);
+            if(tensor(p+"attn_q.bias")&&!require(p+"attn_q.bias",QW))return fail("Malformed starcoder2 attn_q.bias: "+p);
+            if(tensor(p+"attn_k.bias")&&!require(p+"attn_k.bias",KW))return fail("Malformed starcoder2 attn_k.bias: "+p);
+            if(tensor(p+"attn_v.bias")&&!require(p+"attn_v.bias",KW))return fail("Malformed starcoder2 attn_v.bias: "+p);
+            if(tensor(p+"attn_output.bias")&&!require(p+"attn_output.bias",config_.embedding))return fail("Malformed starcoder2 attn_output.bias: "+p);
+            if(tensor(p+"ffn_up.bias")&&!require(p+"ffn_up.bias",config_.ffn))return fail("Malformed starcoder2 ffn_up.bias: "+p);
+            if(tensor(p+"ffn_down.bias")&&!require(p+"ffn_down.bias",config_.embedding))return fail("Malformed starcoder2 ffn_down.bias: "+p);
+            continue;
+        }
+        if(k2_arch){
+            // K2-Horizon (llama.cpp k2-horizon.cpp): group-RMSNorm blocks,
+            // Q/K dense projections, optional MoVA value routing on MoE
+            // layers (attn_v_gate + attn_v_exps replacing attn_v), attention
+            // output gate (wqkv_gate, log2 softplus), MoE FFN + shared expert
+            // on layers >= leading_dense_block_count, dense FFN before.
+            const std::uint32_t lead=meta_uint_arch(report.config,architecture_name_,"leading_dense_block_count",0);
+            const bool is_moe=(config_.moe_expert_count>0&&l>=lead);
+            if(!require(p+"attn_norm.weight",config_.embedding)||!require(p+"attn_q.weight",QW*config_.embedding)||
+               !require(p+"attn_k.weight",KW*config_.embedding)||
+               !require(p+"attn_output.weight",QW*config_.embedding)||
+               !require(p+"attn_gate.weight",QW*config_.embedding)||
+               !require(p+"ffn_norm.weight",config_.embedding))return fail("Missing or malformed K2-Horizon block tensors: "+p);
+            if(is_moe){
+                if(!require(p+"attn_v_gate.weight",config_.embedding*config_.value_expert_count)||
+                   !require(p+"attn_v_exps.weight",config_.embedding*KW*config_.value_expert_count)||
+                   !require(p+"ffn_gate_inp.weight",config_.embedding*config_.moe_expert_count))return fail("Missing or malformed K2-Horizon MoVA tensors: "+p);
+                if(tensor(p+"attn_v_gate.bias")&&!require(p+"attn_v_gate.bias",config_.value_expert_count))return fail("Malformed K2-Horizon attn_v_gate.bias: "+p);
+                const auto* ge2=tensor(p+"ffn_gate_exps.weight");
+                const auto* ue2=tensor(p+"ffn_up_exps.weight");
+                const auto* de2=tensor(p+"ffn_down_exps.weight");
+                if(!ge2||!ue2||!de2||ge2->dims.size()!=3||ue2->dims.size()!=3||de2->dims.size()!=3)return fail("Missing or malformed K2-Horizon MoE expert tensors: "+p);
+                if(ge2->dims[2]!=config_.moe_expert_count||ue2->dims[2]!=config_.moe_expert_count||de2->dims[2]!=config_.moe_expert_count)return fail("K2-Horizon MoE expert count mismatch: "+p);
+                if(config_.moe_ffn==0)config_.moe_ffn=static_cast<std::uint32_t>(ge2->dims[1]);
+                if(tensor(p+"ffn_down_shexp.weight")){
+                    const auto* sg2=tensor(p+"ffn_gate_shexp.weight");
+                    const auto* su2=tensor(p+"ffn_up_shexp.weight");
+                    const auto* sd2=tensor(p+"ffn_down_shexp.weight");
+                    if(!sg2||!su2||!sd2)return fail("Missing or malformed K2-Horizon shared expert tensors: "+p);
+                }
+            }else{
+                if(!require(p+"attn_v.weight",KW*config_.embedding)||
+                   !require(p+"ffn_gate.weight",config_.ffn*config_.embedding)||
+                   !require(p+"ffn_up.weight",config_.ffn*config_.embedding)||
+                   !require(p+"ffn_down.weight",config_.embedding*config_.ffn))return fail("Missing or malformed K2-Horizon dense block tensors: "+p);
+            }
+            continue;
+        }
+        if(gpt_oss_arch){
+            // GPT-OSS (llama.cpp openai-moe.cpp): dense attention with Q/K/V/O
+            // biases + per-head attention sinks, sliding window (parsed as
+            // sliding_window), post-attention RMSNorm, and per-layer biased
+            // SWIGLU MoE (router bias + per-expert gate/up/down biases) with
+            // softmax weights (no renormalization).
+            if(!require(p+"attn_norm.weight",config_.embedding)||
+               !require(p+"attn_q.weight",QW*config_.embedding)||
+               !require(p+"attn_k.weight",KW*config_.embedding)||
+               !require(p+"attn_v.weight",KW*config_.embedding)||
+               !require(p+"attn_output.weight",QW*config_.embedding)||
+               !require(p+"attn_sinks.weight",config_.heads)||
+               !require(p+"post_attention_norm.weight",config_.embedding)||
+               !require(p+"ffn_gate_inp.weight",config_.embedding*config_.moe_expert_count))return fail("Missing or malformed GPT-OSS block tensors: "+p);
+            const auto* ge2=tensor(p+"ffn_gate_exps.weight");
+            const auto* ue2=tensor(p+"ffn_up_exps.weight");
+            const auto* de2=tensor(p+"ffn_down_exps.weight");
+            if(!ge2||!ue2||!de2||ge2->dims.size()!=3||ue2->dims.size()!=3||de2->dims.size()!=3)return fail("Missing or malformed GPT-OSS MoE expert tensors: "+p);
+            if(ge2->dims[2]!=config_.moe_expert_count||ue2->dims[2]!=config_.moe_expert_count||de2->dims[2]!=config_.moe_expert_count)return fail("GPT-OSS MoE expert count mismatch: "+p);
+            if(config_.moe_ffn==0)config_.moe_ffn=static_cast<std::uint32_t>(ge2->dims[1]);
+            if(tensor(p+"attn_q.bias")&&!require(p+"attn_q.bias",QW))return fail("Malformed GPT-OSS attn_q.bias: "+p);
+            if(tensor(p+"attn_k.bias")&&!require(p+"attn_k.bias",KW))return fail("Malformed GPT-OSS attn_k.bias: "+p);
+            if(tensor(p+"attn_v.bias")&&!require(p+"attn_v.bias",KW))return fail("Malformed GPT-OSS attn_v.bias: "+p);
+            if(tensor(p+"attn_output.bias")&&!require(p+"attn_output.bias",config_.embedding))return fail("Malformed GPT-OSS attn_output.bias: "+p);
+            continue;
+        }
+        if(moe_arch){
+            if(config_.moe_gemma&&tensor(p+"ffn_gate_up_exps.weight")){
+                // Gemma4-MoE layer: router (scale-divided input) + fused gate_up
+                // experts + down experts + shared dense MLP sub-block.
+                const auto* ge2u=tensor(p+"ffn_gate_up_exps.weight");
+                const auto* de2=tensor(p+"ffn_down_exps.weight");
+                if(!ge2u||!de2||ge2u->dims.size()!=3||de2->dims.size()!=3)return fail("Missing or malformed Gemma4-MoE expert tensors: "+p);
+                const std::size_t EF2=ge2u->dims[1]/2,EN2=ge2u->dims[2];
+                if(EN2!=config_.moe_expert_count)return fail("Gemma4-MoE expert count mismatch: "+p);
+                if(config_.moe_ffn==0)config_.moe_ffn=static_cast<std::uint32_t>(EF2);
+                if(!require(p+"attn_norm.weight",config_.embedding)||!require(p+"ffn_gate_inp.weight",config_.embedding*EN2))return fail("Missing or malformed Gemma4-MoE router tensors: "+p);
+                continue;
+            }
+            // Qwen3-MoE: dense attention (Q/K norm, no MoE shared experts) +
+            // router (ffn_gate_inp) and 3D expert tensors. Expert FFN width is
+            // read from the tensor dims (dims[0]=in, dims[1]=out, dims[2]=N).
+            const auto* ge=tensor(p+"ffn_gate_exps.weight");
+            const auto* ue=tensor(p+"ffn_up_exps.weight");
+            const auto* de=tensor(p+"ffn_down_exps.weight");
+            if(tensor(p+"shortconv.in_proj.weight")){
+                if(!require(p+"attn_norm.weight",config_.embedding)||!require(p+"ffn_norm.weight",config_.embedding))return fail("Missing or malformed lfm2moe shortconv block tensors: "+p);
+                const auto* sc=tensor(p+"shortconv.conv.weight");
+                const auto* so=tensor(p+"shortconv.out_proj.weight");
+                if(!sc||!so)return fail("Missing or malformed lfm2moe shortconv tensors: "+p);
+                if(tensor(p+"ffn_gate_exps.weight")){
+                    if(config_.moe_ffn==0){
+                        const auto* ge2=tensor(p+"ffn_gate_exps.weight");
+                        if(!ge2||ge2->dims.size()!=3)return fail("Missing or malformed Qwen3-MoE expert tensors: "+p);
+                        if(ge2->dims[2]!=config_.moe_expert_count)return fail("Qwen3-MoE expert count mismatch: "+p);
+                        config_.moe_ffn=static_cast<std::uint32_t>(ge2->dims[1]);
+                    }
+                    const std::size_t EF=config_.moe_ffn,EN=config_.moe_expert_count;
+                    if(!require(p+"ffn_gate_inp.weight",config_.embedding*EN)||!require(p+"ffn_gate_exps.weight",config_.embedding*EF*EN)||!require(p+"ffn_up_exps.weight",config_.embedding*EF*EN)||!require(p+"ffn_down_exps.weight",EF*config_.embedding*EN))return fail("Missing or malformed lfm2moe shortconv MoE tensors: "+p);
+                }else{
+                    if(!require(p+"ffn_gate.weight",config_.ffn*config_.embedding)||!require(p+"ffn_up.weight",config_.ffn*config_.embedding)||!require(p+"ffn_down.weight",config_.embedding*config_.ffn))return fail("Missing or malformed lfm2moe shortconv dense tensors: "+p);
+                }
+                continue;
+            }
+            if(!ge&&!ue&&!de){
+                // Split blocks inside a MoE model (nemotron: SSM-only and
+                // attention-only layers carry no MoE tensors): validate per
+                // their own kind; detailed checks live in the split handlers.
+                if(tensor(p+"ssm_in.weight")||tensor(p+"attn_output.weight")||tensor(p+"ffn_up.weight")){
+                    continue;
+                }
+                // Dense layer inside a MoE model (e.g. laguna blk.0): require
+                // the dense set. Attention tensors are zero-padded to max
+                // heads at load, so check max widths here.
+                const std::size_t QWmax=std::size_t(config_.heads)*head_dim,KWmax=std::size_t(config_.kv_heads)*head_dim;
+                if(!require(p+"attn_norm.weight",config_.embedding)||!require(p+"attn_q.weight",QWmax*config_.embedding)||
+                   !require(p+"attn_k.weight",KWmax*config_.embedding)||!require(p+"attn_v.weight",KWmax*config_.embedding)||
+                   !require(p+"attn_output.weight",QWmax*config_.embedding)||
+                   !require(p+"ffn_norm.weight",config_.embedding)||!require(p+"ffn_gate.weight",config_.ffn*config_.embedding)||
+                   !require(p+"ffn_up.weight",config_.ffn*config_.embedding)||!require(p+"ffn_down.weight",config_.embedding*config_.ffn))return fail("Missing or malformed MoE dense-layer tensors: "+p);
+                continue;
+            }
+            if(config_.moe_ffn==0){
+                if(!ge||!ue||!de||ge->dims.size()!=3||ue->dims.size()!=3||de->dims.size()!=3)return fail("Missing or malformed Qwen3-MoE expert tensors: "+p);
+                if(ge->dims[2]!=config_.moe_expert_count||ue->dims[2]!=config_.moe_expert_count||de->dims[2]!=config_.moe_expert_count)return fail("Qwen3-MoE expert count mismatch: "+p);
+                if(ge->dims[0]!=config_.embedding||ue->dims[0]!=config_.embedding||ge->dims[1]!=ue->dims[1]||de->dims[0]!=ge->dims[1]||de->dims[1]!=config_.embedding)return fail("Qwen3-MoE expert dims inconsistent: "+p);
+                config_.moe_ffn=static_cast<std::uint32_t>(ge->dims[1]);
+                if(!config_.moe_expert_count||!config_.moe_used_count||config_.moe_used_count>config_.moe_expert_count||!config_.moe_ffn)return fail("Qwen3-MoE router hyperparameters invalid");
+            }
+            const std::size_t EF=config_.moe_ffn,EN=config_.moe_expert_count;
+            const std::size_t QWchk=!report.config.heads_per_layer.empty()?std::size_t(config_.heads)*head_dim:QW;
+            const std::size_t KWchk=!report.config.kv_per_layer.empty()?std::size_t(config_.kv_heads)*head_dim:KW;
+            if(!require(p+"attn_norm.weight",config_.embedding)||!require(p+"attn_q.weight",QWchk*config_.embedding)||
+               !require(p+"attn_k.weight",KWchk*config_.embedding)||
+               !require(p+"attn_v.weight",KWchk*config_.embedding)||
+               !require(p+"attn_output.weight",QWchk*config_.embedding)||
+               !require(p+"ffn_norm.weight",config_.embedding)||!require(p+"ffn_gate_inp.weight",config_.embedding*EN)||
+               !require(p+"ffn_gate_exps.weight",config_.embedding*EF*EN)||!require(p+"ffn_up_exps.weight",config_.embedding*EF*EN)||
+               !require(p+"ffn_down_exps.weight",EF*config_.embedding*EN))return fail("Missing or malformed Qwen3-MoE block tensors: "+p);
+            continue;
+        }
+        if(!tensor(p+"attn_q.weight")&&!tensor(p+"ssm_in.weight")&&!tensor(p+"shortconv.in_proj.weight")){
+            // Split FFN-only block (nemotron): FFN without attention.
+            if(!require(p+"attn_norm.weight",config_.embedding)||!require(p+"ffn_up.weight",config_.ffn*config_.embedding)||!require(p+"ffn_down.weight",config_.embedding*config_.ffn))return fail("Missing or malformed nemotron FFN-only block tensors: "+p);
+            continue;
+        }
+        if(tensor(p+"attn_q.weight")&&!tensor(p+"ffn_up.weight")&&!tensor(p+"ffn_gate_exps.weight")&&!tensor(p+"ssm_in.weight")){
+            // Split attention-only block (nemotron): attention without FFN.
+            if(!require(p+"attn_norm.weight",config_.embedding)||!require(p+"attn_q.weight",QW*config_.embedding)||!require(p+"attn_k.weight",KW*config_.embedding)||!require(p+"attn_v.weight",KW*config_.embedding)||!require(p+"attn_output.weight",QW*config_.embedding))return fail("Missing or malformed nemotron attention-only block tensors: "+p);
+            continue;
+        }
+        if(tensor(p+"ssm_in.weight")){
+            // Nemotron SSM layer: ssm_in/out + conv/dt/a/d/norm, no attention,
+            // no FFN (split blocks). attn_norm is the pre-norm for the mix.
+            if(!require(p+"attn_norm.weight",config_.embedding))return fail("Missing or malformed nemotron SSM block tensors: "+p);
+            if(!tensor(p+"ssm_conv1d.weight")||!tensor(p+"ssm_dt.bias")||!tensor(p+"ssm_a")||!tensor(p+"ssm_d")||!tensor(p+"ssm_norm.weight"))return fail("Missing or malformed nemotron SSM tensors: "+p);
+            if(tensor(p+"ffn_gate.weight")){
+                if(!require(p+"ffn_gate.weight",config_.ffn*config_.embedding)||!require(p+"ffn_up.weight",config_.ffn*config_.embedding)||!require(p+"ffn_down.weight",config_.embedding*config_.ffn))return fail("Missing or malformed nemotron dense FFN tensors: "+p);
+            }
+            continue;
+        }
         if(!require(p+"attn_norm.weight",config_.embedding)||!require(p+"attn_q.weight",QW*config_.embedding)||
            !require(p+"attn_k.weight",KW*config_.embedding)||
            !require(p+"attn_v.weight",KW*config_.embedding)||
@@ -934,14 +1544,17 @@ bool DenseTransformerRuntime::load(const std::filesystem::path& path,std::string
             return fail("Malformed Q/K normalisation tensors: "+p+" (head_dim="+std::to_string(head_dim)+" q_elements="+std::to_string(qnorm->elements)+" q_values="+std::to_string(qnorm->values.size())+")");
         if(qwen3_arch&&(!qnorm||!knorm))return fail("Qwen3 requires per-head Q/K RMS normalisation tensors: "+p);
     }
-    // Sequential K-block repack at load (candidate (a)): when
-    // ZEN_CPU_Q8_REPACK_KBLK=1, transpose every Q8 GEMM weight that the
-    // K-blocked kernel would stream into the panel-major layout so the
-    // K-panel reads are sequential. Qwen3.5 fused tensors have a different
-    // row count per name, so they are not registered (they keep falling
-    // back to the raw K-blocked path when KBLK=1). The output head uses
-    // GEMV in decode and a single tail token in prefill, so its repack
-    // would pay hundreds of MB for one small GEMM: skipped.
+    // Sequential K-block repack at load (default-on): when enabled, transpose
+    // every Q8 GEMM weight that the K-blocked kernel would stream into the
+    // panel-major layout so the K-panel reads are sequential. Both gates
+    // default on (opt-out =0) — measured 923ms→477ms prefill on Qwen3-4B
+    // Q8_0 T=32 with identical tokens, at the cost of ~1× weight memory
+    // for the repacked copy and a load-time transpose pass.
+    // Qwen3.5 fused tensors have a different row count per name, so they are
+    // not registered (they keep falling back to the raw K-blocked path).
+    // The output head uses GEMV in decode and a single tail token in
+    // prefill, so its repack would pay hundreds of MB for one small GEMM:
+    // skipped.
     // Repack without KBLK would never be consumed (the repacked kernel is
     // the K-blocked kernel), so both gates must be on to build the buffers.
     if(!qwen35_arch&&quant::q8_repack_enabled()&&quant::q8_kblk_enabled()){
@@ -1006,6 +1619,7 @@ bool DenseTransformerRuntime::forward_q35_batch(const std::vector<std::uint32_t>
     for(std::size_t t=0;t<T;++t){if(tokens[t]>=config_.vocab)return false;
         if(emb->raw&&emb->format){const auto rb=quant::row_bytes(*emb->format,E);if(!rb||!quant::dequantize(*emb->format,emb->raw+std::size_t(tokens[t])*rb,E,x.data()+t*E))return false;}
         else if(emb->values.size()==std::size_t(config_.vocab)*E)std::copy_n(emb->values.data()+std::size_t(tokens[t])*E,E,x.data()+t*E);else return false;
+        if(config_.gemma_variant){const float s=config_.emb_scale;for(std::size_t i=0;i<E;++i)x[t*E+i]*=s;}
         // the embedding table is stored Hadamard-rotated: restore primal rows.
         if(hadamard_.block_size)hadamard_unrotate(x.data()+t*E,E,h_scratch);
     }
@@ -1056,17 +1670,27 @@ bool DenseTransformerRuntime::forward_q35_batch(const std::vector<std::uint32_t>
                 return window_base+std::size_t(idx)*conv_dim;
             };
             // conv1d over [state_rows | qkv window], per channel.
-            for(std::size_t ch=0;ch<conv_dim;++ch){
-                const auto* cw=tensor(p+"ssm_conv1d.weight")->values.data()+ch*CK;
+            // Channels are independent: run head-parallel (bit-identical).
+            {
+                const auto* conv_w=tensor(p+"ssm_conv1d.weight")->values.data();
+                zen::ResourceGovernor gov;
+                const unsigned cw=gov.current_policy().worker_threads;
+                const auto conv_body=[&](std::size_t cfirst,std::size_t clast){
+                    for(std::size_t ch=cfirst;ch<clast;++ch){
+                        const auto* cw2=conv_w+ch*CK;
                 float* out=conv_out.data()+ch;
                 for(std::size_t t=0;t<T;++t){
                     float sum=0.0f;
                     for(std::size_t w=0;w<CK;++w){
                         const std::int64_t idx=std::int64_t(t)+std::int64_t(w)-(std::int64_t)CK+1;
-                        sum+=cw[w]*window_row(idx)[ch];
+                        sum+=cw2[w]*window_row(idx)[ch];
                     }
                     out[t*conv_dim]=sum;
+                    }
                 }
+                };
+                if(cw>1&&conv_dim>=256)zen::ComputePool::instance().parallel_for(conv_dim,cw,conv_body);
+                else conv_body(0,conv_dim);
             }
             silu_inplace(conv_out.data(),T*conv_dim);
             // q/k l2-norm. Upstream normalises the joint [S, 2*NK] view of the
@@ -1107,53 +1731,65 @@ bool DenseTransformerRuntime::forward_q35_batch(const std::vector<std::uint32_t>
             // gates: beta = sigmoid(beta_proj); decay g = a * softplus(alpha + dt_bias); a = -exp(ssm_a)
             const auto* ssm_a=tensor(p+"ssm_a")->values.data();
             const auto* dt_bias=tensor(p+"ssm_dt.bias")->values.data();
-            std::vector<float> delta(S);
-            for(std::size_t t=0;t<T;++t){
-                for(std::size_t h=0;h<NV;++h){
-                    beta[t*NV+h]=1.0f/(1.0f+std::exp(-beta[t*NV+h]));
-                    const float xx=alpha[t*NV+h]+dt_bias[h];
-                    const float sp=xx>20.0f?xx:std::log(1.0f+std::exp(xx));
-                    // ssm_a already holds -A_log.exp() as stored in the checkpoint
-                    // (qwen35.cpp: `gate = alpha_softplus * ssm_a  // -A_log.exp() *
-                    // softplus`, and ops.cpp applies raw_a[iv1] directly). Applying
-                    // exp() and a negation again here reset the decay to a
-                    // completely different curve.
-                    a_gate[h]=ssm_a[h]*sp;
-                }
-                // q/k are repeated over value heads in TILED order: value head h
-                // reads key head h % NK (ops.cpp: iq1 = iv1 % neq1). The previous
-                // h*key_dim/value_dim mapped [0,1,2,3] to [0,0,0,0] for NK=... .
-                for(std::size_t h=0;h<NV;++h){
-                    const std::size_t kh=h%NK;
-                    const float* qh=q.data()+t*q_cap+kh*S;
-                    const float* kh_=k.data()+t*q_cap+kh*S;
-                    const float* vh=conv_out.data()+t*conv_dim+qk_span+h*S;
-                    float* sh=state.data()+h*S*S;
-                    const float g=std::exp(a_gate[h]);
+            // Gates (beta sigmoid + softplus*ssm_a) elementwise over (t,h).
+            {
+                zen::ResourceGovernor gov;
+                const unsigned gw=gov.current_policy().worker_threads;
+                const auto gate_body=[&](std::size_t first,std::size_t last){
+                    for(std::size_t i=first;i<last;++i){
+                        const std::size_t t=i/NV,h=i%NV;
+                        (void)t;
+                        beta[i]=1.0f/(1.0f+std::exp(-beta[i]));
+                        const float xx=alpha[i]+dt_bias[h];
+                        const float sp=xx>20.0f?xx:std::log(1.0f+std::exp(xx));
+                        a_gate[i]=ssm_a[h]*sp;
+                    }
+                };
+                if(gw>1&&(T*NV)>=64)zen::ComputePool::instance().parallel_for(T*NV,gw,gate_body);
+                else gate_body(0,T*NV);
+            }
+            // Recurrence independent per head (state sh per-head): run heads
+            // in parallel, t sequential per head. Bit-identical.
+            {
+                zen::ResourceGovernor gov;
+                const unsigned hw=gov.current_policy().worker_threads;
+                const auto rec_body=[&](std::size_t hfirst,std::size_t hlast){
+                    std::vector<float> delta(S);
+                    for(std::size_t h=hfirst;h<hlast;++h){
+                        const std::size_t kh=h%NK;
+                        float* sh=state.data()+h*S*S;
+                        for(std::size_t t=0;t<T;++t){
+                            const float* qh=q.data()+t*q_cap+kh*S;
+                            const float* kh_=k.data()+t*q_cap+kh*S;
+                            const float* vh=conv_out.data()+t*conv_dim+qk_span+h*S;
+                            const float g=std::exp(a_gate[t*NV+h]);
 #ifdef ZEN_HAS_AVX2_KERNELS
-                    if (gdn_avx2_enabled()) {
-                        zen::gdn_decay_avx2(sh, g, S*S);
-                        zen::gdn_delta_avx2(sh, kh_, vh, delta.data(), beta[t*NV+h], S);
-                        zen::gdn_update_avx2(sh, kh_, delta.data(), S);
-                        float* oh=gdn_out.data()+t*value_dim+h*S;
-                        zen::gdn_output_avx2(sh, qh, oh, scale, S);
-                    } else
+                            if (gdn_avx2_enabled()) {
+                                zen::gdn_decay_avx2(sh, g, S*S);
+                                zen::gdn_delta_avx2(sh, kh_, vh, delta.data(), beta[t*NV+h], S);
+                                zen::gdn_update_avx2(sh, kh_, delta.data(), S);
+                                float* oh=gdn_out.data()+t*value_dim+h*S;
+                                zen::gdn_output_avx2(sh, qh, oh, scale, S);
+                            } else
 #endif
-                    {
-                    for(std::size_t p=0;p<S*S;++p)sh[p]*=g;
-                    for(std::size_t j=0;j<S;++j){
-                        float sum=0.0f;for(std::size_t i=0;i<S;++i)sum+=sh[i*S+j]*kh_[i];
-                        delta[j]=(vh[j]-sum)*beta[t*NV+h];
+                            {
+                            for(std::size_t pi=0;pi<S*S;++pi)sh[pi]*=g;
+                            for(std::size_t j=0;j<S;++j){
+                                float sum=0.0f;for(std::size_t i=0;i<S;++i)sum+=sh[i*S+j]*kh_[i];
+                                delta[j]=(vh[j]-sum)*beta[t*NV+h];
+                            }
+                            for(std::size_t j=0;j<S;++j)for(std::size_t i=0;i<S;++i)sh[i*S+j]+=kh_[i]*delta[j];
+                            float* oh=gdn_out.data()+t*value_dim+h*S;
+                            for(std::size_t j=0;j<S;++j){
+                                float sum=0.0f;for(std::size_t i=0;i<S;++i)sum+=sh[i*S+j]*qh[i];
+                                oh[j]=sum*scale;
+                            }
+                            }
+                        }
                     }
-                    for(std::size_t j=0;j<S;++j)for(std::size_t i=0;i<S;++i)sh[i*S+j]+=kh_[i]*delta[j];
-                    // out[j] = sum_i S[i][j]*q[i] * scale
-                    float* oh=gdn_out.data()+t*value_dim+h*S;
-                    for(std::size_t j=0;j<S;++j){
-                        float sum=0.0f;for(std::size_t i=0;i<S;++i)sum+=sh[i*S+j]*qh[i];
-                        oh[j]=sum*scale;
-                    }
-                    }
-                }
+                };
+                if(hw>1&&NV>=8)zen::ComputePool::instance().parallel_for(NV,hw,rec_body);
+                else rec_body(0,NV);
             }
             std::copy_n(state.begin(),ssmc[l].size(),ssmc[l].begin());
             // conv state update. The ring is indexed newest-first along dim 0
@@ -1258,10 +1894,16 @@ bool DenseTransformerRuntime::forward_q35_batch(const std::vector<std::uint32_t>
             // start_pos != 0, so the write/read offset must use pos, not the
             // batch-local index t.
             if(T>0&&start_pos+T>kc[l].size()/KW)return false;
-            std::vector<float> scores(std::size_t(start_pos)+T);
-            const std::uint32_t group=H/KH;const float inv_scale=1.0f/std::sqrt(float(D));
-            for(std::size_t t=0;t<T;++t)for(std::uint32_t h=0;h<H;++h){
-                const auto kh=h/group;const float*qh=q.data()+t*QW+std::size_t(h)*D;
+            const std::uint32_t group=H/KH;const float inv_scale=config_.attn_scale>0?config_.attn_scale:1.0f/std::sqrt(float(D));
+            {
+                zen::ResourceGovernor gov;
+                const unsigned aw=gov.current_policy().worker_threads;
+                std::atomic<bool> att_ok{true};
+                const auto att_body=[&](std::size_t first,std::size_t last){
+                    std::vector<float> scores(std::size_t(start_pos)+T);
+                    for(std::size_t idx=first;idx<last&&att_ok.load(std::memory_order_relaxed);++idx){
+                        const std::size_t t=idx/H;const std::uint32_t h=static_cast<std::uint32_t>(idx%H);
+                        const auto kh=h/group;const float*qh=q.data()+t*QW+std::size_t(h)*D;
                 float max_score=-std::numeric_limits<float>::infinity();
                 const std::uint32_t pos=start_pos+static_cast<std::uint32_t>(t);
                 const std::size_t first=config_.sliding_window&&pos+1>config_.sliding_window?pos+1-config_.sliding_window:0;
@@ -1269,14 +1911,19 @@ bool DenseTransformerRuntime::forward_q35_batch(const std::vector<std::uint32_t>
                     const float*kt=kc[l].data()+j*KW+std::size_t(kh)*D;double dot=0;
                     for(std::size_t i=0;i<D;++i)dot+=double(qh[i])*kt[i];
                     scores[j]=static_cast<float>(dot)*inv_scale;
-                    if(!std::isfinite(scores[j]))return false;
+                    if(!std::isfinite(scores[j])){att_ok.store(false,std::memory_order_relaxed);break;}
                     max_score=std::max(max_score,scores[j]);
                 }
                 double denom=0;for(std::size_t j=first;j<=pos;++j){scores[j]=std::exp(scores[j]-max_score);denom+=scores[j];}
-                if(!(denom>0.0)||!std::isfinite(denom))return false;
+                if(!(denom>0.0)||!std::isfinite(denom)){att_ok.store(false,std::memory_order_relaxed);continue;}
                 float*out=att.data()+t*QW+std::size_t(h)*D;
                 for(std::size_t j=first;j<=pos;++j){const float a=scores[j]/static_cast<float>(denom);
                     const float*vt=vc[l].data()+j*KW+std::size_t(kh)*D;for(std::size_t i=0;i<D;++i)out[i]+=a*vt[i];}
+                    }
+                };
+                if(aw>1&&(T*H)>=24)zen::ComputePool::instance().parallel_for(T*H,aw,att_body);
+                else att_body(0,T*H);
+                if(!att_ok.load())return false;
             }
             // sigmoid gate after attention. Reference (qwen35.cpp build_layer_attn):
             //   gate_sigmoid = ggml_sigmoid(ctx0, gate);  cur = ggml_mul(ctx0, cur, gate_sigmoid);
@@ -1291,6 +1938,63 @@ bool DenseTransformerRuntime::forward_q35_batch(const std::vector<std::uint32_t>
         // post-attention norm then FFN (sandwich norm), residual from before it.
         std::vector<float> res_before(T*E);std::copy_n(x.data(),T*E,res_before.begin());
         for(std::size_t t=0;t<T;++t)rms_norm(x.data()+t*E,tensor(p+"post_attention_norm.weight")->values.data(),norm.data()+t*E,E,eps);
+        if(tensor(p+"ffn_gate_inp.weight")){
+            // qwen35moe MoE FFN: softmax router + top-k gated experts + shared.
+            const std::size_t EN3=config_.moe_expert_count,EK3=config_.moe_used_count,EF3=config_.moe_ffn;
+            const auto* router=tensor(p+"ffn_gate_inp.weight");
+            const auto* ge=tensor(p+"ffn_gate_exps.weight");
+            const auto* ue=tensor(p+"ffn_up_exps.weight");
+            const auto* de=tensor(p+"ffn_down_exps.weight");
+            if(!router||!ge||!ue||!de)return false;
+            std::vector<float> rlogits(T*EN3),tmpEF(EF3),tmpOut(E);
+            for(std::size_t t=0;t<T;++t){
+                if(!tensor_matvec(*router,norm.data()+t*E,rlogits.data()+t*EN3,EN3,E))return false;
+            }
+            std::fill(tmp.data(),tmp.data()+T*E,0.0f);
+            for(std::size_t t=0;t<T;++t){
+                float* tl=rlogits.data()+t*EN3;
+                float mx=tl[0];for(std::size_t i=1;i<EN3;++i)mx=std::max(mx,tl[i]);
+                double sum=0.0;for(std::size_t i=0;i<EN3;++i){tl[i]=std::exp(tl[i]-mx);sum+=tl[i];}
+                if(!(sum>0.0)||!std::isfinite(sum))return false;
+                for(std::size_t i=0;i<EN3;++i)tl[i]/=float(sum);
+                std::vector<std::uint32_t> idx(EN3);
+                std::iota(idx.begin(),idx.end(),0u);
+                std::partial_sort(idx.begin(),idx.begin()+EK3,idx.end(),[&](std::uint32_t a,std::uint32_t b){return tl[a]>tl[b];});
+                double wsum=0.0;for(std::size_t i=0;i<EK3;++i)wsum+=tl[idx[i]];
+                if(!(wsum>0.0))return false;
+                for(std::size_t i=0;i<EK3;++i){
+                    const std::uint32_t e=idx[i];
+                    const float w=float(tl[e]/wsum)*((config_.deepseek_variant||config_.k2_variant)?config_.moe_w_scale:1.0f);
+                    Tensor sg=*ge,su=*ue,sd=*de;
+                    const auto rbg=quant::row_bytes(*ge->format,E),rbu=quant::row_bytes(*ue->format,E),rbd=quant::row_bytes(*de->format,EF3);
+                    if(!rbg||!rbu||!rbd)return false;
+                    sg.raw=ge->raw+std::size_t(e)*EF3*rbg;
+                    su.raw=ue->raw+std::size_t(e)*EF3*rbu;
+                    sd.raw=de->raw+std::size_t(e)*(E*rbd);
+                    std::vector<float> eGate(EF3),eUp(EF3);
+                    if(!tensor_matvec(sg,norm.data()+t*E,eGate.data(),EF3,E))return false;
+                    if(!tensor_matvec(su,norm.data()+t*E,eUp.data(),EF3,E))return false;
+                    silu_mul(eGate.data(),eUp.data(),tmpEF.data(),EF3);
+                    if(!tensor_matvec(sd,tmpEF.data(),tmpOut.data(),E,EF3))return false;
+                    for(std::size_t k=0;k<E;++k)tmp[t*E+k]+=w*tmpOut[k];
+                }
+                const auto* sg2=tensor(p+"ffn_gate_shexp.weight");
+                const auto* su2=tensor(p+"ffn_up_shexp.weight");
+                const auto* sd2=tensor(p+"ffn_down_shexp.weight");
+                if(sg2&&su2&&sd2){
+                    const std::size_t SFEF=sg2->elements/E;
+                    std::vector<float> sGate(SFEF),sUp(SFEF),sMid(SFEF);
+                    if(!tensor_matvec(*sg2,norm.data()+t*E,sGate.data(),SFEF,E))return false;
+                    if(!tensor_matvec(*su2,norm.data()+t*E,sUp.data(),SFEF,E))return false;
+                    silu_mul(sGate.data(),sUp.data(),sMid.data(),SFEF);
+                    if(!tensor_matvec(*sd2,sMid.data(),tmpOut.data(),E,SFEF))return false;
+                    for(std::size_t k=0;k<E;++k)tmp[t*E+k]+=tmpOut[k];
+                }
+            }
+            for(std::size_t i=0;i<T*E;++i)x[i]=res_before[i]+tmp[i];
+            if(!finite_values(x.data(),x.size()))return false;
+            continue;
+        }
         fold_for(l,norm.data(),E,{"ffn_gate.weight","ffn_up.weight"});
         if(!tensor_gemm(*tensor(p+"ffn_gate.weight"),norm.data(),gate.data(),T,F,E)||
            !tensor_gemm(*tensor(p+"ffn_up.weight"),norm.data(),up.data(),T,F,E))return false;
@@ -1323,9 +2027,272 @@ bool DenseTransformerRuntime::forward_q35_token(std::uint32_t token, std::uint32
     return forward_q35_batch(std::vector<std::uint32_t>{token},kc,vc,convc,ssmc,logits,position);
 }
 
+bool DenseTransformerRuntime::mamba2_forward(const std::string& prefix, const float* norm, float* x,
+        std::size_t T, std::vector<float>& conv_state, std::vector<float>& ssm_state) const{
+    // llama.cpp llm_build_mamba_base::build_mamba2_layer + ggml_ssm_scan:
+    //   zxBCdt = ssm_in(norm)                      [z, xBC, dt] split
+    //   xBC = silu(conv1d(xBC, history) + conv_b) [causal, kernel d_conv]
+    //   dt_soft = softplus(dt + dt_bias)
+    //   per head h (group g = h/(nh/ng)):
+    //     S' = exp(dt_soft*A[h])*S + (x_h*dt_soft) outer B_g
+    //     y_h = S' * C_g + x_h*ssm_d[h]
+    //   y = silu(z)*y ; grouped RMSNorm ; ssm_out(y)
+    // State S is [d_state, head_dim] per head, persisted in ssm_state.
+    const auto* si=tensor(prefix+"ssm_in.weight");
+    const auto* cw_t=tensor(prefix+"ssm_conv1d.weight");
+    const auto* cb_t=tensor(prefix+"ssm_conv1d.bias");
+    const auto* so=tensor(prefix+"ssm_out.weight");
+    const auto* a_t=tensor(prefix+"ssm_a");
+    const auto* d_t=tensor(prefix+"ssm_d");
+    const auto* dtb_t=tensor(prefix+"ssm_dt.bias");
+    const auto* nrm_t=tensor(prefix+"ssm_norm.weight");
+    if(!si||!cw_t||!so||!a_t||!d_t||!nrm_t)return false;
+    const std::size_t E=config_.embedding;
+    const std::size_t CK=config_.ssm_d_conv,DS=config_.ssm_state,NG=config_.ssm_n_group,NH=config_.ssm_dt_rank;
+    if(!CK||!DS||!NG||!NH||CK<2)return false;
+    const std::size_t d_in_proj=si->elements/E;
+    const std::size_t conv_dim=cw_t->elements/CK;
+    if(!conv_dim)return false;
+    const std::size_t d_inner=conv_dim-2*NG*DS;
+    if(!d_inner||d_inner%NH||d_in_proj!=2*d_inner+2*NG*DS+NH)return false;
+    const std::size_t head_dim=d_inner/NH;
+    if(conv_state.size()!=(CK-1)*conv_dim||ssm_state.size()!=NH*head_dim*DS)return false;
+    auto values=[&](const Tensor* t)->const float*{
+        if(!t)return nullptr;
+        if(t->values.size())return t->values.data();
+        if(t->raw&&t->format&&t->format->encoding==quant::Encoding::fp32)return reinterpret_cast<const float*>(t->raw);
+        return nullptr;
+    };
+    const float* cw=values(cw_t);
+    const float* A=values(a_t);
+    const float* Dd=values(d_t);
+    const float* Nrm=values(nrm_t);
+    const float* cbias=cb_t?values(cb_t):nullptr;
+    const float* dtb=dtb_t?values(dtb_t):nullptr;
+    if(!cw||!A||!Dd||!Nrm)return false;
+    std::vector<float> zx(T*d_in_proj);
+    if(!tensor_gemm(*si,norm,zx.data(),T,d_in_proj,E))return false;
+    // Conv: window = newest-first history ring (CK-1 rows) + T token rows,
+    // mirroring the qwen35 conv-state convention so out[t] reads win[t..t+CK).
+    std::vector<float> xbc(T*conv_dim);
+    {
+        std::vector<float> win(((CK-1)+T)*conv_dim);
+        std::copy_n(conv_state.begin(),(CK-1)*conv_dim,win.begin());
+        for(std::size_t t=0;t<T;++t)std::copy_n(zx.data()+t*d_in_proj+d_inner,conv_dim,win.data()+(CK-1+t)*conv_dim);
+        for(std::size_t t=0;t<T;++t)for(std::size_t ch=0;ch<conv_dim;++ch){
+            const float* wrow=cw+ch*CK;
+            const float* base=win.data()+t*conv_dim+ch;
+            float sum=0.0f;
+            for(std::size_t k=0;k<CK;++k)sum+=wrow[k]*base[k*conv_dim];
+            xbc[t*conv_dim+ch]=sum+(cbias?cbias[ch]:0.0f);
+        }
+        silu_inplace(xbc.data(),T*conv_dim);
+        for(std::size_t w=CK-1;w-- > 0;){
+            const std::int64_t idx=std::int64_t(T)-1-std::int64_t(w);
+            std::copy_n(win.data()+(CK-1+idx)*conv_dim,conv_dim,conv_state.data()+w*conv_dim);
+        }
+    }
+    std::vector<float> y(T*d_inner);
+    const std::size_t dtoff=2*d_inner+2*NG*DS;
+    const std::size_t hpg=NH/NG; // heads per group
+    const std::size_t n_per_group=d_inner/NG;
+    for(std::size_t t=0;t<T;++t){
+        const float* xr=xbc.data()+t*conv_dim;
+        const float* zr=zx.data()+t*d_in_proj;
+        const float* dtr=zr+dtoff;
+        float* yt=y.data()+t*d_inner;
+        for(std::size_t h=0;h<NH;++h){
+            const float rdt=dtr[h]+(dtb?dtb[h]:0.0f);
+            const float dt_soft=rdt>20.0f?rdt:std::log(1.0f+std::exp(rdt));
+            const float dA=std::exp(dt_soft*A[h]);
+            const std::size_t g=h/hpg;
+            const float* Bg=xr+d_inner+g*DS;
+            const float* Cg=xr+d_inner+NG*DS+g*DS;
+            float* S=ssm_state.data()+h*head_dim*DS;
+            for(std::size_t j=0;j<head_dim;++j){
+                const std::size_t ii=h*head_dim+j;
+                const float xdt=xr[ii]*dt_soft;
+                float sum=0.0f;
+                for(std::size_t i=0;i<DS;++i){
+                    float& s=S[j*DS+i];
+                    s=dA*s+xdt*Bg[i];
+                    sum+=s*Cg[i];
+                }
+                yt[ii]=sum+xr[ii]*Dd[h];
+            }
+        }
+        silu_mul(zr,yt,yt,d_inner);
+        for(std::size_t g=0;g<NG;++g){
+            float* chunk=yt+g*n_per_group;
+            double ss=0.0;
+            for(std::size_t i=0;i<n_per_group;++i)ss+=double(chunk[i])*double(chunk[i]);
+            const float inv=1.0f/std::sqrt(float(ss/n_per_group)+config_.rms_epsilon);
+            const float* w=Nrm+g*n_per_group;
+            for(std::size_t i=0;i<n_per_group;++i)chunk[i]*=inv*w[i];
+        }
+    }
+    std::vector<float> outp(T*E);
+    if(!tensor_gemm(*so,y.data(),outp.data(),T,E,d_inner))return false;
+    for(std::size_t i=0;i<T*E;++i)x[i]+=outp[i];
+    return finite_values(x,T*E);
+}
+
+bool DenseTransformerRuntime::gemma_moe_forward(const std::string& prefix, const float* attn_out,
+        float* x, std::size_t T) const{
+    // llama.cpp gemma4 build_ffn_layer MoE branch:
+    //   router = softmax(gate_inp(rms(attn_out)/sqrt(E) * gate_inp.scale))
+    //   expert e: gelu(gate_up[0:EF]) * gate_up[EF:2EF] -> down; down scaled
+    //   output normalized by weight sum (moe_norm); moe part post-normed.
+    const auto* router=tensor(prefix+"ffn_gate_inp.weight");
+    const auto* gu=tensor(prefix+"ffn_gate_up_exps.weight");
+    const auto* de=tensor(prefix+"ffn_down_exps.weight");
+    if(!router||!gu||!de)return false;
+    const std::size_t E=config_.embedding;
+    const std::size_t EN=config_.moe_expert_count,EK=config_.moe_used_count;
+    if(gu->dims.size()!=3||de->dims.size()!=3)return false;
+    const std::size_t EF=gu->dims[1]/2;
+    if(gu->dims[2]!=EN||de->dims[2]!=EN)return false;
+    // router input: attn_out / sqrt(E), scaled per-dim by ffn_gate_inp.scale
+    std::vector<float> pre(T*E);
+    {const float isp=1.0f/std::sqrt(float(E));
+     for(std::size_t i=0;i<T*E;++i)pre[i]=attn_out[i]*isp;
+     const auto* ris=tensor(prefix+"ffn_gate_inp.scale");
+     if(ris&&ris->values.size()==E)for(std::size_t t=0;t<T;++t)for(std::size_t i=0;i<E;++i)pre[t*E+i]*=ris->values[i];}
+    std::vector<float> rlogits(T*EN);
+    for(std::size_t t=0;t<T;++t)if(!tensor_matvec(*router,pre.data()+t*E,rlogits.data()+t*EN,EN,E))return false;
+    std::vector<float> acc(T*E,0.0f);
+    const auto rbf=quant::row_bytes(*gu->format,E);
+    const auto rbd=quant::row_bytes(*de->format,EF);
+    if(!rbf||!rbd)return false;
+    const auto* dscale=tensor(prefix+"ffn_down_exps.scale");
+    const auto* qn=tensor(prefix+"pre_ffw_norm_2.weight");
+    if(!qn||!qn->values.size())return false;
+    std::vector<float> normed(T*E);
+    for(std::size_t t=0;t<T;++t)rms_norm(attn_out+t*E,qn->values.data(),normed.data()+t*E,E,config_.rms_epsilon);
+    for(std::size_t t=0;t<T;++t){
+        float* tl=rlogits.data()+t*EN;
+        {
+            float mx=tl[0];for(std::size_t i=1;i<EN;++i)mx=std::max(mx,tl[i]);
+            double sum=0.0;for(std::size_t i=0;i<EN;++i){tl[i]=std::exp(tl[i]-mx);sum+=tl[i];}
+            if(!(sum>0.0))return false;
+            for(std::size_t i=0;i<EN;++i)tl[i]/=float(sum);
+        }
+        std::vector<std::uint32_t> idx(EN);
+        std::iota(idx.begin(),idx.end(),0u);
+        std::partial_sort(idx.begin(),idx.begin()+EK,idx.end(),[&](std::uint32_t a,std::uint32_t b){return tl[a]>tl[b];});
+        if(config_.moe_norm_w){
+            double wsum=0.0;for(std::size_t i=0;i<EK;++i)wsum+=tl[idx[i]];
+            if(!(wsum>0.0))return false;
+            for(std::size_t i=0;i<EK;++i)tl[idx[i]]=float(tl[idx[i]]/wsum);
+        }
+        for(std::size_t i=0;i<EK;++i){
+            const std::uint32_t e=idx[i];
+            const float w=float(tl[e])*config_.moe_w_scale;
+            Tensor su=*gu,sd=*de;
+            su.raw=gu->raw+std::size_t(e)*(2*EF*rbf);
+            sd.raw=de->raw+std::size_t(e)*(E*rbd);
+            std::vector<float> mid(2*EF),h(EF),o(E);
+            if(!tensor_matvec(su,normed.data()+t*E,mid.data(),2*EF,E))return false;
+            for(std::size_t k=0;k<EF;++k){const float g=mid[k];const float tt=0.79788456f*(g+0.044715f*g*g*g);h[k]=0.5f*g*(1.0f+std::tanh(tt))*mid[EF+k];}
+            if(!tensor_matvec(sd,h.data(),o.data(),E,EF))return false;
+            float ds=dscale&&dscale->values.size()>e?dscale->values[e]:1.0f;
+            for(std::size_t k=0;k<E;++k)acc[t*E+k]+=w*ds*o[k];
+        }
+    }
+    // post-norm on the moe output
+    const auto* pn2=tensor(prefix+"post_ffw_norm_2.weight");
+    if(!pn2||!pn2->values.size())return false;
+    {
+        std::vector<float> pn(T*E);
+        for(std::size_t t=0;t<T;++t)rms_norm(acc.data()+t*E,pn2->values.data(),pn.data()+t*E,E,config_.rms_epsilon);
+        for(std::size_t i=0;i<T*E;++i)x[i]+=pn[i];
+    }
+    return finite_values(x,T*E);
+}
+
+bool DenseTransformerRuntime::nemotron_moe_forward(const std::string& prefix, const float* norm, float* x,
+        std::size_t T) const{
+    // llama.cpp nemotron-h build_ffn_layer MoE branch:
+    //   router = ffn_gate_inp(cur); probs = sigmoid(router); sel = probs + bias
+    //   weights = probs[topk(sel)]; optionally normalize to sum 1, then * w_scale
+    //   expert e: down_e(relu_sq(up_e(latent)))     (no gate tensor)
+    //   latent = ffn_latent_down(cur) or cur; out = ffn_latent_up(moe) or moe
+    //   shexp = down_s(relu_sq(up_s(cur))); total = moe_out + shexp + residual
+    const auto* router=tensor(prefix+"ffn_gate_inp.weight");
+    const auto* ue=tensor(prefix+"ffn_up_exps.weight");
+    const auto* de=tensor(prefix+"ffn_down_exps.weight");
+    if(!router||!ue||!de)return false;
+    const std::size_t E=config_.embedding;
+    const std::size_t EN=config_.moe_expert_count,EK=config_.moe_used_count;
+    if(ue->dims.size()!=3||de->dims.size()!=3)return false;
+    const std::size_t EF=ue->dims[1];
+    if(ue->dims[2]!=EN||de->dims[2]!=EN)return false;
+    const auto* ld=tensor(prefix+"ffn_latent_down.weight");
+    const auto* lu=tensor(prefix+"ffn_latent_up.weight");
+    const std::size_t LW=ld?ld->elements/E:E;
+    // latent input (router always reads norm)
+    std::vector<float> latent(T*LW);
+    if(ld){if(!tensor_gemm(*ld,norm,latent.data(),T,LW,E))return false;}
+    else{std::copy_n(norm,T*E,latent.data());}
+    std::vector<float> rlogits(T*EN);
+    for(std::size_t t=0;t<T;++t)if(!tensor_matvec(*router,norm+t*E,rlogits.data()+t*EN,EN,E))return false;
+    const auto* bias_t=tensor(prefix+"ffn_exp_probs_b.bias");
+    if(!bias_t)bias_t=tensor(prefix+"ffn_exp_probs_b");
+    std::vector<float> bias_vec(EN,0.0f);
+    if(bias_t){
+        if(bias_t->values.size()==EN)bias_vec=bias_t->values;
+        else if(bias_t->raw&&bias_t->format){std::vector<float> tmpv(EN);if(!quant::dequantize(*bias_t->format,bias_t->raw,EN,tmpv.data(),1.0f))return false;bias_vec=std::move(tmpv);}
+    }
+    std::vector<float> acc(T*LW,0.0f);
+    const auto rbu=quant::row_bytes(*ue->format,LW),rbd=quant::row_bytes(*de->format,EF);
+    if(!rbu||!rbd)return false;
+    for(std::size_t t=0;t<T;++t){
+        float* tl=rlogits.data()+t*EN;
+        std::vector<float> probs(EN),sel(EN);
+        for(std::size_t i=0;i<EN;++i){probs[i]=1.0f/(1.0f+std::exp(-tl[i]));sel[i]=probs[i]+bias_vec[i];}
+        std::vector<std::uint32_t> idx(EN);
+        std::iota(idx.begin(),idx.end(),0u);
+        std::partial_sort(idx.begin(),idx.begin()+EK,idx.end(),[&](std::uint32_t a,std::uint32_t b){return sel[a]>sel[b];});
+        if(config_.moe_norm_w){
+            double wsum=0.0;
+            for(std::size_t i=0;i<EK;++i)wsum+=probs[idx[i]];
+            const float inv=1.0f/std::max(float(wsum),6.103515625e-5f);
+            for(std::size_t i=0;i<EK;++i)probs[idx[i]]*=inv;
+        }
+        for(std::size_t i=0;i<EK;++i){
+            const std::uint32_t e=idx[i];
+            const float w=probs[e]*config_.moe_w_scale;
+            Tensor su=*ue,sd=*de;
+            su.raw=ue->raw+std::size_t(e)*(EF*rbu);
+            sd.raw=de->raw+std::size_t(e)*(LW*rbd);
+            std::vector<float> h(EF),o(LW);
+            if(!tensor_matvec(su,latent.data()+t*LW,h.data(),EF,LW))return false;
+            for(std::size_t k=0;k<EF;++k){const float v=h[k];h[k]=(v>0.0f)?v*v:0.0f;}
+            if(!tensor_matvec(sd,h.data(),o.data(),LW,EF))return false;
+            for(std::size_t k=0;k<LW;++k)acc[t*LW+k]+=w*o[k];
+        }
+    }
+    std::vector<float> moe_out(T*E);
+    if(lu){if(!tensor_gemm(*lu,acc.data(),moe_out.data(),T,E,LW))return false;}
+    else{std::copy_n(acc.begin(),T*E,moe_out.begin());}
+    const auto* sh_up=tensor(prefix+"ffn_up_shexp.weight");
+    const auto* sh_dn=tensor(prefix+"ffn_down_shexp.weight");
+    if(sh_up&&sh_dn){
+        const std::size_t SFEF=sh_up->elements/E;
+        std::vector<float> sh(T*SFEF),sh_o(T*E);
+        if(!tensor_gemm(*sh_up,norm,sh.data(),T,SFEF,E))return false;
+        for(std::size_t i=0;i<T*SFEF;++i){const float v=sh[i];sh[i]=(v>0.0f)?v*v:0.0f;}
+        if(!tensor_gemm(*sh_dn,sh.data(),sh_o.data(),T,E,SFEF))return false;
+        for(std::size_t i=0;i<T*E;++i)moe_out[i]+=sh_o[i];
+    }
+    for(std::size_t i=0;i<T*E;++i)x[i]+=moe_out[i];
+    return finite_values(x,T*E);
+}
+
 bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& tokens,
         std::vector<std::vector<float>>& kc,std::vector<std::vector<float>>& vc,
-        std::vector<float>& logits,std::uint32_t start_pos,std::size_t tail_count,std::vector<float>* tail_logits)const{
+        std::vector<float>& logits,std::uint32_t start_pos,std::size_t tail_count,std::vector<float>* tail_logits,
+        std::vector<std::vector<float>>* nem_conv,std::vector<std::vector<float>>* nem_state)const{
     const std::size_t T=tokens.size(),E=config_.embedding,H=config_.heads,KH=config_.kv_heads,D=config_.head_dim,F=config_.ffn;
     if(!T||start_pos>config_.context||T>config_.context-start_pos||tail_count==0||tail_count>T)return false;
     
@@ -1344,6 +2311,7 @@ bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& to
     for(std::size_t t=0;t<T;++t){if(tokens[t]>=config_.vocab)return false;
         if(emb->raw&&emb->format){const auto rb=quant::row_bytes(*emb->format,E);if(!rb||!quant::dequantize(*emb->format,emb->raw+std::size_t(tokens[t])*rb,E,x.data()+t*E))return false;}
         else if(emb->values.size()==std::size_t(config_.vocab)*E)std::copy_n(emb->values.data()+std::size_t(tokens[t])*E,E,x.data()+t*E);else return false;
+        if(config_.gemma_variant){const float s=config_.emb_scale;for(std::size_t i=0;i<E;++i)x[t*E+i]*=s;}
     }
     // Prefill RoPE tables: [tokens * pairs], token-major, built ONCE per
     // forward_batch (positions start_pos..start_pos+T-1, layer-independent). The
@@ -1372,26 +2340,24 @@ bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& to
 #endif
     static const bool rope_cpu_disallowed = []{const char* e=std::getenv("ZEN_CPU_ROPE");return e&&e[0]=='0';}();
     // Prefill elementwise on the GPU (RMSNorm, SiLU, residuals, device-resident
-    // FFN). Default OFF: the CPU path below is unchanged when unset.
-    //   ZEN_D3D12_PREFILL_GPU=1   opt in: attn/output RMSNorm via
-    //                             zen::d3d12::rms_norm, the whole FFN half
-    //                             (attn_output GEMM, both residuals, FFN norm,
-    //                             gate|up, SiLU, down) via the device-resident
-    //                             zen::d3d12::ffn_prefill_fused in ONE submit
-    //                             per layer instead of 4 GEMM submits plus a
-    //                             CPU SiLU and two CPU adds.
-    // T<16 stays on the host path: speculative verify batches (T=4..8) and
-    // short prompts keep the bit-identical single-GEMM route, and the fused
-    // working buffers only amortise over multi-token prefills.
-    // Any GPU failure (backend absent, non-Q8 weights, BitNet subln, shape
-    // guards) falls back to the host path below per layer, never fails.
+    // FFN). Default ON (ZEN_D3D12_PREFILL_GPU=0 opts out): attn/output RMSNorm
+    // via zen::d3d12::rms_norm, the whole FFN half via
+    // zen::d3d12::ffn_prefill_fused in ONE submit per layer instead of 4 GEMM
+    // submits plus a CPU SiLU and two CPU adds. Cuts submits 916->368 and
+    // fence wait ~44% at T=32. T<16 stays on the host path: speculative verify
+    // batches (T=4..8) and short prompts keep the bit-identical single-GEMM
+    // route. Any GPU failure falls back to the host path per layer.
 #if defined(ZEN_HAS_D3D12)
-    static const bool prefill_gpu_on = []{const char* e=std::getenv("ZEN_D3D12_PREFILL_GPU");return e&&e[0]=='1';}();
-    const bool use_prefill_gpu = prefill_gpu_on&&T>=16;
+    static const bool prefill_gpu_on = []{const char* e=std::getenv("ZEN_D3D12_PREFILL_GPU");return !(e&&e[0]=='0');}();
+    const bool use_prefill_gpu = prefill_gpu_on&&T>=16&&config_.moe_expert_count==0;
 #endif
     std::vector<float> prefill_cos,prefill_sin;
     std::size_t prefill_pairs=0;
     bool prefill_tables_built=false;
+    // Gemma4: two head-dim classes (full/SWA) use different rotary dims and
+    // bases. Tables are built lazily per distinct (rd, base) pair.
+    std::vector<std::vector<float>> prefill_cos_by_rd, prefill_sin_by_rd; // indexed by (D_l==512)
+    std::vector<std::size_t> prefill_pairs_by_rd;
     std::future<void> prefetch;
     for(std::uint32_t l=0;l<config_.layers;++l){if(prefetch.valid())prefetch.get();if(l+1<config_.layers&&prefetch_enabled_)prefetch=std::async(std::launch::async,[this,l]{prefetch_layer(l+1);});const std::string p="blk."+std::to_string(l)+".";
         // Host copy of the attention norm only for decode and for the host fallback:
@@ -1403,7 +2369,7 @@ bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& to
             if(use_prefill_gpu)attn_norm_gpu=zen::d3d12::rms_norm(x.data(),tensor(p+"attn_norm.weight")->values.data(),norm.data(),T,E,config_.rms_epsilon);
 #endif
             {zen::diag::Scope san("prefill.attn_norm",zen::diag::Phase::compute);
-            if(!attn_norm_gpu)for(std::size_t t=0;t<T;++t)rms_norm(x.data()+t*E,tensor(p+"attn_norm.weight")->values.data(),norm.data()+t*E,E,config_.rms_epsilon);}
+            if(!attn_norm_gpu)for(std::size_t t=0;t<T;++t){const auto* aw=tensor(p+"attn_norm.weight");const auto* ab=tensor(p+"attn_norm.bias");if(config_.layernorm_variant){if(!ab)return false;layernorm(x.data()+t*E,aw->values.data(),ab->values.data(),norm.data()+t*E,E,config_.rms_epsilon);}else if(config_.k2_variant)group_rms_norm(x.data()+t*E,aw->values.data(),norm.data()+t*E,E,config_.group_norm_groups,config_.rms_epsilon);else rms_norm(x.data()+t*E,aw->values.data(),norm.data()+t*E,E,config_.rms_epsilon);}}
             return finite_values(norm.data(),norm.size());
         };
         if(T==1&&!compute_attn_norm())return false;
@@ -1428,13 +2394,373 @@ bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& to
         }
         bool front_done=false;
         bool ffn_fused_done=false;
-        if(T==1){
+        bool gemma_attn_done=false;
+        if(config_.spark2_5_variant){
+            // Spark-X2.5 dedicated attention (llama.cpp spark2-5.cpp): fused
+            // attn_qkv (Q|K|V in one projection), per-layer rope (SWA: dim
+            // 256/base 1e4/window 512; full: partial 64 of 256/base 5e6),
+            // attention with matched SWA mask, sigmoid per-head gate into
+            // Wo, then Wo + residual. Shared rope/kv/attention/output
+            // sections skipped via front_done + gemma_attn_done.
+            const std::size_t Dk=config_.head_dim;
+            const std::size_t QWl=std::size_t(H)*Dk;
+            const std::size_t KWl=std::size_t(KH)*Dk;
+            const bool sw_l=l<config_.swa_pattern.size()&&config_.swa_pattern[l];
+            const std::uint32_t rd=sw_l?config_.rope_dim_swa:config_.rope_dim;
+            const float base=sw_l?config_.rope_base_swa:config_.rope_base;
+            const std::size_t win=sw_l?config_.sliding_window:0; // 0 => full
+            const auto* qkv_=tensor(p+"attn_qkv.weight");
+            const auto* wo_=tensor(p+"attn_output.weight");
+            const auto* gt2=tensor(p+"attn_gate.weight");
+            if(!qkv_||!wo_||!gt2)return false;
+            if(!compute_attn_norm())return false;
+            std::vector<float> qkvf(T*(QWl+2*KWl));
+            if(!tensor_gemm(*qkv_,norm.data(),qkvf.data(),T,QWl+2*KWl,E))return false;
+            for(std::size_t t=0;t<T;++t){
+                std::copy_n(qkvf.data()+t*(QWl+2*KWl),QWl,q.data()+t*QW);
+                std::copy_n(qkvf.data()+t*(QWl+2*KWl)+QWl,KWl,k.data()+t*KW);
+                std::copy_n(qkvf.data()+t*(QWl+2*KWl)+QWl+KWl,KWl,v.data()+t*KW);
+            }
+            for(std::size_t t=0;t<T;++t){
+                const std::uint32_t pos=start_pos+static_cast<std::uint32_t>(t);
+                std::vector<float> tc,ts;
+                rope_table(rd,pos,base,config_.rope_scaling_type,config_.rope_scaling_factor,config_.rope_original_context,config_.rope_low_freq_factor,config_.rope_high_freq_factor,config_.rope_yarn_beta_fast,config_.rope_yarn_beta_slow,tc,ts);
+                rope_apply_table(q.data()+t*QW,H,Dk,rd/2,tc.data(),ts.data(),config_.rope_pairs_adjacent);
+                rope_apply_table(k.data()+t*KW,KH,Dk,rd/2,tc.data(),ts.data(),config_.rope_pairs_adjacent);
+                std::memcpy(kc[l].data()+std::size_t(pos)*KW,k.data()+t*KW,KW*sizeof(float));
+                std::memcpy(vc[l].data()+std::size_t(pos)*KW,v.data()+t*KW,KW*sizeof(float));
+            }
+            {zen::diag::Scope sa("transformer.prefill.attention",zen::diag::Phase::compute);
+            std::fill(att.begin(),att.end(),0.0f);
+            const float ascale=config_.attn_scale>0?config_.attn_scale:1.0f/std::sqrt(float(Dk));
+            for(std::size_t t=0;t<T;++t){
+                const std::uint32_t pos=start_pos+static_cast<std::uint32_t>(t);
+                const std::size_t first=win&&std::size_t(pos)+1>win?std::size_t(pos)+1-win:0;
+                for(std::size_t h=0;h<H;++h){
+                    const std::uint32_t kh=h*KH/H;
+                    const float* qh=q.data()+t*QWl+std::size_t(h)*Dk;
+                    float mx=-std::numeric_limits<float>::infinity();
+                    std::vector<float> scores(std::size_t(pos)+1-first);
+                    for(std::size_t j=first;j<=pos;++j){
+                        const float* kt=kc[l].data()+j*KW+std::size_t(kh)*Dk;
+                        float dot=0.0f;for(std::size_t i=0;i<Dk;++i)dot+=qh[i]*kt[i];
+                        scores[j-first]=dot*ascale;mx=std::max(mx,scores[j-first]);
+                    }
+                    double denom=0.0;
+                    for(std::size_t n=0;n<scores.size();++n){scores[n]=std::exp(scores[n]-mx);denom+=scores[n];}
+                    if(!(denom>0.0)||!std::isfinite(denom))return false;
+                    float* out=att.data()+t*QWl+std::size_t(h)*Dk;
+                    for(std::size_t j=first;j<=pos;++j){
+                        const float a=scores[j-first]/float(denom);
+                        const float* vt=vc[l].data()+j*KW+std::size_t(kh)*Dk;
+                        for(std::size_t i=0;i<Dk;++i)out[i]+=a*vt[i];
+                    }
+                }
+            }
+            }
+            // Sigmoid per-head attention gate (wqkv_gate), applied to the
+            // attention output BEFORE wo.
+            {
+                std::vector<float> gate(T*H);
+                if(!tensor_gemm(*gt2,norm.data(),gate.data(),T,H,E))return false;
+                for(std::size_t t=0;t<T;++t)for(std::size_t h=0;h<H;++h){
+                    const float g=gate[t*H+h];
+                    const float sp=1.0f/(1.0f+std::exp(-g));
+                    float* o=att.data()+t*QWl+std::size_t(h)*Dk;
+                    for(std::size_t i=0;i<Dk;++i)o[i]*=sp;
+                }
+            }
+            if(!tensor_gemm(*wo_,att.data(),tmp.data(),T,E,QWl))return false;
+            for(std::size_t i=0;i<T*E;++i)x[i]+=tmp[i];
+            if(!finite_values(x.data(),x.size()))return false;
+            gemma_attn_done=true;
+            front_done=true;
+        }else if(config_.deepseek_variant){
+            // DeepSeek MLA attention (llama.cpp deepseek2.cpp, is_mla path):
+            //   Q = attn_q(normed) [T, H*Dk]; per head: q_nope [nope] + q_pe
+            //   [rope_dim]; rope rotates the trailing q_pe part only (llama
+            //   adjacent pairs over rope_dim).
+            //   KVA = attn_kv_a_mqa(normed) [T, rank+rope_dim]: latent =
+            //   first rank, k_pe = last rope_dim; rope on k_pe.
+            //   latent rms-normed (attn_kv_a_norm); cache stores latent in
+            //   kc and k_pe in vc (stride KW = kv_heads*head_dim, same as
+            //   the shared path, so generate() sizing stays untouched).
+            //   K/V decompressed per head via attn_kv_b
+            //   ([rank, H*(nope+Dv)] head-major: [nope | Dv] per head):
+            //   score[h,j] = (q_nope[h]·k_nope[j,h] + q_pe[h]·k_pe[j]) /
+            //   sqrt(Dk); out[h] = Σ_j softmax * v[j,h]; then attn_output
+            //   [E x H*Dv] + residual. Shared rope/kv/attention/output
+            //   sections skipped via front_done + gemma_attn_done.
+            const std::size_t Dk=config_.head_dim;
+            const std::size_t nope=Dk-config_.rope_dim;
+            const std::size_t rank=config_.kv_lora_rank;
+            const std::size_t L=rank+config_.rope_dim;
+            const auto* tq_=tensor(p+"attn_q.weight");
+            const auto* tkv_=tensor(p+"attn_kv_a_mqa.weight");
+            const auto* kna_=tensor(p+"attn_kv_a_norm.weight");
+            const auto* kvb_=tensor(p+"attn_kv_b.weight");
+            const auto* tkb_=tensor(p+"attn_k_b.weight");  // split (GLM-style)
+            const auto* tvb_=tensor(p+"attn_v_b.weight");  // split (GLM-style)
+            const auto* wo_=tensor(p+"attn_output.weight");
+            const bool split=(tkb_!=nullptr&&tvb_!=nullptr);
+            if(!tkv_||!kna_||!wo_||(!tq_&&!tensor(p+"attn_q_a.weight"))||(!kvb_&&!split))return false;
+            std::size_t Dv=0,KVB_W=0;
+            if(split){
+                Dv=tvb_->elements/(rank*std::size_t(H));
+                if(!Dv)return false;
+            }else{
+                const std::size_t HBD=kvb_->elements/(rank*std::size_t(H)); // nope+Dv
+                if(!HBD||HBD<=nope)return false;
+                Dv=HBD-nope;
+                KVB_W=std::size_t(H)*HBD;
+            }
+            const std::size_t QW_=std::size_t(H)*Dk;
+            const std::size_t HDv=std::size_t(H)*Dv;
+            // MLA cache row width: latent + k_pe (576), not KW (GLM: 256).
+            const std::size_t MLS=rank+config_.rope_dim;
+            if(!compute_attn_norm())return false;
+            if(tq_){if(!tensor_gemm(*tq_,norm.data(),q.data(),T,QW_,E))return false;}
+            else{
+                // GLM-style q_lora: norm(q_a(normed)) via q_b.
+                const auto* qqa=tensor(p+"attn_q_a.weight");
+                const auto* qqb=tensor(p+"attn_q_b.weight");
+                const auto* qqn=tensor(p+"attn_q_a_norm.weight");
+                if(!qqa||!qqb||!qqn)return false;
+                const std::size_t qlora=qqa->elements/E;
+                std::vector<float> qa(T*qlora);
+                if(!tensor_gemm(*qqa,norm.data(),qa.data(),T,qlora,E))return false;
+                for(std::size_t t=0;t<T;++t)rms_norm(qa.data()+t*qlora,qqn->values.data(),qa.data()+t*qlora,qlora,config_.rms_epsilon);
+                if(!tensor_gemm(*qqb,qa.data(),q.data(),T,QW_,qlora))return false;
+            }
+            std::vector<float> kva(T*L),lat(T*rank);
+            if(!tensor_gemm(*tkv_,norm.data(),kva.data(),T,L,E))return false;
+            for(std::size_t t=0;t<T;++t){
+                const std::uint32_t pos=start_pos+static_cast<std::uint32_t>(t);
+                rms_norm(kva.data()+t*L,kna_->values.data(),lat.data()+t*rank,rank,config_.rms_epsilon);
+                std::vector<float> tc,ts;
+                rope_table(config_.rope_dim,pos,config_.rope_base,config_.rope_scaling_type,config_.rope_scaling_factor,config_.rope_original_context,config_.rope_low_freq_factor,config_.rope_high_freq_factor,config_.rope_yarn_beta_fast,config_.rope_yarn_beta_slow,tc,ts);
+                for(std::size_t h=0;h<H;++h){
+                    float* pe=q.data()+t*QW_+h*Dk+nope;
+                    for(std::size_t i=0;i<tc.size();++i){
+                        const float a=pe[2*i],b=pe[2*i+1];
+                        pe[2*i]=a*tc[i]-b*ts[i];
+                        pe[2*i+1]=a*ts[i]+b*tc[i];
+                    }
+                }
+                float* ke=kva.data()+t*L+rank;
+                for(std::size_t i=0;i<tc.size();++i){
+                    const float a=ke[2*i],b=ke[2*i+1];
+                    ke[2*i]=a*tc[i]-b*ts[i];
+                    ke[2*i+1]=a*ts[i]+b*tc[i];
+                }
+                if(kc[l].size()<std::size_t(pos+1)*MLS||vc[l].size()<std::size_t(pos+1)*MLS)return false;
+                std::memcpy(kc[l].data()+std::size_t(pos)*MLS,lat.data()+t*rank,rank*sizeof(float));
+                std::memcpy(vc[l].data()+std::size_t(pos)*MLS,ke,config_.rope_dim*sizeof(float));
+            }
+            // K/V decompression (classic) or absorbed scoring (split GLM).
+            const std::size_t nT=start_pos+T;
+            std::vector<float> outHv(T*HDv,0.0f);
+            const float ascale=config_.attn_scale>0?config_.attn_scale:1.0f/std::sqrt(float(Dk));
+            if(split){
+                // Absorbed form (UPSTREAM-exact for GLM-style split files):
+                //   qabsorbed_h = attn_k_b[h]·q_nope_h          (rank-vector)
+                //   score_hj    = qabsorbed_h·latent_j + q_pe_h·k_pe_j
+                //   out_pre_h   = Σ_j softmax_j * latent_j
+                //   out_h       = attn_v_b[h]·out_pre_h
+                const auto rbfk=quant::row_bytes(*tkb_->format,nope);
+                const auto rbfv=quant::row_bytes(*tvb_->format,rank);
+                if(!rbfk||!rbfv)return false;
+                for(std::size_t t=0;t<T;++t){
+                    for(std::size_t h=0;h<H;++h){
+                        const float* qnope=q.data()+t*QW_+h*Dk;
+                        const float* qpe=q.data()+t*QW_+h*Dk+nope;
+                        Tensor subk=*tkb_;
+                        subk.raw=tkb_->raw+std::size_t(h)*(rank*nope)*rbfk/nope; // h*rank rows of nope floats
+                        subk.elements=rank*nope;
+                        std::vector<float> qabs(rank);
+                        if(!tensor_matvec(subk,qnope,qabs.data(),rank,nope))return false;
+                        float mx=-std::numeric_limits<float>::infinity();
+                        std::vector<float> scores(start_pos+t+1);
+                        for(std::size_t j=0;j<start_pos+t+1;++j){
+                            const float* lat_j=kc[l].data()+j*MLS;
+                            const float* kpe_j=vc[l].data()+j*MLS;
+                            float dot=0.0f;
+                            for(std::size_t i=0;i<rank;++i)dot+=qabs[i]*lat_j[i];
+                            for(std::size_t i=0;i<config_.rope_dim;++i)dot+=qpe[i]*kpe_j[i];
+                            scores[j]=dot*ascale;mx=std::max(mx,scores[j]);
+                        }
+                        double denom=0.0;
+                        for(std::size_t j=0;j<start_pos+t+1;++j){scores[j]=std::exp(scores[j]-mx);denom+=scores[j];}
+                        if(!(denom>0.0)||!std::isfinite(denom))return false;
+                        std::vector<float> out_pre(rank,0.0f);
+                        for(std::size_t j=0;j<start_pos+t+1;++j){
+                            const float a=scores[j]/float(denom);
+                            const float* lat_j=kc[l].data()+j*MLS;
+                            for(std::size_t i=0;i<rank;++i)out_pre[i]+=a*lat_j[i];
+                        }
+                        Tensor subv=*tvb_;
+                        subv.raw=tvb_->raw+std::size_t(h)*(Dv*rank)*rbfv/rank; // h*Dv rows of rank floats
+                        subv.elements=Dv*rank;
+                        if(!tensor_matvec(subv,out_pre.data(),outHv.data()+t*HDv+h*Dv,Dv,rank))return false;
+                    }
+                }
+            }else{
+                std::vector<float> latt(nT*rank),kvb(nT*KVB_W,0.0f);
+                for(std::size_t j=0;j<nT;++j)std::memcpy(latt.data()+j*rank,kc[l].data()+j*MLS,rank*sizeof(float));
+                if(!tensor_gemm(*kvb_,latt.data(),kvb.data(),nT,KVB_W,rank))return false;
+                const std::size_t HBD=KVB_W/std::size_t(H);
+                for(std::size_t t=0;t<T;++t){
+                    for(std::size_t h=0;h<H;++h){
+                        const float* qnope=q.data()+t*QW_+h*Dk;
+                        const float* qpe=q.data()+t*QW_+h*Dk+nope;
+                        float mx=-std::numeric_limits<float>::infinity();
+                        std::vector<float> scores(start_pos+t+1);
+                        for(std::size_t j=0;j<start_pos+t+1;++j){
+                            const float* ksj=kvb.data()+j*KVB_W+h*HBD;
+                            const float* kpe_j=vc[l].data()+j*MLS;
+                            float dot=0.0f;
+                            for(std::size_t i=0;i<nope;++i)dot+=qnope[i]*ksj[i];
+                            for(std::size_t i=0;i<config_.rope_dim;++i)dot+=qpe[i]*kpe_j[i];
+                            scores[j]=dot*ascale;mx=std::max(mx,scores[j]);
+                        }
+                        double denom=0.0;
+                        for(std::size_t j=0;j<start_pos+t+1;++j){scores[j]=std::exp(scores[j]-mx);denom+=scores[j];}
+                        if(!(denom>0.0)||!std::isfinite(denom))return false;
+                        float* out=outHv.data()+t*HDv+h*Dv;
+                        for(std::size_t j=0;j<start_pos+t+1;++j){
+                            const float a=scores[j]/float(denom);
+                            const float* vj=kvb.data()+j*KVB_W+h*HBD+nope;
+                            for(std::size_t i=0;i<Dv;++i)out[i]+=a*vj[i];
+                        }
+                    }
+                }
+            }
+            if(!tensor_gemm(*wo_,outHv.data(),tmp.data(),T,E,HDv))return false;
+            for(std::size_t i=0;i<T*E;++i)x[i]+=tmp[i];
+            if(!finite_values(x.data(),x.size()))return false;
+            gemma_attn_done=true;  // shared rope/kv/attention/output skipped
+            front_done=true;
+        }else if(config_.gemma_variant){
+            // Gemma4 dedicated attention (llama.cpp gemma4.cpp): per-layer
+            // head dims (full 512 / SWA 256), v = k when attn_v absent,
+            // per-head q/k RMS norms, dual-base rope (1e6 full / 1e4 SWA),
+            // attention scale 1.0, KV cache with per-layer stride, then
+            // post-norm + residual. Wrote q/k/v/attn buffers and KV cache;
+            // shared rope/attention sections are skipped via gemma_attn_done.
+            const std::size_t D_l=config_.head_dim_per_layer.empty()?D:config_.head_dim_per_layer[l];
+            const std::size_t QW_l=std::size_t(H)*D_l;
+            const auto* tq_=tensor(p+"attn_q.weight");
+            const auto* tk_=tensor(p+"attn_k.weight");
+            const auto* tv_=tensor(p+"attn_v.weight");
+            const std::size_t KW_l=tk_->elements/E;
+            const std::uint32_t KH_l=static_cast<std::uint32_t>(KW_l/D_l);
+            if(!compute_attn_norm())return false;
+            if(!tensor_gemm(*tq_,norm.data(),q.data(),D_l?T:T,QW_l,E))return false;
+            if(!tensor_gemm(*tk_,norm.data(),k.data(),T,KW_l,E))return false;
+            if(tv_){if(!tensor_gemm(*tv_,norm.data(),v.data(),T,KW_l,E))return false;}
+            else{for(std::size_t t=0;t<T;++t)std::copy_n(k.data()+t*KW_l,KW_l,v.data()+t*KW_l);}
+            // Gemma4: V gets a weightless per-head RMS-norm before rope/attention.
+            if(tv_){for(std::size_t t=0;t<T;++t)for(std::size_t h=0;h<KH_l;++h){float* vh=v.data()+t*KW_l+std::size_t(h)*D_l;double ss=0.0;for(std::size_t i=0;i<D_l;++i)ss+=double(vh[i])*vh[i];const float inv=1.0f/std::sqrt(float(ss/D_l)+config_.rms_epsilon);for(std::size_t i=0;i<D_l;++i)vh[i]*=inv;}}
+            const auto* qn=tensor(p+"attn_q_norm.weight");const auto* kn=tensor(p+"attn_k_norm.weight");
+            if(!qn||!kn)return false;
+            const std::uint32_t rd_l=static_cast<std::uint32_t>(D_l);
+            const float base_l=(D_l==512)?1.0e6f:1.0e4f;
+            for(std::size_t t=0;t<T;++t){
+                qk_rms_norm(q.data()+t*QW_l,H,(std::uint32_t)D_l,qn->values.data(),config_.rms_epsilon);
+                qk_rms_norm(k.data()+t*KW_l,KH_l,(std::uint32_t)D_l,kn->values.data(),config_.rms_epsilon);
+                std::vector<float> tc,ts;
+                const std::uint32_t pos=start_pos+static_cast<std::uint32_t>(t);
+                rope_table(rd_l,pos,base_l,config_.rope_scaling_type,config_.rope_scaling_factor,config_.rope_original_context,config_.rope_low_freq_factor,config_.rope_high_freq_factor,config_.rope_yarn_beta_fast,config_.rope_yarn_beta_slow,tc,ts);
+                rope_apply_table(q.data()+t*QW_l,H,(std::uint32_t)D_l,rd_l/2,tc.data(),ts.data(),config_.rope_pairs_adjacent);
+                rope_apply_table(k.data()+t*KW_l,KH_l,(std::uint32_t)D_l,rd_l/2,tc.data(),ts.data(),config_.rope_pairs_adjacent);
+                std::memcpy(kc[l].data()+std::size_t(pos)*KW_l,k.data()+t*KW_l,KW_l*sizeof(float));
+                std::memcpy(vc[l].data()+std::size_t(pos)*KW_l,v.data()+t*KW_l,KW_l*sizeof(float));
+            }
+            std::vector<float> pan(T*E);
+            (void)pan;
+            {zen::diag::Scope sa("transformer.prefill.attention",zen::diag::Phase::compute);
+            std::fill(att.begin(),att.begin()+T*QW_l,0.0f);
+            // Per-head GQA attention (causal). Operates over the buffers
+            // packed at per-layer stride for this layer only.
+            const float ascale=config_.attn_scale>0?config_.attn_scale:1.0f;
+            for(std::size_t t=0;t<T;++t){
+                for(std::uint32_t h=0;h<H;++h){
+                    const std::uint32_t kh=h*KH_l/H;
+                    float mx=-std::numeric_limits<float>::infinity();
+                    std::vector<float> scores(start_pos+t+1);
+                    for(std::size_t j=0;j<start_pos+t+1;++j){
+                        const float* qh=q.data()+t*QW_l+std::size_t(h)*D_l;
+                        const float* kt=kc[l].data()+j*KW_l+std::size_t(kh)*D_l;
+                        float dot=0.0f;for(std::size_t i=0;i<D_l;++i)dot+=qh[i]*kt[i];
+                        scores[j]=dot*ascale;mx=std::max(mx,scores[j]);
+                    }
+                    double denom=0.0;for(std::size_t j=0;j<start_pos+t+1;++j){scores[j]=std::exp(scores[j]-mx);denom+=scores[j];}
+                    if(!(denom>0.0))return false;
+                    float* out=att.data()+t*QW_l+std::size_t(h)*D_l;
+                    for(std::size_t j=0;j<start_pos+t+1;++j){
+                        const float a=scores[j]/float(denom);
+                        const float* vt=vc[l].data()+j*KW_l+std::size_t(kh)*D_l;
+                        for(std::size_t i=0;i<D_l;++i)out[i]+=a*vt[i];
+                    }
+                }
+            }
+            }
+            if(!tensor_gemm(*tensor(p+"attn_output.weight"),att.data(),tmp.data(),T,E,QW_l))return false;
+            // capture raw output for the MoE router/norm path (gemma-MoE)
+            std::vector<float> moe_attn_out(T*E);
+            std::copy_n(tmp.data(),T*E,moe_attn_out.begin());
+            const auto* pan_t=tensor(p+"post_attention_norm.weight");
+            if(!pan_t||!pan_t->values.size())return false;
+            for(std::size_t t=0;t<T;++t)rms_norm(tmp.data()+t*E,pan_t->values.data(),tmp.data()+t*E,E,config_.rms_epsilon);
+            for(std::size_t i=0;i<T*E;++i)x[i]+=tmp[i];
+            if(config_.moe_gemma&&tensor(p+"ffn_gate_up_exps.weight")){
+                if(!gemma_moe_forward(p,moe_attn_out.data(),x.data(),T))return false;
+            }
+            gemma_attn_done=true;
+            front_done=true;
+        }
+        else if(T==1){
             // Decode: Q, K and V share the normed input, so submitting them as one
             // batch replaces two extra queue round trips (~70us each) per layer.
-            const DenseTransformerRuntime::Tensor* const qkv_t[3]={tensor(p+"attn_q.weight"),tensor(p+"attn_k.weight"),tensor(p+"attn_v.weight")};
-            float* const qkv_y[3]={q.data(),k.data(),v.data()};
-            const std::size_t qkv_r[3]={QW,KW,KW};
-            if(!tensor_matvec_batch(qkv_t,norm.data(),qkv_y,qkv_r,3,E))return false;
+            // Shortconv/SSM layers have no QKV tensors: zero the buffers instead
+            // (attention of zeros is zeros; shortconv/SSM mix ran above).
+            if(tensor(p+"ssm_in.weight")){
+                if(!compute_attn_norm())return false;
+                if(!nem_conv||!nem_state)return false;
+                if(!mamba2_forward(p,norm.data(),x.data(),1,(*nem_conv)[l],(*nem_state)[l]))return false;
+                std::fill(q.begin(),q.end(),0.0f);
+                std::fill(k.begin(),k.end(),0.0f);
+                std::fill(v.begin(),v.end(),0.0f);
+            }else if(tensor(p+"shortconv.in_proj.weight")){
+                const auto* si=tensor(p+"shortconv.in_proj.weight");
+                const auto* sc=tensor(p+"shortconv.conv.weight");
+                const auto* so=tensor(p+"shortconv.out_proj.weight");
+                if(!si||!sc||!so)return false;
+                if(!compute_attn_norm())return false;
+                {
+                    std::vector<float> proj(3*E),conv_out(E),gated(E);
+                    if(!tensor_matvec(*si,norm.data(),proj.data(),3*E,E))return false;
+                    const float* cw=sc->values.empty()?nullptr:sc->values.data();
+                    if(!cw)return false;
+                    for(std::size_t c=0;c<E;++c){
+                        double sum=0.0;
+                        for(std::size_t k=0;k<3;++k)sum+=double(cw[c*3+k])*(k==2?proj[c]:0.0f);
+                        conv_out[c]=static_cast<float>(sum);
+                    }
+                    silu_inplace(conv_out.data(),E);
+                    for(std::size_t c=0;c<E;++c)gated[c]=conv_out[c]*proj[E+c]+proj[2*E+c];
+                    if(!tensor_matvec(*so,gated.data(),tmp.data(),E,E))return false;
+                    for(std::size_t i=0;i<E;++i)x[i]+=tmp[i];
+                }
+                std::fill(q.begin(),q.end(),0.0f);
+                std::fill(k.begin(),k.end(),0.0f);
+                std::fill(v.begin(),v.end(),0.0f);
+            }else{
+                const DenseTransformerRuntime::Tensor* const qkv_t[3]={tensor(p+"attn_q.weight"),tensor(p+"attn_k.weight"),tensor(p+"attn_v.weight")};
+                float* const qkv_y[3]={q.data(),k.data(),v.data()};
+                const std::size_t qkv_r[3]={QW,KW,KW};
+                if(!tensor_matvec_batch(qkv_t,norm.data(),qkv_y,qkv_r,3,E))return false;
+            }
         }else{
             // Prefill Q|K|V share the normed input: submit as one batched GEMM
             // when ZEN_D3D12_BATCH=1, otherwise tensor_gemm_batch loops the
@@ -1479,6 +2805,7 @@ bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& to
                     layer_fused=true;
                 }
                 if(!front_off&&front_flash_on&&(use_prefill_gpu||front_i8_on)&&!config_.use_alibi&&
+                   !config_.gemma_variant&&
                    config_.sliding_window==0&&!config_.bitnet_variant&&
                    prefill_pairs&&(fq==nullptr)==(fk==nullptr)&&
                    tensor(p+"attn_q.bias")==nullptr&&tensor(p+"attn_k.bias")==nullptr&&tensor(p+"attn_v.bias")==nullptr&&
@@ -1490,7 +2817,7 @@ bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& to
                             fq?fq->values.data():nullptr,fk?fk->values.data():nullptr,
                             T,H,KH,D,prefill_pairs,
                             config_.rope_pairs_adjacent,prefill_cos.data(),prefill_sin.data(),
-                            l,start_pos,config_.rms_epsilon,1.0f/std::sqrt(float(D)),&ffn_args);
+                            l,start_pos,config_.rms_epsilon,config_.attn_scale>0?config_.attn_scale:1.0f/std::sqrt(float(D)),&ffn_args);
                         if(front_done)ffn_fused_done=true;
                     }
                     // The layer-fused call declines before recording anything (it plans
@@ -1500,13 +2827,140 @@ bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& to
                         fq?fq->values.data():nullptr,fk?fk->values.data():nullptr,
                         T,H,KH,D,prefill_pairs,
                         config_.rope_pairs_adjacent,prefill_cos.data(),prefill_sin.data(),
-                        l,start_pos,config_.rms_epsilon,1.0f/std::sqrt(float(D)),nullptr);
+                        l,start_pos,config_.rms_epsilon,config_.attn_scale>0?config_.attn_scale:1.0f/std::sqrt(float(D)),nullptr);
                 }
             }
 #endif
             if(!front_done){
-                if(!compute_attn_norm())return false;
-                if(!tensor_gemm_batch(qkv_t,norm.data(),qkv_y,qkv_r,3,T,E))return false;
+                if(!gemma_attn_done){
+                    if(!compute_attn_norm())return false;
+                if(tensor(p+"ssm_in.weight")){
+                    // Mamba-2 recurrent layer (nemotron_h): exact ggml semantics
+                    // in mamba2_forward(); state persists across calls.
+                    if(!nem_conv||!nem_state)return false;
+                    if(!mamba2_forward(p,norm.data(),x.data(),T,(*nem_conv)[l],(*nem_state)[l]))return false;
+                    std::fill(q.begin(),q.end(),0.0f);
+                    std::fill(k.begin(),k.end(),0.0f);
+                    std::fill(v.begin(),v.end(),0.0f);
+                    std::fill(att.begin(),att.end(),0.0f);
+                }else if(tensor(p+"shortconv.in_proj.weight")){
+                    // Shortconv recurrent layer (lfm2moe): depthwise conv3
+                    // gated depthwise over the sequence. Documented as
+                    // best-effort gated conv (split 3E -> conv/gate/skip,
+                    // causal depthwise, SiLU*gate) pending the templated
+                    // models.h graph reference; CPU vs DX share this host
+                    // path so parity holds by construction.
+                    const auto* si=tensor(p+"shortconv.in_proj.weight");
+                    const auto* sc=tensor(p+"shortconv.conv.weight");
+                    const auto* so=tensor(p+"shortconv.out_proj.weight");
+                    if(!si||!sc||!so)return false;
+                    std::vector<float> proj(T*3*E),conv_out(T*E),gated(T*E);
+                    if(!tensor_gemm(*si,norm.data(),proj.data(),T,3*E,E))return false;
+                    const std::size_t CK=3;
+                    const float* cw=sc->values.empty()?nullptr:sc->values.data();
+                    if(!cw)return false;
+                    for(std::size_t t=0;t<T;++t){
+                        for(std::size_t c=0;c<E;++c){
+                            double sum=0.0;
+                            for(std::size_t k=0;k<CK;++k){
+                                const long idx=static_cast<long>(t)+(static_cast<long>(k)-(static_cast<long>(CK)-1));
+                                float xv=(idx>=0)?proj[static_cast<std::size_t>(idx)*3*E+c]:0.0f;
+                                // GGUF dims [3,2048]: ne0 (kernel) fastest.
+                                sum+=double(cw[c*CK+k])*xv;
+                            }
+                            conv_out[t*E+c]=static_cast<float>(sum);
+                        }
+                    }
+                    silu_inplace(conv_out.data(),T*E);
+                    // proj is token-major: proj[t*3E + chunk*E + c].
+                    for(std::size_t t=0;t<T;++t)for(std::size_t c=0;c<E;++c){
+                        gated[t*E+c]=conv_out[t*E+c]*proj[t*3*E+E+c]+proj[t*3*E+2*E+c];
+                    }
+                    if(!tensor_gemm(*so,gated.data(),tmp.data(),T,E,E))return false;
+                    for(std::size_t i=0;i<T*E;++i)x[i]+=tmp[i];
+                    // Shortconv layer: no attention. Zero q/k/v/att so the
+                    // shared attention+attn_output code below is a no-op
+                    // (attention of zeros is zeros) and FFN runs normally.
+                    std::fill(q.begin(),q.end(),0.0f);
+                    std::fill(k.begin(),k.end(),0.0f);
+                    std::fill(v.begin(),v.end(),0.0f);
+                    std::fill(att.begin(),att.end(),0.0f);
+                }else if(config_.phi3_variant){
+                    // Phi-3 fused attn_qkv: single GEMM into a dedicated
+                    // [T, QW+2KW] scratch ("tmp" is only T*E wide and would
+                    // overflow: the old code wrote it there and heap-corrupted
+                    // the following allocations - seen as 0xC0000374 on the
+                    // 2nd generated token of Phi-4).
+                    std::vector<float> qkvf(T*(QW+2*KW));
+                    if(!tensor_gemm(*tensor(p+"attn_qkv.weight"),norm.data(),qkvf.data(),T,QW+2*KW,E))return false;
+                    for(std::size_t t=0;t<T;++t){
+                        std::copy_n(qkvf.data()+t*(QW+2*KW),QW,q.data()+t*QW);
+                        std::copy_n(qkvf.data()+t*(QW+2*KW)+QW,KW,k.data()+t*KW);
+                        std::copy_n(qkvf.data()+t*(QW+2*KW)+QW+KW,KW,v.data()+t*KW);
+                    }
+                }else if(tensor(p+"attn_q.weight")&&!config_.k2_variant){
+                    const DenseTransformerRuntime::Tensor* const qkv_t[3]={tensor(p+"attn_q.weight"),tensor(p+"attn_k.weight"),tensor(p+"attn_v.weight")};
+                    float* const qkv_y[3]={q.data(),k.data(),v.data()};
+                    const std::size_t qkv_r[3]={QW,KW,KW};
+                    if(!tensor_gemm_batch(qkv_t,norm.data(),qkv_y,qkv_r,3,T,E))return false;
+                }
+                else if(config_.k2_variant){
+                    // K2-Horizon: Q/K are dense GEMMs; V is dense on leading
+                    // layers and MoVA-routed (attn_v_gate + attn_v_exps,
+                    // sigmoid, top-4, silu, normed+scaled 2.5 weights) on
+                    // MoE layers. Downstream shared rope/kv/attention then
+                    // run normally over these buffers.
+                    if(!tensor_gemm(*tensor(p+"attn_q.weight"),norm.data(),q.data(),T,QW,E))return false;
+                    if(!tensor_gemm(*tensor(p+"attn_k.weight"),norm.data(),k.data(),T,KW,E))return false;
+                    if(const auto* lv=tensor(p+"attn_v.weight")){
+                        if(!tensor_gemm(*lv,norm.data(),v.data(),T,KW,E))return false;
+                    }else{
+                        const auto* vg=tensor(p+"attn_v_gate.weight");
+                        const auto* vge=tensor(p+"attn_v_exps.weight");
+                        if(!vg||!vge)return false;
+                        const std::size_t EN3=config_.value_expert_count,EK3=config_.value_expert_used;
+                        if(!EN3||!EK3||EK3>EN3||vge->dims.size()!=3||vge->dims[2]!=EN3)return false;
+                        const std::size_t VK=KW,EK=EK3;
+                        std::vector<float> vlogits(T*EN3);
+                        for(std::size_t t=0;t<T;++t){
+                            if(!tensor_matvec(*vg,norm.data()+t*E,vlogits.data()+t*EN3,EN3,E))return false;
+                        }
+                        const auto rbg=quant::row_bytes(*vge->format,E);
+                        if(!rbg)return false;
+                        for(std::size_t t=0;t<T;++t){
+                            std::vector<float> probs(EN3);
+                            for(std::size_t i=0;i<EN3;++i)probs[i]=1.0f/(1.0f+std::exp(-vlogits[t*EN3+i]));
+                            std::vector<float> sel=probs;
+                            if(const auto* vb=tensor(p+"attn_v_gate.bias")){
+                                if(vb->values.size()!=EN3)return false;
+                                for(std::size_t i=0;i<EN3;++i)sel[i]+=vb->values[i];
+                            }
+                            std::vector<std::uint32_t> idx(EN3);
+                            std::iota(idx.begin(),idx.end(),0u);
+                            std::partial_sort(idx.begin(),idx.begin()+EK,idx.end(),[&](std::uint32_t a,std::uint32_t b){return sel[a]>sel[b];});
+                            double wsum=0.0;for(std::size_t i=0;i<EK;++i)wsum+=probs[idx[i]];
+                            if(!(wsum>0.0))return false;
+                            std::fill(v.data()+t*KW,v.data()+t*KW+KW,0.0f);
+                            for(std::size_t i=0;i<EK;++i){
+                                const std::uint32_t e=idx[i];
+                                const float w=float(probs[e]/wsum)*config_.moe_w_scale;
+                                Tensor sv=*vge;sv.raw=vge->raw+std::size_t(e)*VK*rbg;sv.elements=VK*E;
+                                std::vector<float> mid(VK);
+                                if(!tensor_matvec(sv,norm.data()+t*E,mid.data(),VK,E))return false;
+                                silu_inplace(mid.data(),VK);
+                                for(std::size_t k2=0;k2<VK;++k2)v[t*KW+k2]+=w*mid[k2];
+                            }
+                        }
+                    }
+                }
+                else{
+                    // Split FFN-only layer: no attention to compute.
+                    std::fill(q.begin(),q.end(),0.0f);
+                    std::fill(k.begin(),k.end(),0.0f);
+                    std::fill(v.begin(),v.end(),0.0f);
+                    std::fill(att.begin(),att.end(),0.0f);
+                }
+                }
             }
         }
         {zen::diag::Scope sfin("prefill.finite_qkv",zen::diag::Phase::compute);
@@ -1519,7 +2973,7 @@ bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& to
         for(const auto& item:std::array<std::pair<const char*,std::vector<float>*>,3>{{{"attn_q.bias",&q},{"attn_k.bias",&k},{"attn_v.bias",&v}}})if(const auto*bias=tensor(p+item.first)){const std::size_t width=item.first[5]=='q'?QW:KW;if(bias->values.size()!=width)return false;for(std::size_t t=0;t<T;++t)for(std::size_t i=0;i<width;++i)(*item.second)[t*width+i]+=bias->values[i];}
         const auto* qnorm=tensor(p+"attn_q_norm.weight");const auto* knorm=tensor(p+"attn_k_norm.weight");
         if((qnorm==nullptr)!=(knorm==nullptr))return false;
-        if(qnorm&&(qnorm->values.size()!=D||knorm->values.size()!=D))return false;
+        if(qnorm&&!((qnorm->values.size()==D&&knorm->values.size()==D)||(qnorm->values.size()==QW&&knorm->values.size()==KW)||(config_.gemma_variant&&qnorm->values.size()==config_.head_dim_per_layer[l]&&knorm->values.size()==config_.head_dim_per_layer[l])))return false;
         {zen::diag::Scope scope_rope("transformer.prefill.rope",zen::diag::Phase::compute);
         // Collect all K/V pointers for batched KV cache append
         std::vector<std::size_t> kv_layers;
@@ -1540,8 +2994,10 @@ bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& to
         // the batched GPU rope sees fully-normalised Q/K in one dispatch; the
         // CPU fallback below applies rope to the same normalised rows.
         if(qnorm&&!front_done){zen::diag::Scope sk("prefill.rope.qknorm",zen::diag::Phase::compute);for(std::size_t t=0;t<T;++t){
-            qk_rms_norm(q.data()+t*QW,H,D,qnorm->values.data(),config_.rms_epsilon);
-            qk_rms_norm(k.data()+t*KW,KH,D,knorm->values.data(),config_.rms_epsilon);
+            if(qnorm->values.size()==QW)rms_norm(q.data()+t*QW,qnorm->values.data(),q.data()+t*QW,QW,config_.rms_epsilon);
+            else qk_rms_norm(q.data()+t*QW,H,D,qnorm->values.data(),config_.rms_epsilon);
+            if(knorm->values.size()==KW)rms_norm(k.data()+t*KW,knorm->values.data(),k.data()+t*KW,KW,config_.rms_epsilon);
+            else qk_rms_norm(k.data()+t*KW,KH,D,knorm->values.data(),config_.rms_epsilon);
         }}
         if(!front_done&&!config_.use_alibi&&prefill_pairs){
             zen::diag::Scope sa("prefill.rope.apply",zen::diag::Phase::compute);
@@ -1575,8 +3031,8 @@ bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& to
                 // (ZEN_D3D12_ROPE_PREFILL unset): ZEN_CPU_ROPE=0 alone has no
                 // rope implementation and must fail, not silently use CPU.
                 if(rope_cpu_disallowed)return false;
-                if(!q_done)for(std::size_t t=0;t<T;++t)rope_apply_table(q.data()+t*QW,H,D,static_cast<std::uint32_t>(prefill_pairs),prefill_cos.data()+t*std::size_t(prefill_pairs),prefill_sin.data()+t*std::size_t(prefill_pairs),config_.rope_pairs_adjacent);
-                if(!k_done)for(std::size_t t=0;t<T;++t)rope_apply_table(k.data()+t*KW,KH,D,static_cast<std::uint32_t>(prefill_pairs),prefill_cos.data()+t*std::size_t(prefill_pairs),prefill_sin.data()+t*std::size_t(prefill_pairs),config_.rope_pairs_adjacent);
+                if(!q_done&&(config_.rope_pattern.empty()||l>=config_.rope_pattern.size()||config_.rope_pattern[l]))for(std::size_t t=0;t<T;++t)rope_apply_table(q.data()+t*QW,H,D,static_cast<std::uint32_t>(prefill_pairs),prefill_cos.data()+t*std::size_t(prefill_pairs),prefill_sin.data()+t*std::size_t(prefill_pairs),config_.rope_pairs_adjacent);
+                if(!k_done&&(config_.rope_pattern.empty()||l>=config_.rope_pattern.size()||config_.rope_pattern[l]))for(std::size_t t=0;t<T;++t)rope_apply_table(k.data()+t*KW,KH,D,static_cast<std::uint32_t>(prefill_pairs),prefill_cos.data()+t*std::size_t(prefill_pairs),prefill_sin.data()+t*std::size_t(prefill_pairs),config_.rope_pairs_adjacent);
             }
         }
         // Loop-invariant across tokens AND layers up to the KV length, but it was
@@ -1685,9 +3141,11 @@ bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& to
             }
         }
         #endif
-        if (!flash_ok) {
+        if(gemma_attn_done){
+            // Shared CPU attention skipped: gemma computed att itself.
+        }else if(!flash_ok) {
             {zen::diag::Scope scope_attn("transformer.prefill.attention",zen::diag::Phase::compute);
-        std::fill(att.begin(),att.end(),0.0f);const std::uint32_t group=H/KH;const float inv_scale=1.0f/std::sqrt(float(D));
+        std::fill(att.begin(),att.end(),0.0f);const std::uint32_t group=H/KH;const float inv_scale=config_.attn_scale>0?config_.attn_scale:1.0f/std::sqrt(float(D));
         std::atomic<bool> attn_ok{true};
         zen::ResourceGovernor attn_gov;
         const unsigned attn_workers=attn_gov.current_policy().worker_threads;
@@ -1753,6 +3211,27 @@ bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& to
                     }
                     j0+=KB;
                 }
+                // Tiled online-softmax: attention sinks add one extra virtual KV
+                // entry with score = sinks[h] and zero value contribution:
+                // they enter only as a rescale + unit-count in the denominator.
+                if(config_.has_attn_sinks){
+                    const auto* sinks=tensor(p+"attn_sinks.weight");
+                    if(!sinks||sinks->values.size()<=h){attn_ok.store(false,std::memory_order_relaxed);return;}
+                    const float sink=sinks->values[h];
+                    for(std::size_t qi=0;qi<qn;++qi){
+                        float& mq=m[qi];double& lq=denom[qi];float* aq=acc.data()+qi*D;
+                        if(sink>mq){
+                            if(mq!=-std::numeric_limits<float>::infinity()){
+                                const float scale=std::exp(mq-sink);
+                                for(std::size_t i=0;i<D;++i)aq[i]*=scale;
+                                lq*=(double)scale;
+                            }
+                            mq=sink;lq+=1.0;
+                        }else{
+                            lq+=(double)std::exp(sink-mq);
+                        }
+                    }
+                }
                 for(std::size_t qi=0;qi<qn;++qi){
                     const double lq=denom[qi];
                     if(!(lq>0.0)||!std::isfinite(lq)){attn_ok.store(false,std::memory_order_relaxed);return;}
@@ -1790,7 +3269,13 @@ bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& to
                 if(!std::isfinite(scores[j])){attn_ok.store(false,std::memory_order_relaxed);return;}
                 max_score=std::max(max_score,scores[j]);
             }
+            const auto* sinks=tensor(p+"attn_sinks.weight");
+            if(sinks&&config_.has_attn_sinks){
+                if(sinks->values.size()<=h){attn_ok.store(false,std::memory_order_relaxed);return;}
+                max_score=std::max(max_score,sinks->values[h]);
+            }
             double denom=0;for(std::size_t j=first;j<=pos;++j){scores[j]=std::exp(scores[j]-max_score);denom+=scores[j];}
+            if(sinks&&config_.has_attn_sinks)denom+=std::exp(sinks->values[h]-max_score);
             if(!(denom>0.0)||!std::isfinite(denom)){attn_ok.store(false,std::memory_order_relaxed);return;}
             const float inv=1.0f/static_cast<float>(denom);
             float*out=att.data()+t*QW+std::size_t(h)*D;
@@ -1838,7 +3323,7 @@ bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& to
         if(ffn_fused_done){
             // Already part of the attention submission.
             ffn_gpu=true;
-        }else if((use_prefill_gpu||prefill_i8_on)&&!ffn_fused_off&&!config_.bitnet_variant){
+        }else if((use_prefill_gpu||prefill_i8_on)&&!ffn_fused_off&&!config_.bitnet_variant&&!config_.gemma_variant&&!config_.deepseek_variant){
             const auto* lo=tensor(p+"attn_output.weight");const auto* lg=tensor(p+"ffn_gate.weight");
             const auto* lu=tensor(p+"ffn_up.weight");const auto* ldw=tensor(p+"ffn_down.weight");
             const auto* lfn=tensor(p+"ffn_norm.weight");
@@ -1858,7 +3343,7 @@ bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& to
 #else
             if(!finite_values(x.data(),x.size()))return false;
 #endif
-        }else if(front_done){
+        }else if(front_done&&!gemma_attn_done){
             // att is not on the host on this path, so the separate host FFN ops below
             // would read the previous layer's activations.
             std::fprintf(stderr,"[ffn] fused FFN chain declined after the fused attention front "
@@ -1869,14 +3354,244 @@ bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& to
         // The host half recomputes the residual here, so the device copy is stale.
         zen::d3d12::prefill_residual_invalidate();
 #endif
+        // Layers without attention (shortconv recurrent, split SSM/FFN-only
+        // blocks stripped below) skip attention+FFN via the guards after.
+        if(tensor(p+"ssm_in.weight")){
+            // SSM mix runs in the attention section below via the shortconv-like
+            // zero-fill path; here it already updated x.
+        }
         // BitNet subln: RMS-normalise each token's attention output before
         // the wo projection.
         if(config_.bitnet_variant)for(std::size_t t=0;t<T;++t)rms_norm(att.data()+t*QW,tensor(p+"attn_sub_norm.weight")->values.data(),att.data()+t*QW,QW,config_.rms_epsilon);
-        if(!tensor_gemm(*tensor(p+"attn_output.weight"),att.data(),tmp.data(),T,E,QW))return false;
+        {
+            // Laguna attention gate (laguna.cpp): softplus(g_proj(normed attn
+            // input)) multiplied into the per-head output before Wo.
+            const auto* ag=tensor(p+"attn_gate.weight");
+            if(ag){
+                const std::size_t GD=ag->elements/config_.embedding;
+                std::vector<float> gate(T*GD);
+                if(!tensor_gemm(*ag,norm.data(),gate.data(),T,GD,E))return false;
+                for(std::size_t t=0;t<T;++t){
+                    // Per-head gate: GD == Hl (48/64 for laguna, stride max QW).
+                    // GD==QW (per-element, M.1-style) handled below.
+                    // K2-Horizon uses log2 softplus: log2(1+2^g).
+                    auto gate_of=[&](float g)->float{
+                        if(config_.k2_variant){const float y=g*0.69314718f;const float sp=(y>20.0f?y:std::log(1.0f+std::exp(y)))*1.44269504f;return sp;}
+                        return g>20.0f?g:std::log(1.0f+std::exp(g));
+                    };
+                    if(GD!=QW){
+                        for(std::size_t h=0;h<GD;++h){
+                            float g=gate[t*GD+h];
+                            float sp=gate_of(g);
+                            float* o=att.data()+t*QW+h*D;
+                            for(std::size_t i=0;i<D;++i)o[i]*=sp;
+                        }
+                    }else{
+                        for(std::size_t i=0;i<QW;++i){
+                            float g=gate[t*GD+i];
+                            float sp=gate_of(g);
+                            att[t*QW+i]*=sp;
+                        }
+                    }
+                }
+            }
+        }
+        // Gemma attention already handled in its own branch (post-norm +
+        // residual done there); skip the shared output projection.
+        if(!gemma_attn_done&&tensor(p+"attn_output.weight")){
+            if(!tensor_gemm(*tensor(p+"attn_output.weight"),att.data(),tmp.data(),T,E,QW))return false;
+            if(const auto* obias=tensor(p+"attn_output.bias")){
+                if(obias->values.size()!=E)return false;
+                for(std::size_t t=0;t<T;++t)for(std::size_t i=0;i<E;++i)tmp[t*E+i]+=obias->values[i];
+            }
+            if(config_.gemma_variant){
+                // Gemma4: post-norm applies to the attention output BEFORE
+                // the residual add: x = inp + rms_norm(proj, post_attention_norm).
+                const auto* pan=tensor(p+"post_attention_norm.weight");
+                if(!pan||!pan->values.size())return false;
+                for(std::size_t t=0;t<T;++t)rms_norm(tmp.data()+t*E,pan->values.data(),tmp.data()+t*E,E,config_.rms_epsilon);
+                // att buffer still holds raw proj in tmp; x currently holds
+                // inp (residual added below). Gemma adds after norming.
+            }
+            for(std::size_t i=0;i<T*E;++i)x[i]+=tmp[i];
+        }
+        if(config_.moe_nemotron&&tensor(p+"ffn_up_exps.weight")){
+            if(!nemotron_moe_forward(p,norm.data(),x.data(),T))return false;
+            continue;
+        }
+        if(!tensor(p+"ffn_norm.weight")&&tensor(p+"ffn_up.weight")){
+            // Split FFN-only layer (nemotron): single attn_norm already
+            // produced `norm`; no second resnorm to apply.
+                }else if(config_.gpt_oss_variant){
+            // GPT-OSS post-attention norm (no ffn_norm tensor) applies after
+            // the attention output and residual, before MoE routing.
+            const auto* pn=tensor(p+"post_attention_norm.weight");
+            if(!pn)return false;
+            {zen::diag::Scope sr("prefill.resnorm",zen::diag::Phase::compute);
+            for(std::size_t t=0;t<T;++t)rms_norm(x.data()+t*E,pn->values.data(),norm.data()+t*E,E,config_.rms_epsilon);}}
+        else if(!tensor(p+"ffn_norm.weight")){
+            // Split SSM layer (nemotron): no FFN block.
+            if(!finite_values(x.data(),x.size()))return false;
+            continue;
+        }else{
         {zen::diag::Scope sr("prefill.resnorm",zen::diag::Phase::compute);
-        for(std::size_t i=0;i<T*E;++i)x[i]+=tmp[i];
-        for(std::size_t t=0;t<T;++t)rms_norm(x.data()+t*E,tensor(p+"ffn_norm.weight")->values.data(),norm.data()+t*E,E,config_.rms_epsilon);}
-        if(!finite_values(norm.data(),norm.size()))return false;
+        for(std::size_t t=0;t<T;++t){const auto* fw=tensor(p+"ffn_norm.weight");const auto* fb=tensor(p+"ffn_norm.bias");if(config_.layernorm_variant){if(!fb)return false;layernorm(x.data()+t*E,fw->values.data(),fb->values.data(),norm.data()+t*E,E,config_.rms_epsilon);}else if(config_.k2_variant)group_rms_norm(x.data()+t*E,fw->values.data(),norm.data()+t*E,E,config_.group_norm_groups,config_.rms_epsilon);else rms_norm(x.data()+t*E,fw->values.data(),norm.data()+t*E,E,config_.rms_epsilon);}}}
+                if(config_.moe_expert_count&&tensor(p+"ffn_gate_exps.weight")){
+            // Qwen3-MoE FFN: router + top-k experts (per-layer dispatch:
+            // dense layers inside MoE models keep the dense FFN below).
+            const std::size_t EN=config_.moe_expert_count,EK=config_.moe_used_count,EF=config_.moe_ffn;
+            const auto* router=tensor(p+"ffn_gate_inp.weight");
+            const auto* ge=tensor(p+"ffn_gate_exps.weight");
+            const auto* ue=tensor(p+"ffn_up_exps.weight");
+            const auto* de=tensor(p+"ffn_down_exps.weight");
+            if(!router||!ge||!ue||!de)return false;
+            std::vector<float> rlogits(T*EN),tmpEF(EF),tmpOut(E);
+            for(std::size_t t=0;t<T;++t){
+                if(!tensor_matvec(*router,norm.data()+t*E,rlogits.data()+t*EN,EN,E))return false;
+            }
+            std::fill(tmp.data(),tmp.data()+T*E,0.0f);
+            const auto* exp_bias=tensor(p+"ffn_exp_probs_b");if(!exp_bias&&config_.gpt_oss_variant)exp_bias=tensor(p+"ffn_gate_inp.bias");
+            std::vector<float> bias_vec(EN,0.0f);
+            if(exp_bias){
+                if(exp_bias->values.size()==EN)bias_vec=exp_bias->values;
+                else if(exp_bias->raw&&exp_bias->format){
+                    std::vector<float> tmpv(EN);
+                    if(!quant::dequantize(*exp_bias->format,exp_bias->raw,EN,tmpv.data(),1.0f))return false;
+                    bias_vec=std::move(tmpv);
+                }
+            }
+            for(std::size_t t=0;t<T;++t){
+                float* tl=rlogits.data()+t*EN;
+                for(std::size_t i=0;i<EN;++i)tl[i]+=bias_vec[i];
+                if(config_.moe_sigmoid){
+                    for(std::size_t i=0;i<EN;++i)tl[i]=1.0f/(1.0f+std::exp(-tl[i]));
+                }else{
+                    float mx=tl[0];for(std::size_t i=1;i<EN;++i)mx=std::max(mx,tl[i]);
+                    double sum=0.0;for(std::size_t i=0;i<EN;++i){tl[i]=std::exp(tl[i]-mx);sum+=tl[i];}
+                    if(!(sum>0.0)||!std::isfinite(sum))return false;
+                    for(std::size_t i=0;i<EN;++i)tl[i]/=float(sum);
+                }
+                std::vector<std::uint32_t> idx(EN);
+                std::iota(idx.begin(),idx.end(),0u);
+                std::partial_sort(idx.begin(),idx.begin()+EK,idx.end(),[&](std::uint32_t a,std::uint32_t b){return tl[a]>tl[b];});
+                double wsum=0.0;for(std::size_t i=0;i<EK;++i)wsum+=tl[idx[i]];
+                if(!(wsum>0.0))return false;
+                for(std::size_t i=0;i<EK;++i){
+                    const std::uint32_t e=idx[i];
+                    // gpt-oss: softmax_weight uses probs directly (no renorm).
+                    const float w=(config_.gpt_oss_variant?float(tl[e]):float(tl[e]/wsum)*((config_.deepseek_variant||config_.k2_variant)?config_.moe_w_scale:1.0f));
+                    Tensor sg=*ge,su=*ue,sd=*de;
+                    const auto rbg=quant::row_bytes(*ge->format,E),rbu=quant::row_bytes(*ue->format,E),rbd=quant::row_bytes(*de->format,EF);
+                    if(!rbg||!rbu||!rbd)return false;
+                    sg.raw=ge->raw+std::size_t(e)*EF*rbg;
+                    su.raw=ue->raw+std::size_t(e)*EF*rbu;
+                    sd.raw=de->raw+std::size_t(e)*(config_.embedding*rbd);
+                    std::vector<float> eGate(EF),eUp(EF);
+                    if(config_.moe_ffn==0||t==0){/* [fl] debug removed */}
+            std::fprintf(stderr,"[fl] layer %u t=%zu expert-row pre-check\n",l,t);std::fflush(stderr);
+            if(!tensor_matvec(sg,norm.data()+t*E,eGate.data(),EF,E)){std::fprintf(stderr,"[fl] sg fail t=%zu\n",t);std::fflush(stderr);return false;}
+                    if(!tensor_matvec(su,norm.data()+t*E,eUp.data(),EF,E)){std::fprintf(stderr,"[fl] su fail t=%zu\n",t);std::fflush(stderr);return false;}
+                    if(config_.gpt_oss_variant){
+                        // per-expert biases: [row, N] bundled, col e at e*row.
+                        const auto* gb=tensor(p+"ffn_gate_exps.bias");const auto* ub=tensor(p+"ffn_up_exps.bias");const auto* db=tensor(p+"ffn_down_exps.bias");
+                        if(!gb||!ub||gb->values.size()<EF*EN||ub->values.size()<EF*EN)return false;
+                        for(std::size_t k2=0;k2<EF;++k2){eGate[k2]+=gb->values[std::size_t(e)*EF+k2];eUp[k2]+=ub->values[std::size_t(e)*EF+k2];}
+                    }
+                    silu_mul(eGate.data(),eUp.data(),tmpEF.data(),EF);
+                    if(!tensor_matvec(sd,tmpEF.data(),tmpOut.data(),E,EF)){std::fprintf(stderr,"[fl] sd fail t=%zu e=%u\n",t,e);std::fflush(stderr);return false;}
+                    if(config_.gpt_oss_variant){
+                        const auto* db=tensor(p+"ffn_down_exps.bias");
+                        if(!db||db->values.size()<std::size_t(E)*EN)return false;
+                        for(std::size_t k=0;k<E;++k)tmpOut[k]+=db->values[std::size_t(e)*E+k];
+                    }
+                    for(std::size_t k=0;k<E;++k)tmp[t*E+k]+=w*tmpOut[k];
+                }
+                // Shared expert (if present, e.g. laguna shexp): always active.
+                const auto* sg2=tensor(p+"ffn_gate_shexp.weight");
+                const auto* su2=tensor(p+"ffn_up_shexp.weight");
+                const auto* sd2=tensor(p+"ffn_down_shexp.weight");
+                if(sg2&&su2&&sd2){
+                    const std::size_t SFEF=sg2->elements/E;
+                    std::vector<float> sGate(SFEF),sUp(SFEF),sMid(SFEF);
+                    if(!tensor_matvec(*sg2,norm.data()+t*E,sGate.data(),SFEF,E))return false;
+                    if(!tensor_matvec(*su2,norm.data()+t*E,sUp.data(),SFEF,E))return false;
+                    silu_mul(sGate.data(),sUp.data(),sMid.data(),SFEF);
+                    if(!tensor_matvec(*sd2,sMid.data(),tmpOut.data(),E,SFEF))return false;
+                    for(std::size_t k=0;k<E;++k)tmp[t*E+k]+=tmpOut[k];
+                }
+            }
+            for(std::size_t i=0;i<T*E;++i)x[i]+=tmp[i];
+            if(!finite_values(x.data(),x.size()))return false;
+            continue;
+        }
+        if(config_.phi3_variant){
+            // Phi-3 double-up SWIGLU: up=[2F]; out = silu(u[:F]) * u[F:] then down.
+            // (Dedicated 2F scratch: ffn/gate/up are F-wide buffers.)
+            const auto* lu3=tensor(p+"ffn_up.weight");
+            const auto* ld3=tensor(p+"ffn_down.weight");
+            if(!lu3||!ld3)return false;
+            std::vector<float> up2(T*2*F);
+            if(!tensor_gemm(*lu3,norm.data(),up2.data(),T,2*F,E))return false;
+            for(std::size_t t=0;t<T;++t)for(std::size_t i=0;i<F;++i){const float g=up2[t*2*F+i];const float u=up2[t*2*F+F+i];gate[t*F+i]=(g/(1.0f+std::exp(-g)))*u;}
+            if(!tensor_gemm(*ld3,gate.data(),tmp.data(),T,E,F))return false;
+            for(std::size_t i=0;i<T*E;++i)x[i]+=tmp[i];
+            if(!finite_values(x.data(),x.size()))return false;
+            continue;
+        }
+        if(config_.gelu_variant){
+            // starcoder2 sequential FFN: up+bias -> exact gelu -> down+bias.
+            const auto* lu4=tensor(p+"ffn_up.weight");
+            const auto* ld4=tensor(p+"ffn_down.weight");
+            if(!lu4||!ld4)return false;
+            if(!tensor_gemm(*lu4,norm.data(),ffn.data(),T,F,E))return false;
+            if(const auto* ub=tensor(p+"ffn_up.bias")){
+                if(ub->values.size()!=F)return false;
+                for(std::size_t t=0;t<T;++t)for(std::size_t i=0;i<F;++i)ffn[t*F+i]+=ub->values[i];
+            }
+            gelu_exact(ffn.data(),T*F);
+            if(!tensor_gemm(*ld4,ffn.data(),tmp.data(),T,E,F))return false;
+            if(const auto* db=tensor(p+"ffn_down.bias")){
+                if(db->values.size()!=E)return false;
+                for(std::size_t t=0;t<T;++t)for(std::size_t i=0;i<E;++i)tmp[t*E+i]+=db->values[i];
+            }
+            for(std::size_t i=0;i<T*E;++i)x[i]+=tmp[i];
+            if(!finite_values(x.data(),x.size()))return false;
+            continue;
+        }
+        if(config_.gelu_par_variant){
+            // Spark-X2.5 parallel FFN: gate and up projections, gelu(gate) *
+            // up, then down (llama.cpp LLM_FFN_GELU/LM_FFN_PAR).
+            const auto* lg4=tensor(p+"ffn_gate.weight");
+            const auto* lu4=tensor(p+"ffn_up.weight");
+            const auto* ld4=tensor(p+"ffn_down.weight");
+            if(!lg4||!lu4||!ld4)return false;
+            const DenseTransformerRuntime::Tensor* const fu_t[2]={lg4,lu4};
+            float* const fu_y[2]={gate.data(),up.data()};
+            const std::size_t fu_r[2]={F,F};
+            if(!tensor_gemm_batch(fu_t,norm.data(),fu_y,fu_r,2,T,E))return false;
+            gelu_exact(gate.data(),T*F);
+            for(std::size_t i=0;i<T*F;++i)gate[i]*=up[i];
+            if(!tensor_gemm(*ld4,gate.data(),tmp.data(),T,E,F))return false;
+            for(std::size_t i=0;i<T*E;++i)x[i]+=tmp[i];
+            if(!finite_values(x.data(),x.size()))return false;
+            continue;
+        }
+        if(!tensor(p+"ffn_gate.weight")&&tensor(p+"ffn_up.weight")){
+            // Nemotron FFN-only: up + RELU_SQR (relu^2) + down (no gate).
+            const auto* lu2=tensor(p+"ffn_up.weight");
+            const auto* ld2=tensor(p+"ffn_down.weight");
+            if(!lu2||!ld2)return false;
+            if(T==1){
+                if(!tensor_matvec(*lu2,norm.data(),ffn.data(),F,E))return false;
+            }else{
+                if(!tensor_gemm(*lu2,norm.data(),ffn.data(),T,F,E))return false;
+            }
+            for(std::size_t i=0;i<T*F;++i){const float v=ffn[i];ffn[i]=(v>0.0f)?v*v:0.0f;}
+            if(!tensor_gemm(*ld2,ffn.data(),tmp.data(),T,E,F))return false;
+            for(std::size_t i=0;i<T*E;++i)x[i]+=tmp[i];
+            if(!finite_values(x.data(),x.size()))return false;
+            continue;
+        }
         if(T==1){
             const DenseTransformerRuntime::Tensor* const fu_t[2]={tensor(p+"ffn_gate.weight"),tensor(p+"ffn_up.weight")};
             float* const fu_y[2]={gate.data(),up.data()};
@@ -1891,6 +3606,10 @@ bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& to
             const std::size_t fu_r[2]={F,F};
             if(!tensor_gemm_batch(fu_t,norm.data(),fu_y,fu_r,2,T,E))return false;
         }
+        if(config_.gemma_variant){
+            // GGML GELU (tanh approximation) on gate, times up.
+            for(std::size_t i=0;i<T*F;++i){const float g=gate[i];const float t=0.79788456f*(g+0.044715f*g*g*g);ffn[i]=0.5f*g*(1.0f+std::tanh(t))*up[i];}
+        }else{
         {zen::diag::Scope scope_silu("transformer.prefill.silu",zen::diag::Phase::compute);
         // silu_mul is elementwise, so splitting it over token rows is bit-identical
         // to the serial pass (same kernel, same inputs, no reduction). At T=512 and
@@ -1903,14 +3622,31 @@ bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& to
             zen::ComputePool::instance().parallel_for(T,silu_workers,[&](std::size_t first,std::size_t last){for(std::size_t t=first;t<last;++t)silu_mul(gate.data()+t*F,up.data()+t*F,ffn.data()+t*F,F);});
         else
             silu_mul(gate.data(),up.data(),ffn.data(),T*F);}
+        }
         // BitNet subln: RMS-normalise the FFN hidden activation before ffn_down.
         if(config_.bitnet_variant)for(std::size_t t=0;t<T;++t)rms_norm(ffn.data()+t*F,tensor(p+"ffn_sub_norm.weight")->values.data(),ffn.data()+t*F,F,config_.rms_epsilon);
         if(!tensor_gemm(*tensor(p+"ffn_down.weight"),ffn.data(),tmp.data(),T,E,F))return false;
+        if(config_.gemma_variant){
+            // Gemma4: post-norm applies to the FFN output before the residual.
+            const auto* pfn=tensor(p+"post_ffw_norm.weight");
+            if(!pfn||!pfn->values.size())return false;
+            for(std::size_t t=0;t<T;++t)rms_norm(tmp.data()+t*E,pfn->values.data(),tmp.data()+t*E,E,config_.rms_epsilon);
+        }
         for(std::size_t i=0;i<T*E;++i)x[i]+=tmp[i];
+        if(config_.gemma_variant){
+            if(const auto* os=tensor(p+"layer_output_scale.weight")){
+                float sc=1.0f;
+                if(os->values.size())sc=os->values[0];
+                else if(os->raw&&os->format){float tmpv=1.0f;if(quant::dequantize(*os->format,os->raw,1,&tmpv,1.0f))sc=tmpv;}
+                for(std::size_t i=0;i<T*E;++i)x[i]*=sc;
+            }
+        }
         if(!finite_values(x.data(),x.size()))return false;
         }
     }
-    const auto* norm_weight=tensor("output_norm.weight");if(!norm_weight||norm_weight->values.size()!=E)return false;
+    const auto* norm_weight=tensor("output_norm.weight");
+    if(!norm_weight||norm_weight->values.size()!=E)return false;
+    const auto* out_bias=tensor("output_norm.bias");
     const std::size_t first_tail=T-tail_count;std::vector<float> norm_tail(tail_count*E),logits_tail(tail_count*config_.vocab);
     // Output-norm tail on the GPU when the prefill gate is on (one dispatch,
     // fallback to the CPU loop when the call declines).
@@ -1918,17 +3654,18 @@ bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& to
 #if defined(ZEN_HAS_D3D12)
     if(use_prefill_gpu)out_norm_gpu=zen::d3d12::rms_norm(x.data()+(first_tail)*E,norm_weight->values.data(),norm_tail.data(),tail_count,E,config_.rms_epsilon);
 #endif
-    if(!out_norm_gpu)for(std::size_t t=0;t<tail_count;++t)rms_norm(x.data()+(first_tail+t)*E,norm_weight->values.data(),norm_tail.data()+t*E,E,config_.rms_epsilon);
+    if(!out_norm_gpu)for(std::size_t t=0;t<tail_count;++t){if(config_.layernorm_variant){if(!out_bias)return false;layernorm(x.data()+(first_tail+t)*E,norm_weight->values.data(),out_bias->values.data(),norm_tail.data()+t*E,E,config_.rms_epsilon);}else if(config_.k2_variant)group_rms_norm(x.data()+(first_tail+t)*E,norm_weight->values.data(),norm_tail.data()+t*E,E,config_.group_norm_groups,config_.rms_epsilon);else rms_norm(x.data()+(first_tail+t)*E,norm_weight->values.data(),norm_tail.data()+t*E,E,config_.rms_epsilon);}
     if(!finite_values(norm_tail.data(),norm_tail.size()))return false;
     const auto* output=tensor("output.weight");if(!output)output=emb;
     if(!tensor_gemm(*output,norm_tail.data(),logits_tail.data(),tail_count,config_.vocab,E))return false;
+    if(config_.logit_softcap>0.0f){const float c=config_.logit_softcap;for(auto& v:logits_tail)v=std::tanh(v/c)*c;}
     if(!finite_values(logits_tail.data(),logits_tail.size()))return false;
     logits.assign(logits_tail.end()-config_.vocab,logits_tail.end());if(tail_logits)*tail_logits=std::move(logits_tail);
     return true;
 }
 bool DenseTransformerRuntime::forward(std::uint32_t token,std::uint32_t pos,
         std::vector<std::vector<float>>& kc,std::vector<std::vector<float>>& vc,
-        std::vector<float>& logits)const{
+        std::vector<float>& logits,std::vector<std::vector<float>>* nem_conv,std::vector<std::vector<float>>* nem_state)const{
     const auto E=config_.embedding,H=config_.heads,KH=config_.kv_heads,D=config_.head_dim,F=config_.ffn;
     if(token>=config_.vocab||pos>=config_.context)return false;
     // Stage timing, opt-in via ZEN_D3D12_STAGE=1. Printed as a cumulative
@@ -1950,6 +3687,7 @@ bool DenseTransformerRuntime::forward(std::uint32_t token,std::uint32_t pos,
     std::vector<float> attn_scratch(static_cast<std::size_t>(H)*(pos+1));
     if(emb->raw&&emb->format){const auto rb=quant::row_bytes(*emb->format,E);if(!rb||!quant::dequantize(*emb->format,emb->raw+std::size_t(token)*rb,E,x.data()))return false;}
     else if(emb->values.size()==std::size_t(config_.vocab)*E)std::copy_n(emb->values.data()+std::size_t(token)*E,E,x.data());else return false;
+    if(config_.gemma_variant){const float s=config_.emb_scale;for(std::size_t i=0;i<E;++i)x[i]*=s;}
     // ZI-P7: no prefetch thread in the per-token path. Spawning one std::async
     // per layer cost ~7ms of a 61ms decode step (measured 16.3 -> 18.7 tok/s with
     // it removed) because the weights are already resident in the page cache.
@@ -1992,14 +3730,14 @@ bool DenseTransformerRuntime::forward(std::uint32_t token,std::uint32_t pos,
         const auto* lv=tensor(p+"attn_v.weight");const auto* lo=tensor(p+"attn_output.weight");
         const auto* lg=tensor(p+"ffn_gate.weight");const auto* lu=tensor(p+"ffn_up.weight");
         const auto* ldw=tensor(p+"ffn_down.weight");
-        const auto* ln=tensor(p+"attn_norm.weight");const auto* lfn=tensor(p+"ffn_norm.weight");
+        const auto* ln=tensor(p+"attn_norm.weight");const auto* lfn0=tensor(p+"ffn_norm.weight");const auto* lfn=lfn0?lfn0:tensor(p+"post_attention_norm.weight");
         // Qwen3 normalises every q/k head before RoPE. The pipeline applies it on the
         // device (qk_norm.hlsl), so the tensors no longer disqualify a layer; they are
         // only rejected when the pair is incomplete or the wrong width, which load
         // already rules out for this arch.
         const auto* lqn=tensor(p+"attn_q_norm.weight");const auto* lkn=tensor(p+"attn_k_norm.weight");
         const bool qk_ok=(!lqn&&!lkn)||(lqn&&lkn&&lqn->values.size()==D&&lkn->values.size()==D);
-        if(!config_.use_alibi&&!config_.bitnet_variant&&lq&&lk&&lv&&lo&&lg&&lu&&ldw&&ln&&lfn
+        if(!config_.use_alibi&&!config_.bitnet_variant&&!config_.gemma_variant&&lq&&lk&&lv&&lo&&lg&&lu&&ldw&&ln&&lfn
            &&tensor_is_q8(lq)&&tensor_is_q8(lk)&&tensor_is_q8(lv)&&tensor_is_q8(lo)
            &&tensor_is_q8(lg)&&tensor_is_q8(lu)&&tensor_is_q8(ldw)
            &&!tensor(p+"attn_q.bias")&&!tensor(p+"attn_k.bias")&&!tensor(p+"attn_v.bias")
@@ -2107,7 +3845,7 @@ bool DenseTransformerRuntime::forward(std::uint32_t token,std::uint32_t pos,
         const auto* lv=tensor(p+"attn_v.weight");const auto* lo=tensor(p+"attn_output.weight");
         const auto* lg=tensor(p+"ffn_gate.weight");const auto* lu=tensor(p+"ffn_up.weight");
         const auto* ldw=tensor(p+"ffn_down.weight");
-        const auto* ln=tensor(p+"attn_norm.weight");const auto* lfn=tensor(p+"ffn_norm.weight");
+        const auto* ln=tensor(p+"attn_norm.weight");const auto* lfn0=tensor(p+"ffn_norm.weight");const auto* lfn=lfn0?lfn0:tensor(p+"post_attention_norm.weight");
         const auto* qb=tensor(p+"attn_q.bias");const auto* kb=tensor(p+"attn_k.bias");const auto* vb=tensor(p+"attn_v.bias");
         const auto* qnorm=tensor(p+"attn_q_norm.weight");const auto* knorm=tensor(p+"attn_k_norm.weight");
         // Whole layer in one device submission (task 7), when this block needs nothing
@@ -2115,7 +3853,7 @@ bool DenseTransformerRuntime::forward(std::uint32_t token,std::uint32_t pos,
         // falls through to the per-op path below, which handles those cases.
 #if defined(ZEN_HAS_D3D12)
         {
-            if(!config_.use_alibi&&!config_.bitnet_variant&&lq&&lk&&lv&&lo&&lg&&lu&&ldw&&ln&&lfn
+            if(!config_.use_alibi&&!config_.bitnet_variant&&!config_.gemma_variant&&lq&&lk&&lv&&lo&&lg&&lu&&ldw&&ln&&lfn
                &&tensor_is_q8(lq)&&tensor_is_q8(lk)&&tensor_is_q8(lv)&&tensor_is_q8(lo)
                &&tensor_is_q8(lg)&&tensor_is_q8(lu)&&tensor_is_q8(ldw)
                &&!qb&&!kb&&!vb
@@ -2127,8 +3865,300 @@ bool DenseTransformerRuntime::forward(std::uint32_t token,std::uint32_t pos,
             }
         }
 #endif
-        rms_norm(x.data(),ln->values.data(),norm.data(),E,config_.rms_epsilon);
+        {const auto* ab=tensor(p+"attn_norm.bias");if(config_.layernorm_variant){if(!ab)return false;layernorm(x.data(),ln->values.data(),ab->values.data(),norm.data(),E,config_.rms_epsilon);}else if(config_.k2_variant)group_rms_norm(x.data(),ln->values.data(),norm.data(),E,config_.group_norm_groups,config_.rms_epsilon);else rms_norm(x.data(),ln->values.data(),norm.data(),E,config_.rms_epsilon);}
         if(!finite_values(norm.data(),E))return false;
+        bool gemma_done=false;
+        if(config_.spark2_5_variant){
+            // Spark-X2.5 decode (mirror of the prefill dedicated branch):
+            // fused qkv, per-layer rope (SWA: 256-dim/base 1e4/win 512),
+            // attention with matched mask, sigmoid per-head gate into Wo.
+            const std::size_t Dk=config_.head_dim;
+            const std::size_t QWl=std::size_t(H)*Dk;
+            const std::size_t KWl=std::size_t(KH)*Dk;
+            const bool sw_l=l<config_.swa_pattern.size()&&config_.swa_pattern[l];
+            const std::uint32_t rd=sw_l?config_.rope_dim_swa:config_.rope_dim;
+            const float base=sw_l?config_.rope_base_swa:config_.rope_base;
+            const std::size_t win=sw_l?config_.sliding_window:0;
+            const auto* qkv_=tensor(p+"attn_qkv.weight");
+            const auto* gt2=tensor(p+"attn_gate.weight");
+            if(!qkv_||!lo||!gt2)return false;
+            std::vector<float> qkvf(QWl+2*KWl);
+            if(!tensor_matvec(*qkv_,norm.data(),qkvf.data(),QWl+2*KWl,E))return false;
+            std::copy_n(qkvf.data(),QWl,q.data());
+            std::copy_n(qkvf.data()+QWl,KWl,k.data());
+            std::copy_n(qkvf.data()+QWl+KWl,KWl,v.data());
+            std::vector<float> tc,ts;
+            rope_table(rd,pos,base,config_.rope_scaling_type,config_.rope_scaling_factor,config_.rope_original_context,config_.rope_low_freq_factor,config_.rope_high_freq_factor,config_.rope_yarn_beta_fast,config_.rope_yarn_beta_slow,tc,ts);
+            rope_apply_table(q.data(),H,Dk,rd/2,tc.data(),ts.data(),config_.rope_pairs_adjacent);
+            rope_apply_table(k.data(),KH,Dk,rd/2,tc.data(),ts.data(),config_.rope_pairs_adjacent);
+            std::memcpy(kc[l].data()+std::size_t(pos)*KW,k.data(),KW*sizeof(float));
+            std::memcpy(vc[l].data()+std::size_t(pos)*KW,v.data(),KW*sizeof(float));
+            {
+                const std::uint32_t first=win&&std::size_t(pos)+1>win?pos+1-win:0;
+                const float ascale=config_.attn_scale>0?config_.attn_scale:1.0f/std::sqrt(float(Dk));
+                std::fill(att.begin(),att.end(),0.0f);
+                for(std::size_t h=0;h<H;++h){
+                    const std::uint32_t kh=static_cast<std::uint32_t>(h)*KH/H;
+                    const float* qh=q.data()+std::size_t(h)*Dk;
+                    float mx=-std::numeric_limits<float>::infinity();
+                    std::vector<float> scores(std::size_t(pos)+1-first);
+                    for(std::size_t j=first;j<=pos;++j){
+                        const float* kt=kc[l].data()+j*KW+std::size_t(kh)*Dk;
+                        float dot=0.0f;for(std::size_t i=0;i<Dk;++i)dot+=qh[i]*kt[i];
+                        scores[j-first]=dot*ascale;mx=std::max(mx,scores[j-first]);
+                    }
+                    double denom=0.0;
+                    for(std::size_t n=0;n<scores.size();++n){scores[n]=std::exp(scores[n]-mx);denom+=scores[n];}
+                    if(!(denom>0.0)||!std::isfinite(denom))return false;
+                    float* out=att.data()+std::size_t(h)*Dk;
+                    for(std::size_t j=first;j<=pos;++j){
+                        const float a=scores[j-first]/float(denom);
+                        const float* vt=vc[l].data()+j*KW+std::size_t(kh)*Dk;
+                        for(std::size_t i=0;i<Dk;++i)out[i]+=a*vt[i];
+                    }
+                }
+                {
+                    std::vector<float> gate(H);
+                    if(!tensor_matvec(*gt2,norm.data(),gate.data(),H,E))return false;
+                    for(std::size_t h=0;h<H;++h){
+                        const float sp=1.0f/(1.0f+std::exp(-gate[h]));
+                        float* o=att.data()+std::size_t(h)*Dk;
+                        for(std::size_t i=0;i<Dk;++i)o[i]*=sp;
+                    }
+                }
+            }
+            if(!tensor_matvec(*lo,att.data(),tmp.data(),E,QWl))return false;
+            for(std::size_t i=0;i<E;++i)x[i]+=tmp[i];
+            if(!finite_values(x.data(),x.size()))return false;
+            gemma_done=true; // shared q/k/v/rope/kv/attention/output skipped
+        }else if(config_.deepseek_variant){
+            // DeepSeek MLA decode (llama.cpp deepseek2.cpp, is_mla path), same
+            // math as the forward_batch branch with T=1: K/V recomputed from
+            // the full cached latent prefix every token (no decompressed
+            // cache for now; correct, just O(pos) matvecs per step).
+            const std::size_t Dk=config_.head_dim;
+            const std::size_t nope=Dk-config_.rope_dim;
+            const std::size_t rank=config_.kv_lora_rank;
+            const std::size_t L=rank+config_.rope_dim;
+            const auto* tkv_=tensor(p+"attn_kv_a_mqa.weight");
+            const auto* kna_=tensor(p+"attn_kv_a_norm.weight");
+            const auto* kvb_=tensor(p+"attn_kv_b.weight");
+            const auto* tkb_=tensor(p+"attn_k_b.weight");
+            const auto* tvb_=tensor(p+"attn_v_b.weight");
+            const bool split=(tkb_!=nullptr&&tvb_!=nullptr);
+            if(!tkv_||!kna_||!lo||(!lq&&!tensor(p+"attn_q_a.weight"))||(!kvb_&&!split))return false;
+            std::size_t Dv=0,KVB_W=0;
+            if(split){
+                Dv=tvb_->elements/(rank*std::size_t(H));
+                if(!Dv)return false;
+            }else{
+                const std::size_t HBD=kvb_->elements/(rank*std::size_t(H));
+                if(!HBD||HBD<=nope)return false;
+                Dv=HBD-nope;
+                KVB_W=std::size_t(H)*HBD;
+            }
+            const std::size_t QW_=std::size_t(H)*Dk;
+            const std::size_t HDv=std::size_t(H)*Dv;
+            const std::size_t MLS=rank+config_.rope_dim; // see prefill branch
+            if(lq){if(!tensor_matvec(*lq,norm.data(),q.data(),QW_,E))return false;}
+            else{
+                const auto* qqa=tensor(p+"attn_q_a.weight");
+                const auto* qqb=tensor(p+"attn_q_b.weight");
+                const auto* qqn=tensor(p+"attn_q_a_norm.weight");
+                if(!qqa||!qqb||!qqn)return false;
+                const std::size_t qlora=qqa->elements/E;
+                std::vector<float> qa(qlora);
+                if(!tensor_matvec(*qqa,norm.data(),qa.data(),qlora,E))return false;
+                rms_norm(qa.data(),qqn->values.data(),qa.data(),qlora,config_.rms_epsilon);
+                if(!tensor_matvec(*qqb,qa.data(),q.data(),QW_,qlora))return false;
+            }
+            std::vector<float> kva(L),lat(rank);
+            if(!tensor_matvec(*tkv_,norm.data(),kva.data(),L,E))return false;
+            rms_norm(kva.data(),kna_->values.data(),lat.data(),rank,config_.rms_epsilon);
+            std::vector<float> tc,ts;
+            rope_table(config_.rope_dim,pos,config_.rope_base,config_.rope_scaling_type,config_.rope_scaling_factor,config_.rope_original_context,config_.rope_low_freq_factor,config_.rope_high_freq_factor,config_.rope_yarn_beta_fast,config_.rope_yarn_beta_slow,tc,ts);
+            for(std::size_t h=0;h<H;++h){
+                float* pe=q.data()+h*Dk+nope;
+                for(std::size_t i=0;i<tc.size();++i){
+                    const float a=pe[2*i],b=pe[2*i+1];
+                    pe[2*i]=a*tc[i]-b*ts[i];
+                    pe[2*i+1]=a*ts[i]+b*tc[i];
+                }
+            }
+            float* ke=kva.data()+rank;
+            for(std::size_t i=0;i<tc.size();++i){
+                const float a=ke[2*i],b=ke[2*i+1];
+                ke[2*i]=a*tc[i]-b*ts[i];
+                ke[2*i+1]=a*ts[i]+b*tc[i];
+            }
+            if(kc[l].size()<std::size_t(pos+1)*MLS||vc[l].size()<std::size_t(pos+1)*MLS)return false;
+            std::memcpy(kc[l].data()+std::size_t(pos)*MLS,lat.data(),rank*sizeof(float));
+            std::memcpy(vc[l].data()+std::size_t(pos)*MLS,ke,config_.rope_dim*sizeof(float));
+            const std::size_t nT=std::size_t(pos)+1;
+            std::vector<float> outHv(HDv,0.0f);
+            const float ascale=config_.attn_scale>0?config_.attn_scale:1.0f/std::sqrt(float(Dk));
+            if(split){
+                const auto rbfk=quant::row_bytes(*tkb_->format,nope);
+                const auto rbfv=quant::row_bytes(*tvb_->format,rank);
+                if(!rbfk||!rbfv)return false;
+                for(std::size_t h=0;h<H;++h){
+                    const float* qnope=q.data()+h*Dk;
+                    const float* qpe=q.data()+h*Dk+nope;
+                    Tensor subk=*tkb_;
+                    subk.raw=tkb_->raw+std::size_t(h)*(rank*nope)*rbfk/nope;
+                    subk.elements=rank*nope;
+                    std::vector<float> qabs(rank);
+                    if(!tensor_matvec(subk,qnope,qabs.data(),rank,nope))return false;
+                    float mx=-std::numeric_limits<float>::infinity();
+                    std::vector<float> scores(pos+1);
+                    for(std::size_t j=0;j<=pos;++j){
+                        const float* lat_j=kc[l].data()+j*MLS;
+                        const float* kpe_j=vc[l].data()+j*MLS;
+                        float dot=0.0f;
+                        for(std::size_t i=0;i<rank;++i)dot+=qabs[i]*lat_j[i];
+                        for(std::size_t i=0;i<config_.rope_dim;++i)dot+=qpe[i]*kpe_j[i];
+                        scores[j]=dot*ascale;mx=std::max(mx,scores[j]);
+                    }
+                    double denom=0.0;
+                    for(std::size_t j=0;j<=pos;++j){scores[j]=std::exp(scores[j]-mx);denom+=scores[j];}
+                    if(!(denom>0.0)||!std::isfinite(denom))return false;
+                    std::vector<float> out_pre(rank,0.0f);
+                    for(std::size_t j=0;j<=pos;++j){
+                        const float a=scores[j]/float(denom);
+                        const float* lat_j=kc[l].data()+j*MLS;
+                        for(std::size_t i=0;i<rank;++i)out_pre[i]+=a*lat_j[i];
+                    }
+                    Tensor subv=*tvb_;
+                    subv.raw=tvb_->raw+std::size_t(h)*(Dv*rank)*rbfv/rank;
+                    subv.elements=Dv*rank;
+                    if(!tensor_matvec(subv,out_pre.data(),outHv.data()+h*Dv,Dv,rank))return false;
+                }
+            }else{
+                const std::size_t HBD=KVB_W/std::size_t(H);
+                std::vector<float> latt(nT*rank),kvb(nT*KVB_W,0.0f);
+                for(std::size_t j=0;j<nT;++j)std::memcpy(latt.data()+j*rank,kc[l].data()+j*MLS,rank*sizeof(float));
+                if(!tensor_gemm(*kvb_,latt.data(),kvb.data(),nT,KVB_W,rank))return false;
+                for(std::size_t h=0;h<H;++h){
+                    const float* qnope=q.data()+h*Dk;
+                    const float* qpe=q.data()+h*Dk+nope;
+                    float mx=-std::numeric_limits<float>::infinity();
+                    std::vector<float> scores(pos+1);
+                    for(std::size_t j=0;j<=pos;++j){
+                        const float* ksj=kvb.data()+j*KVB_W+h*HBD;
+                        const float* kpe_j=vc[l].data()+j*MLS;
+                        float dot=0.0f;
+                        for(std::size_t i=0;i<nope;++i)dot+=qnope[i]*ksj[i];
+                        for(std::size_t i=0;i<config_.rope_dim;++i)dot+=qpe[i]*kpe_j[i];
+                        scores[j]=dot*ascale;mx=std::max(mx,scores[j]);
+                    }
+                    double denom=0.0;
+                    for(std::size_t j=0;j<=pos;++j){scores[j]=std::exp(scores[j]-mx);denom+=scores[j];}
+                    if(!(denom>0.0)||!std::isfinite(denom))return false;
+                    float* out=outHv.data()+h*Dv;
+                    for(std::size_t j=0;j<=pos;++j){
+                        const float a=scores[j]/float(denom);
+                        const float* vj=kvb.data()+j*KVB_W+h*HBD+nope;
+                        for(std::size_t i=0;i<Dv;++i)out[i]+=a*vj[i];
+                    }
+                }
+            }
+            if(!tensor_matvec(*lo,outHv.data(),tmp.data(),E,HDv))return false;
+            for(std::size_t i=0;i<E;++i)x[i]+=tmp[i];
+            if(!finite_values(x.data(),x.size()))return false;
+            gemma_done=true; // shared projection/rope/kv/attention/output skipped
+        }
+        if(config_.gemma_variant){
+            // Gemma4 decode: per-layer head width, v==k when absent, per-head
+            // q/k norms, dual-base rope; attention scale 1.0; post-attn norm +
+            // residual. q/k/v/att computed here; shared FFN section (gelu,
+            // post-norms) handles the rest via the gemma flags.
+            const std::size_t D_l=config_.head_dim_per_layer.empty()?D:config_.head_dim_per_layer[l];
+            const std::size_t QW_l=std::size_t(H)*D_l;
+            const auto* tk2=tensor(p+"attn_k.weight");
+            const std::size_t KW_l=tk2?tk2->elements/E:KW;
+            const std::uint32_t KH_l=static_cast<std::uint32_t>(KW_l/D_l);
+            const std::uint32_t rd_l=static_cast<std::uint32_t>(D_l);
+            const float base_l=(D_l==512)?1.0e6f:1.0e4f;
+            if(!tensor_matvec(*lq,norm.data(),q.data(),QW_l,E))return false;
+            if(!tensor_matvec(*lk,norm.data(),k.data(),KW_l,E))return false;
+            if(lv){if(!tensor_matvec(*lv,norm.data(),v.data(),KW_l,E))return false;}
+            else{std::copy_n(k.data(),KW_l,v.data());}
+            if(lv){for(std::size_t h=0;h<KH_l;++h){float* vh=v.data()+std::size_t(h)*D_l;double ss=0.0;for(std::size_t i=0;i<D_l;++i)ss+=double(vh[i])*vh[i];const float inv=1.0f/std::sqrt(float(ss/D_l)+config_.rms_epsilon);for(std::size_t i=0;i<D_l;++i)vh[i]*=inv;}}
+            if(qnorm&&qnorm->values.size()==D_l)qk_rms_norm(q.data(),H,(std::uint32_t)D_l,qnorm->values.data(),config_.rms_epsilon);
+            if(knorm&&knorm->values.size()==D_l)qk_rms_norm(k.data(),KH_l,(std::uint32_t)D_l,knorm->values.data(),config_.rms_epsilon);
+            std::vector<float> tc,ts;
+            rope_table(rd_l,pos,base_l,config_.rope_scaling_type,config_.rope_scaling_factor,config_.rope_original_context,config_.rope_low_freq_factor,config_.rope_high_freq_factor,config_.rope_yarn_beta_fast,config_.rope_yarn_beta_slow,tc,ts);
+            rope_apply_table(q.data(),H,(std::uint32_t)D_l,rd_l/2,tc.data(),ts.data(),config_.rope_pairs_adjacent);
+            rope_apply_table(k.data(),KH_l,(std::uint32_t)D_l,rd_l/2,tc.data(),ts.data(),config_.rope_pairs_adjacent);
+            std::memcpy(kc[l].data()+std::size_t(pos)*KW_l,k.data(),KW_l*sizeof(float));
+            std::memcpy(vc[l].data()+std::size_t(pos)*KW_l,v.data(),KW_l*sizeof(float));
+            {
+                const std::size_t first_pos=config_.sliding_window&&pos+1>config_.sliding_window?pos+1-config_.sliding_window:0;
+                const float ascale=config_.attn_scale>0?config_.attn_scale:1.0f;
+                for(std::uint32_t h=0;h<H;++h){
+                    const std::uint32_t kh=h*KH_l/H;
+                    float mx=-std::numeric_limits<float>::infinity();
+                    const float* qh=q.data()+std::size_t(h)*D_l;
+                    std::vector<float> scores(pos+1);
+                    for(std::size_t j=first_pos;j<=pos;++j){
+                        const float* kt=kc[l].data()+j*KW_l+std::size_t(kh)*D_l;
+                        float dot=0.0f;for(std::size_t i=0;i<D_l;++i)dot+=qh[i]*kt[i];
+                        scores[j]=dot*ascale;mx=std::max(mx,scores[j]);
+                    }
+                    double denom=0.0;for(std::size_t j=first_pos;j<=pos;++j){scores[j]=std::exp(scores[j]-mx);denom+=scores[j];}
+                    float* out=att.data()+std::size_t(h)*D_l;
+                    for(std::size_t j=first_pos;j<=pos;++j){
+                        const float a=scores[j]/float(denom);
+                        const float* vt=vc[l].data()+j*KW_l+std::size_t(kh)*D_l;
+                        for(std::size_t i=0;i<D_l;++i)out[i]+=a*vt[i];
+                    }
+                }
+            }
+            if(!tensor_matvec(*lo,att.data(),tmp.data(),E,QW_l))return false;
+            const auto* pan=tensor(p+"post_attention_norm.weight");
+            if(!pan||!pan->values.size())return false;
+            rms_norm(tmp.data(),pan->values.data(),tmp.data(),E,config_.rms_epsilon);
+            for(std::size_t i=0;i<E;++i)x[i]+=tmp[i];
+            gemma_done=true;
+        }
+        if(!gemma_done){
+            if(!gemma_done){
+            if(tensor(p+"ssm_in.weight")){
+            // Mamba-2 recurrent layer (nemotron_h): single decode step with
+            // persistent conv/SSM state.
+            if(!nem_conv||!nem_state)return false;
+            if(!mamba2_forward(p,norm.data(),x.data(),1,(*nem_conv)[l],(*nem_state)[l]))return false;
+            std::fill(q.begin(),q.end(),0.0f);
+            std::fill(k.begin(),k.end(),0.0f);
+            std::fill(v.begin(),v.end(),0.0f);
+            }
+        }
+        }
+        // Shortconv layer (lfm2moe recurrent): no attention QKV. Best-effort
+        // gated depthwise with zero history for the single decode token.
+        if(tensor(p+"shortconv.in_proj.weight")){
+            const auto* si=tensor(p+"shortconv.in_proj.weight");
+            const auto* sc=tensor(p+"shortconv.conv.weight");
+            const auto* so=tensor(p+"shortconv.out_proj.weight");
+            if(!si||!sc||!so)return false;
+            if(!sc->values.empty()){
+                std::vector<float> proj(3*E),conv_out(E),gated(E);
+                if(!tensor_matvec(*si,norm.data(),proj.data(),3*E,E))return false;
+                for(std::size_t c=0;c<E;++c){
+                    // Causal conv3 with zero history (decode step): only the
+                    // center tap sees the current token; taps -2/-1 are zero.
+                    const float cw2=sc->values[2*E+c];
+                    conv_out[c]=cw2*proj[c];
+                }
+                silu_inplace(conv_out.data(),E);
+                for(std::size_t c=0;c<E;++c)gated[c]=conv_out[c]*proj[E+c]+proj[2*E+c];
+                if(!tensor_matvec(*so,gated.data(),tmp.data(),E,E))return false;
+                for(std::size_t i=0;i<E;++i)x[i]+=tmp[i];
+                std::fill(q.begin(),q.end(),0.0f);
+                std::fill(k.begin(),k.end(),0.0f);
+                std::fill(v.begin(),v.end(),0.0f);
+            }
+        }
         bool attn_device_ok=false;
         {
             zen::diag::Scope scope("transformer.attention.projection",zen::diag::Phase::compute);
@@ -2137,28 +4167,99 @@ bool DenseTransformerRuntime::forward(std::uint32_t token,std::uint32_t pos,
             const DenseTransformerRuntime::Tensor* const qkv_t[3]={lq,lk,lv};
             float* const qkv_y[3]={q.data(),k.data(),v.data()};
             const std::size_t qkv_r[3]={QW,KW,KW};
-            if(!tensor_matvec_batch(qkv_t,norm.data(),qkv_y,qkv_r,3,E))return false;
+            if(tensor(p+"attn_qkv.weight")){
+                // Phi-3 fused QKV (dedicated scratch: "tmp" is E-wide only).
+                std::vector<float> qkvf(QW+2*KW);
+                if(!tensor_matvec(*tensor(p+"attn_qkv.weight"),norm.data(),qkvf.data(),QW+2*KW,E))return false;
+                std::copy_n(qkvf.data(),QW,q.data());
+                std::copy_n(qkvf.data()+QW,KW,k.data());
+                std::copy_n(qkvf.data()+QW+KW,KW,v.data());
+            }
+            else if(config_.k2_variant){
+                // K2-Horizon: Q/K dense GEMMs; V plain on dense layers,
+                // MoVA-routed on MoE layers.
+                if(!tensor_matvec(*lq,norm.data(),q.data(),QW,E))return false;
+                if(!tensor_matvec(*lk,norm.data(),k.data(),KW,E))return false;
+                if(lv){if(!tensor_matvec(*lv,norm.data(),v.data(),KW,E))return false;}
+                else{
+                    const auto* vg=tensor(p+"attn_v_gate.weight");
+                    const auto* vge=tensor(p+"attn_v_exps.weight");
+                    if(!vg||!vge)return false;
+                    const std::size_t EN3=config_.value_expert_count,EK3=config_.value_expert_used;
+                    if(!EN3||!EK3||EK3>EN3||vge->dims.size()!=3||vge->dims[2]!=EN3)return false;
+                    std::vector<float> vlogits(EN3);
+                    if(!tensor_matvec(*vg,norm.data(),vlogits.data(),EN3,E))return false;
+                    std::vector<float> probs(EN3);
+                    for(std::size_t i=0;i<EN3;++i)probs[i]=1.0f/(1.0f+std::exp(-vlogits[i]));
+                    std::vector<float> sel=probs;
+                    if(const auto* vb=tensor(p+"attn_v_gate.bias")){
+                        if(vb->values.size()!=EN3)return false;
+                        for(std::size_t i=0;i<EN3;++i)sel[i]+=vb->values[i];
+                    }
+                    std::vector<std::uint32_t> idx(EN3);
+                    std::iota(idx.begin(),idx.end(),0u);
+                    std::partial_sort(idx.begin(),idx.begin()+EK3,idx.end(),[&](std::uint32_t a,std::uint32_t b){return sel[a]>sel[b];});
+                    const auto rbg=quant::row_bytes(*vge->format,E);
+                    if(!rbg)return false;
+                    double wsum=0.0;for(std::size_t i=0;i<EK3;++i)wsum+=probs[idx[i]];
+                    if(!(wsum>0.0))return false;
+                    std::fill(v.begin(),v.end(),0.0f);
+                    for(std::size_t i=0;i<EK3;++i){
+                        const std::uint32_t e=idx[i];
+                        const float w=float(probs[e]/wsum)*config_.moe_w_scale;
+                        Tensor sv=*vge;sv.raw=vge->raw+std::size_t(e)*KW*rbg;sv.elements=KW*E;
+                        std::vector<float> mid(KW);
+                        if(!tensor_matvec(sv,norm.data(),mid.data(),KW,E))return false;
+                        silu_inplace(mid.data(),KW);
+                        for(std::size_t k2=0;k2<KW;++k2)v[k2]+=w*mid[k2];
+                    }
+                }
+            }
+            else if(lq&&lk&&lv&&!gemma_done){if(!tensor_matvec_batch(qkv_t,norm.data(),qkv_y,qkv_r,3,E))return false;}
+            else if(lq&&lk&&!lv&&config_.gemma_variant&&!gemma_done){
+                // Gemma4: v_proj absent -> v = k (reused).
+                if(!tensor_matvec(*lq,norm.data(),q.data(),QW,E))return false;
+                if(!tensor_matvec(*lk,norm.data(),k.data(),KW,E))return false;
+                v=k;
+            }
+            else{
+                // Shortconv layer: q/k/v stay zeroed above; bias/norm/rope on
+                // zeros are no-ops, so skip the per-op work entirely.
+                std::fill(q.begin(),q.end(),0.0f);
+                std::fill(k.begin(),k.end(),0.0f);
+                std::fill(v.begin(),v.end(),0.0f);
+            }
             for(const auto& item:std::array<std::pair<const DenseTransformerRuntime::Tensor*,std::vector<float>*>,3>{{{qb,&q},{kb,&k},{vb,&v}}})if(const auto*bias=item.first){if(bias->values.size()!=item.second->size())return false;for(std::size_t i=0;i<item.second->size();++i)(*item.second)[i]+=bias->values[i];}
             {zen::diag::Scope sfin("prefill.finite_qkv",zen::diag::Phase::compute);
             if(!finite_values(q.data(),q.size())||!finite_values(k.data(),k.size())||!finite_values(v.data(),v.size()))return false;}
             if((qnorm==nullptr)!=(knorm==nullptr))return false;
-            if(qnorm){if(qnorm->values.size()!=D||knorm->values.size()!=D)return false;qk_rms_norm(q.data(),H,D,qnorm->values.data(),config_.rms_epsilon);qk_rms_norm(k.data(),KH,D,knorm->values.data(),config_.rms_epsilon);}
+            if(qnorm){
+                const bool per_head=(qnorm->values.size()==D&&knorm->values.size()==D);
+                const bool full=(qnorm->values.size()==QW&&knorm->values.size()==KW);
+                const bool gemma_layer=config_.gemma_variant&&!config_.head_dim_per_layer.empty()&&l<config_.head_dim_per_layer.size()&&qnorm->values.size()==config_.head_dim_per_layer[l]&&knorm->values.size()==config_.head_dim_per_layer[l];
+                if(!per_head&&!full&&!gemma_layer)return false;
+                if(per_head){qk_rms_norm(q.data(),H,D,qnorm->values.data(),config_.rms_epsilon);qk_rms_norm(k.data(),KH,D,knorm->values.data(),config_.rms_epsilon);}
+                else if(gemma_layer){qk_rms_norm(q.data(),H,config_.head_dim_per_layer[l],qnorm->values.data(),config_.rms_epsilon);qk_rms_norm(k.data(),KH,config_.head_dim_per_layer[l],knorm->values.data(),config_.rms_epsilon);}
+                else{rms_norm(q.data(),qnorm->values.data(),q.data(),QW,config_.rms_epsilon);rms_norm(k.data(),knorm->values.data(),k.data(),KW,config_.rms_epsilon);}
+            }
             // Device attention: rope(q), rope(k), the cache append and GQA attention in
             // one submission. q/k are still pre-rope here, which is what the kernel
             // expects. On failure the host path below runs unchanged.
 #if defined(ZEN_HAS_D3D12)
-            if(!config_.use_alibi&&device_attention_available(config_.layers,kc[l].size()/KW,KH,D,config_.rms_epsilon)){
+            if(!config_.use_alibi&&!config_.has_attn_sinks&&device_attention_available(config_.layers,kc[l].size()/KW,KH,D,config_.rms_epsilon)){
                 device_rope_table();
                 const std::uint32_t dev_first=config_.sliding_window&&pos+1>config_.sliding_window?pos+1-config_.sliding_window:0;
                 attn_device_ok=zen::d3d12::attention_block(q.data(),k.data(),v.data(),rope_cos.data(),rope_sin.data(),att.data(),H,KH,D,rope_cos.size(),l,pos,dev_first,config_.rope_pairs_adjacent);
             }
 #endif
-            if(!config_.use_alibi){
+            if(!config_.use_alibi&&!gemma_done){
+                if(config_.rope_pattern.empty()||l>=config_.rope_pattern.size()||config_.rope_pattern[l]){
                 rope(q.data(),H,D,config_.rope_dim,pos,config_.rope_base,config_.rope_scaling_type,config_.rope_scaling_factor,config_.rope_original_context,config_.rope_low_freq_factor,config_.rope_high_freq_factor,config_.rope_yarn_beta_fast,config_.rope_yarn_beta_slow,config_.rope_pairs_adjacent);
                 rope(k.data(),KH,D,config_.rope_dim,pos,config_.rope_base,config_.rope_scaling_type,config_.rope_scaling_factor,config_.rope_original_context,config_.rope_low_freq_factor,config_.rope_high_freq_factor,config_.rope_yarn_beta_fast,config_.rope_yarn_beta_slow,config_.rope_pairs_adjacent);
+                }
             }
-            std::copy(k.begin(),k.end(),kc[l].begin()+std::size_t(pos)*KW);
-            std::copy(v.begin(),v.end(),vc[l].begin()+std::size_t(pos)*KW);
+            if(!gemma_done){std::copy(k.begin(),k.end(),kc[l].begin()+std::size_t(pos)*KW);
+            std::copy(v.begin(),v.end(),vc[l].begin()+std::size_t(pos)*KW);}
         }
         // Set when the FFN half of this layer ran as one GPU submission, which also
         // covers the attention output matvec and its residual.
@@ -2167,10 +4268,10 @@ bool DenseTransformerRuntime::forward(std::uint32_t token,std::uint32_t pos,
             zen::diag::Scope scope("transformer.attention.softmax",zen::diag::Phase::compute);
             // The device block already filled `att`; only the host fallback recomputes
             // it. Everything after this guard (BitNet subln, attn_output, FFN) still runs.
-            if(!attn_device_ok){
+            if(!attn_device_ok&&!gemma_done){
             std::fill(att.begin(),att.end(),0.0f);
             const std::uint32_t group=H/KH;
-            const float inv_scale=1.0f/std::sqrt(float(D));
+            const float inv_scale=config_.attn_scale>0?config_.attn_scale:1.0f/std::sqrt(float(D));
             const std::uint32_t first_pos=config_.sliding_window&&pos+1>config_.sliding_window?pos+1-config_.sliding_window:0;
             std::atomic<bool> attn_ok{true};
             // ZI-P6: one scratch row per head so the heads of a decode step run in
@@ -2187,8 +4288,17 @@ bool DenseTransformerRuntime::forward(std::uint32_t token,std::uint32_t pos,
                     if(!std::isfinite(scores[t])){attn_ok.store(false,std::memory_order_relaxed);return;}
                     max_score=std::max(max_score,scores[t]);
                 }
+                // Attention sinks (gpt-oss): one extra virtual position with
+                // learned per-head score; dilutes via the softmax denominator
+                // but contributes no value.
+                const auto* sinks=tensor(p+"attn_sinks.weight");
+                if(sinks&&config_.has_attn_sinks){
+                    if(sinks->values.size()<=h){attn_ok.store(false,std::memory_order_relaxed);return;}
+                    max_score=std::max(max_score,sinks->values[h]);
+                }
                 double denom=0.0;
                 for(std::uint32_t t=first_pos;t<=pos;++t){scores[t]=std::exp(scores[t]-max_score);denom+=scores[t];}
+                if(sinks&&config_.has_attn_sinks)denom+=std::exp(sinks->values[h]-max_score);
                 if(!(denom>0.0)||!std::isfinite(denom)){attn_ok.store(false,std::memory_order_relaxed);return;}
                 float* out=att.data()+std::size_t(h)*D;
                 const float inv=1.0f/static_cast<float>(denom);
@@ -2210,55 +4320,236 @@ bool DenseTransformerRuntime::forward(std::uint32_t token,std::uint32_t pos,
                 for(std::uint32_t h=0;h<H&&attn_ok.load(std::memory_order_relaxed);++h)
                     head_row(h,attn_scratch.data()+std::size_t(h)*(pos+1));
             }
-            if(!attn_ok.load())return false;
+        if(!attn_ok.load())return false;
             }  // !attn_device_ok
             // BitNet subln: RMS-normalise the attention output before the
             // wo projection (src/models/bitnet.cpp: attn_sub_norm).
             if(config_.bitnet_variant)rms_norm(att.data(),tensor(p+"attn_sub_norm.weight")->values.data(),att.data(),QW,config_.rms_epsilon);
-            if(!config_.bitnet_variant){
+            // Laguna attn_gate is applied on the host (softplus per-head), so
+            // any layer carrying it must skip the fused GPU half.
+            if(!config_.bitnet_variant&&!config_.gemma_variant&&!config_.deepseek_variant&&!tensor(p+"attn_gate.weight")){
                 if(lo&&lfn&&lg&&lu&&ldw)
                     half_fused=tensor_ffn_residual_fused(*lo,*lg,*lu,*ldw,lfn->values.data(),
                                                          x.data(),att.data(),x.data(),E,QW,F,
                                                          config_.rms_epsilon);
             }
             if(!half_fused){
-                if(!tensor_matvec(*lo,att.data(),tmp.data(),E,QW))return false;
-                for(std::uint32_t i=0;i<E;++i)x[i]+=tmp[i];
+                const auto* ag=tensor(p+"attn_gate.weight");
+                if(ag){
+                    const std::size_t GD=ag->elements/config_.embedding;
+                    std::vector<float> gate(GD);
+                    if(!tensor_matvec(*ag,norm.data(),gate.data(),GD,E))return false;
+                    // K2-Horizon: log2 softplus; else plain softplus (laguna).
+                    auto gate_of=[&](float g)->float{
+                        if(config_.k2_variant){const float y=g*0.69314718f;return (y>20.0f?y:std::log(1.0f+std::exp(y)))*1.44269504f;}
+                        return g>20.0f?g:std::log(1.0f+std::exp(g));
+                    };
+                    if(GD!=QW){
+                        for(std::size_t h=0;h<GD;++h){
+                            float g=gate[h];
+                            float sp=gate_of(g);
+                            float* o=att.data()+h*D;
+                            for(std::size_t i=0;i<D;++i)o[i]*=sp;
+                        }
+                    }else{
+                        for(std::size_t i=0;i<QW;++i){
+                            float g=gate[i];
+                            float sp=gate_of(g);
+                            att[i]*=sp;
+                        }
+                    }
+                }
+                if(lo&&!gemma_done){if(!tensor_matvec(*lo,att.data(),tmp.data(),E,QW))return false;
+                if(const auto* obias=tensor(p+"attn_output.bias")){
+                    if(obias->values.size()!=E)return false;
+                    for(std::uint32_t i=0;i<E;++i)tmp[i]+=obias->values[i];
+                }
+                if(config_.gemma_variant){
+                    const auto* pan=tensor(p+"post_attention_norm.weight");
+                    if(!pan||!pan->values.size())return false;
+                    rms_norm(tmp.data(),pan->values.data(),tmp.data(),E,config_.rms_epsilon);
+                }
+                for(std::uint32_t i=0;i<E;++i)x[i]+=tmp[i];}
             }
         }
         {
             zen::diag::Scope scope("transformer.ffn",zen::diag::Phase::compute);
+            if(config_.moe_nemotron&&tensor(p+"ffn_up_exps.weight")){
+                if(!nemotron_moe_forward(p,norm.data(),x.data(),1))return false;
+                continue;
+            }
+            if(!lfn&&config_.gpt_oss_variant)lfn=tensor(p+"post_attention_norm.weight");
+            if(!lfn){
+                // SSM-only layer (nemotron): no FFN block.
+                if(!finite_values(x.data(),x.size()))return false;
+                continue;
+            }
             // The fused path already normed into VRAM, so this only runs on the
             // separate-op fallback.
-            if(!half_fused)rms_norm(x.data(),lfn->values.data(),norm.data(),E,config_.rms_epsilon);
+            if(!half_fused){const auto* fb=tensor(p+"ffn_norm.bias");if(config_.layernorm_variant){if(!fb)return false;layernorm(x.data(),lfn->values.data(),fb->values.data(),norm.data(),E,config_.rms_epsilon);}else if(config_.k2_variant)group_rms_norm(x.data(),lfn->values.data(),norm.data(),E,config_.group_norm_groups,config_.rms_epsilon);else rms_norm(x.data(),lfn->values.data(),norm.data(),E,config_.rms_epsilon);}
             if(!finite_values(norm.data(),E))return false;
             // Seeded from half_fused so a fused layer skips the FFN batch entirely
             // instead of recomputing what the single submission already produced.
             bool ffn_fused=half_fused;
-            if(!half_fused&&!config_.bitnet_variant&&lg&&lu&&ldw){
+            if(!ffn_fused&&config_.moe_expert_count&&tensor(p+"ffn_gate_exps.weight")){
+                const std::size_t EN=config_.moe_expert_count,EK=config_.moe_used_count,EF=config_.moe_ffn;
+                const auto* router=tensor(p+"ffn_gate_inp.weight");
+                const auto* ge=tensor(p+"ffn_gate_exps.weight");
+                const auto* ue=tensor(p+"ffn_up_exps.weight");
+                const auto* de=tensor(p+"ffn_down_exps.weight");
+                if(!router||!ge||!ue||!de)return false;
+                std::vector<float> rlogits(EN),tmpEF(EF),tmpOut(E);
+                if(!tensor_matvec(*router,norm.data(),rlogits.data(),EN,E))return false;
+                {
+                    const auto* exp_bias=tensor(p+"ffn_exp_probs_b");if(!exp_bias&&config_.gpt_oss_variant)exp_bias=tensor(p+"ffn_gate_inp.bias");
+                    std::vector<float> bias_vec(EN,0.0f);
+                    if(exp_bias){
+                        if(exp_bias->values.size()==EN)bias_vec=exp_bias->values;
+                        else if(exp_bias->raw&&exp_bias->format){
+                            std::vector<float> tmpv(EN);
+                            if(!quant::dequantize(*exp_bias->format,exp_bias->raw,EN,tmpv.data(),1.0f))return false;
+                            bias_vec=std::move(tmpv);
+                        }
+                    }
+                    for(std::size_t i=0;i<EN;++i)rlogits[i]+=bias_vec[i];
+                }
+                if(config_.moe_sigmoid){
+                    for(std::size_t i=0;i<EN;++i)rlogits[i]=1.0f/(1.0f+std::exp(-rlogits[i]));
+                }else{
+                    float mx=rlogits[0];for(std::size_t i=1;i<EN;++i)mx=std::max(mx,rlogits[i]);
+                    double sum=0.0;for(std::size_t i=0;i<EN;++i){rlogits[i]=std::exp(rlogits[i]-mx);sum+=rlogits[i];}
+                    if(!(sum>0.0)||!std::isfinite(sum))return false;
+                    for(std::size_t i=0;i<EN;++i)rlogits[i]/=float(sum);
+                }
+                std::vector<std::uint32_t> idx(EN);
+                std::iota(idx.begin(),idx.end(),0u);
+                std::partial_sort(idx.begin(),idx.begin()+EK,idx.end(),[&](std::uint32_t a,std::uint32_t b){return rlogits[a]>rlogits[b];});
+                double wsum=0.0;for(std::size_t i=0;i<EK;++i)wsum+=rlogits[idx[i]];
+                if(!(wsum>0.0))return false;
+                std::fill(tmp.begin(),tmp.end(),0.0f);
+                for(std::size_t i=0;i<EK;++i){
+                    const std::uint32_t e=idx[i];
+                    const float w=float(rlogits[e]/wsum)*((config_.deepseek_variant||config_.k2_variant)?config_.moe_w_scale:1.0f);
+                    Tensor sg=*ge,su=*ue,sd=*de;
+                    const auto rbg=quant::row_bytes(*ge->format,E),rbu=quant::row_bytes(*ue->format,E),rbd=quant::row_bytes(*de->format,EF);
+                    if(!rbg||!rbu||!rbd)return false;
+                    sg.raw=ge->raw+std::size_t(e)*EF*rbg;
+                    su.raw=ue->raw+std::size_t(e)*EF*rbu;
+                    sd.raw=de->raw+std::size_t(e)*(E*rbd);
+                    std::vector<float> eGate(EF),eUp(EF);
+                    if(!tensor_matvec(sg,norm.data(),eGate.data(),EF,E))return false;
+                    if(!tensor_matvec(su,norm.data(),eUp.data(),EF,E))return false;
+                    silu_mul(eGate.data(),eUp.data(),tmpEF.data(),EF);
+                    if(!tensor_matvec(sd,tmpEF.data(),tmpOut.data(),E,EF))return false;
+                    for(std::size_t k=0;k<E;++k)tmp[k]+=w*tmpOut[k];
+                }
+                {
+                    const auto* sg2=tensor(p+"ffn_gate_shexp.weight");
+                    const auto* su2=tensor(p+"ffn_up_shexp.weight");
+                    const auto* sd2=tensor(p+"ffn_down_shexp.weight");
+                    if(sg2&&su2&&sd2){
+                        const std::size_t SFEF=sg2->elements/E;
+                        std::vector<float> sGate(SFEF),sUp(SFEF),sMid(SFEF);
+                        if(!tensor_matvec(*sg2,norm.data(),sGate.data(),SFEF,E))return false;
+                        if(!tensor_matvec(*su2,norm.data(),sUp.data(),SFEF,E))return false;
+                        silu_mul(sGate.data(),sUp.data(),sMid.data(),SFEF);
+                        if(!tensor_matvec(*sd2,sMid.data(),tmpOut.data(),E,SFEF))return false;
+                        for(std::size_t k=0;k<E;++k)tmp[k]+=tmpOut[k];
+                    }
+                }
+                for(std::uint32_t i=0;i<E;++i)x[i]+=tmp[i];
+                if(!finite_values(x.data(),x.size()))return false;
+                ffn_fused=true;
+            }
+            if(!ffn_fused&&config_.gelu_par_variant){
+                // spark2_5 decode FFN: gelu(gate) * up -> down.
+                if(!lg||!lu||!ldw)return false;
+                if(!tensor_matvec(*lg,norm.data(),gate.data(),F,E))return false;
+                if(!tensor_matvec(*lu,norm.data(),up.data(),F,E))return false;
+                gelu_exact(gate.data(),F);
+                for(std::size_t i=0;i<F;++i)ffn[i]=gate[i]*up[i];
+                if(!tensor_matvec(*ldw,ffn.data(),tmp.data(),E,F))return false;
+                for(std::uint32_t i=0;i<E;++i)x[i]+=tmp[i];
+                if(!finite_values(x.data(),x.size()))return false;
+                ffn_fused=true;
+            }else
+            if(!ffn_fused&&config_.gelu_variant){
+                // starcoder2 decode FFN: up+bias -> exact gelu -> down+bias.
+                if(!lu||!ldw)return false;
+                if(!tensor_matvec(*lu,norm.data(),ffn.data(),F,E))return false;
+                if(const auto* ub=tensor(p+"ffn_up.bias")){
+                    if(ub->values.size()!=F)return false;
+                    for(std::size_t i=0;i<F;++i)ffn[i]+=ub->values[i];
+                }
+                gelu_exact(ffn.data(),F);
+                if(!tensor_matvec(*ldw,ffn.data(),tmp.data(),E,F))return false;
+                if(const auto* db=tensor(p+"ffn_down.bias")){
+                    if(db->values.size()!=E)return false;
+                    for(std::uint32_t i=0;i<E;++i)tmp[i]+=db->values[i];
+                }
+                for(std::uint32_t i=0;i<E;++i)x[i]+=tmp[i];
+                if(!finite_values(x.data(),x.size()))return false;
+                ffn_fused=true;
+            }else
+            if(!half_fused&&!config_.bitnet_variant&&!config_.gemma_variant&&lg&&lu&&ldw){
                 // gate|up|SiLU|down in one submission: the activation never leaves VRAM,
                 // which removes a full queue round trip from every layer.
                 ffn_fused=tensor_ffn(*lg,*lu,*ldw,norm.data(),tmp.data(),F,E,E);
                 if(ffn_fused)for(std::uint32_t i=0;i<E;++i)x[i]+=tmp[i];
             }
-            if(!ffn_fused){
+            if(!ffn_fused&&config_.phi3_variant){
+                // Phi-3 decode FFN: up=[2F]; silu(first half) * second half.
+                std::vector<float> up2(2*F);
+                if(!tensor_matvec(*lu,norm.data(),up2.data(),2*F,E))return false;
+                for(std::size_t i=0;i<F;++i){const float g=up2[i];const float u=up2[F+i];ffn[i]=(g/(1.0f+std::exp(-g)))*u;}
+                if(!tensor_matvec(*ldw,ffn.data(),tmp.data(),E,F))return false;
+                for(std::uint32_t i=0;i<E;++i)x[i]+=tmp[i];
+                if(!finite_values(x.data(),x.size()))return false;
+            }else if(!ffn_fused&&!lg&&lu&&ldw){
+                // Nemotron up-only FFN: up + RELU_SQR + down.
+                if(!tensor_matvec(*lu,norm.data(),ffn.data(),F,E))return false;
+                for(std::size_t i=0;i<F;++i){const float v=ffn[i];ffn[i]=(v>0.0f)?v*v:0.0f;}
+                if(!tensor_matvec(*ldw,ffn.data(),tmp.data(),E,F))return false;
+                for(std::uint32_t i=0;i<E;++i)x[i]+=tmp[i];
+                if(!finite_values(x.data(),x.size()))return false;
+            }else if(!ffn_fused){
                 const DenseTransformerRuntime::Tensor* const fu_t[2]={lg,lu};
                 float* const fu_y[2]={gate.data(),up.data()};
                 const std::size_t fu_r[2]={F,F};
                 if(!tensor_matvec_batch(fu_t,norm.data(),fu_y,fu_r,2,E))return false;
-                silu_mul(gate.data(),up.data(),ffn.data(),F);
+                if(config_.gemma_variant){
+                    for(std::size_t i=0;i<F;++i){const float g=gate[i];const float tt=0.79788456f*(g+0.044715f*g*g*g);ffn[i]=0.5f*g*(1.0f+std::tanh(tt))*up[i];}
+                }else{
+                    silu_mul(gate.data(),up.data(),ffn.data(),F);
+                }
                 // BitNet subln: RMS-normalise the FFN hidden activation before
                 // ffn_down (src/models/bitnet.cpp: ffn_sub_norm).
                 if(config_.bitnet_variant)rms_norm(ffn.data(),tensor(p+"ffn_sub_norm.weight")->values.data(),ffn.data(),F,config_.rms_epsilon);
                 if(!tensor_matvec(*ldw,ffn.data(),tmp.data(),E,F))return false;
+                if(config_.gemma_variant){
+                    const auto* pfn=tensor(p+"post_ffw_norm.weight");
+                    if(!pfn||!pfn->values.size())return false;
+                    rms_norm(tmp.data(),pfn->values.data(),tmp.data(),E,config_.rms_epsilon);
+                }
                 for(std::uint32_t i=0;i<E;++i)x[i]+=tmp[i];
+                if(config_.gemma_variant){
+                    if(const auto* os=tensor(p+"layer_output_scale.weight")){
+                        float sc=1.0f;
+                        if(os->values.size())sc=os->values[0];
+                        else if(os->raw&&os->format){float tmpv=1.0f;if(quant::dequantize(*os->format,os->raw,1,&tmpv,1.0f))sc=tmpv;}
+                        for(std::uint32_t i=0;i<E;++i)x[i]*=sc;
+                    }
+                }
             }
             if(!finite_values(x.data(),x.size()))return false;
         }
     }
     }
     if(!lm_head_fused){
-        rms_norm(x.data(),tensor("output_norm.weight")->values.data(),norm.data(),E,config_.rms_epsilon);
+        {const auto* ob=tensor("output_norm.bias");
+         if(config_.layernorm_variant){if(!ob)return false;layernorm(x.data(),tensor("output_norm.weight")->values.data(),ob->values.data(),norm.data(),E,config_.rms_epsilon);}
+         else if(config_.k2_variant)group_rms_norm(x.data(),tensor("output_norm.weight")->values.data(),norm.data(),E,config_.group_norm_groups,config_.rms_epsilon);
+         else rms_norm(x.data(),tensor("output_norm.weight")->values.data(),norm.data(),E,config_.rms_epsilon);}
         if(!finite_values(norm.data(),E))return false;
     }
     // ZI-P8: the exhaustive finite scan over the vocab-sized logit row (128256
@@ -2277,6 +4568,7 @@ bool DenseTransformerRuntime::forward(std::uint32_t token,std::uint32_t pos,
     // lm_fuse.fused: the pipeline submission already ran final-rmsnorm + vocab GEMV
     // on the device and read the logits back into logits[] — nothing to do here.
     if(!lm_head_fused&&!tensor_matvec(*output,norm.data(),logits.data(),config_.vocab,E,validate_logits))return false;
+    if(config_.logit_softcap>0.0f){const float c=config_.logit_softcap;for(std::size_t i=0;i<logits.size();++i)logits[i]=std::tanh(logits[i]/c)*c;}
     if(stage_trace){
         acc_setup+=setup_us;acc_pipeline+=pipeline_us;acc_head+=tm_head.us();++acc_n;
         if(acc_n%2==0){
@@ -2317,17 +4609,40 @@ bool DenseTransformerRuntime::generate(const std::vector<std::uint32_t>& prompt,
     std::size_t cache_positions=static_cast<std::size_t>(prompt.size())+static_cast<std::size_t>(max_new);
     const bool full_context_cache=cache_positions<=kMaxCachePositions;
     if(!full_context_cache)return fail("Prompt plus requested generation exceeds the KV cache position limit");
-    std::uint64_t kv_bytes=std::uint64_t(cache_positions)*config_.layers*config_.kv_heads*config_.head_dim*2*sizeof(float);
+    const std::size_t kv_stride=config_.deepseek_variant?std::size_t(config_.kv_lora_rank)+config_.rope_dim:std::size_t(config_.kv_heads)*config_.head_dim;
+    std::uint64_t kv_bytes=std::uint64_t(cache_positions)*config_.layers*kv_stride*2*sizeof(float);
     if(kv_bytes>policy.transient_budget_bytes)return fail("KV cache exceeds ResourceGovernor transient-memory budget");
-    const auto kvsize=static_cast<std::size_t>(std::uint64_t(cache_positions)*config_.kv_heads*config_.head_dim);
+    const auto kvsize=static_cast<std::size_t>(std::uint64_t(cache_positions)*kv_stride);
     std::vector<std::vector<float>> kc,vc;std::vector<float> logits;bool cache_hit=false;
     // qwen35 hybrid: additional recurrent caches (conv windows + GDN states).
     const bool q35=config_.qwen35_variant;
+    // nemotron_h: mamba-2 recurrent caches (fixed conv ring + SSM state per layer).
+    const bool nem=(architecture_name_=="nemotron_h"||architecture_name_=="nemotron_h_moe");
     const std::size_t conv_dim=q35?(std::size_t(config_.ssm_state)*config_.ssm_n_group*2+std::size_t(config_.ssm_state)*config_.ssm_dt_rank):0;
     const std::size_t ssm_dim=q35?std::size_t(config_.ssm_dt_rank)*config_.ssm_state*config_.ssm_state:0;
     std::vector<std::vector<float>> convc,ssmc;
+    std::vector<std::vector<float>> nem_conv,nem_state;
+    std::size_t nem_conv_size=0,nem_state_size=0;
+    if(nem){
+        std::size_t ncd=0;
+        for(std::uint32_t l=0;l<config_.layers;++l){
+            const std::string p="blk."+std::to_string(l)+".";
+            if(tensor(p+"ssm_conv1d.weight")){
+                ncd=tensor(p+"ssm_conv1d.weight")->elements/config_.ssm_d_conv;
+                break;
+            }
+        }
+        if(ncd&&config_.ssm_d_conv&&config_.ssm_state&&config_.ssm_n_group&&config_.ssm_dt_rank){
+            const std::size_t d_inner=ncd-2*std::size_t(config_.ssm_n_group)*config_.ssm_state;
+            const std::size_t head_dim=d_inner/config_.ssm_dt_rank;
+            if(d_inner&&d_inner%config_.ssm_dt_rank==0){
+                nem_conv_size=std::size_t(config_.ssm_d_conv-1)*ncd;
+                nem_state_size=std::size_t(config_.ssm_dt_rank)*head_dim*config_.ssm_state;
+            }
+        }
+    }
     using clock=std::chrono::steady_clock;auto t0=clock::now();
-    {std::lock_guard<std::mutex> lock(prefix_cache_mutex_);if(prefix_cache_&&prefix_cache_->tokens==prompt){kc=prefix_cache_->key;vc=prefix_cache_->value;logits=prefix_cache_->logits;if(q35){convc=prefix_cache_->conv;ssmc=prefix_cache_->ssm;}cache_hit=true;}}
+    {std::lock_guard<std::mutex> lock(prefix_cache_mutex_);if(prefix_cache_&&prefix_cache_->tokens==prompt){kc=prefix_cache_->key;vc=prefix_cache_->value;logits=prefix_cache_->logits;if(q35){convc=prefix_cache_->conv;ssmc=prefix_cache_->ssm;}if(nem){nem_conv=prefix_cache_->conv;nem_state=prefix_cache_->ssm;for(auto& layer:nem_conv)layer.resize(nem_conv_size);for(auto& layer:nem_state)layer.resize(nem_state_size);}cache_hit=true;}}
     // Cache entries were allocated for the previous request's max_new, which
     // need not match this one. Preserve the prompt state but size all request-
     // local buffers for the positions the current generation may visit.
@@ -2371,11 +4686,15 @@ bool DenseTransformerRuntime::generate(const std::vector<std::uint32_t>& prompt,
             convc.assign(config_.layers,std::vector<float>(std::size_t(config_.ssm_d_conv-1+cache_positions)*conv_dim));
             ssmc.assign(config_.layers,std::vector<float>(ssm_dim));
         }
+        if(nem){
+            nem_conv.assign(config_.layers,std::vector<float>(nem_conv_size,0.0f));
+            nem_state.assign(config_.layers,std::vector<float>(nem_state_size,0.0f));
+        }
         for(std::size_t i=0;i<prompt.size();++i){if(cancelled&&cancelled->load(std::memory_order_relaxed))return fail("Generation cancelled");if(prompt[i]>=config_.vocab)return fail("Prompt token ID is outside vocabulary");zen::diag::breadcrumb(401,static_cast<std::int64_t>(i),prompt[i]);}
         {zen::diag::Scope scope("transformer.prefill.batch",zen::diag::Phase::compute);
          if(q35){if(!forward_q35_batch(prompt,kc,vc,convc,ssmc,logits))return fail("Batched prefill forward pass failed");}
-         else if(!forward_batch(prompt,kc,vc,logits))return fail("Batched prefill forward pass failed");}
-        if(kv_bytes<=policy.cache_budget_bytes){auto saved=std::make_shared<PrefixCache>();saved->tokens=prompt;saved->key=kc;saved->value=vc;saved->logits=logits;if(q35){saved->conv=convc;saved->ssm=ssmc;}std::lock_guard<std::mutex> lock(prefix_cache_mutex_);prefix_cache_=std::move(saved);}
+         else if(!forward_batch(prompt,kc,vc,logits,0,1,nullptr,nem?&nem_conv:nullptr,nem?&nem_state:nullptr))return fail("Batched prefill forward pass failed");}
+        if(kv_bytes<=policy.cache_budget_bytes){auto saved=std::make_shared<PrefixCache>();saved->tokens=prompt;saved->key=kc;saved->value=vc;saved->logits=logits;if(q35){saved->conv=convc;saved->ssm=ssmc;}if(nem){saved->conv=nem_conv;saved->ssm=nem_state;}std::lock_guard<std::mutex> lock(prefix_cache_mutex_);prefix_cache_=std::move(saved);}
     }else zen::diag::breadcrumb(403,static_cast<std::int64_t>(prompt.size()),1);
     auto t1=clock::now();result.cache_hit=cache_hit;
     result.prefill_ms=std::chrono::duration<double,std::milli>(t1-t0).count();
@@ -2409,7 +4728,7 @@ bool DenseTransformerRuntime::generate(const std::vector<std::uint32_t>& prompt,
         const auto d0=clock::now();
         {zen::diag::Scope scope("transformer.forward",zen::diag::Phase::compute);
          if(q35){if(!forward_q35_token(next,pos,kc,vc,convc,ssmc,logits))return fail("Decode forward pass failed");}
-         else if(!forward(next,pos,kc,vc,logits))return fail("Decode forward pass failed");}
+         else if(!forward(next,pos,kc,vc,logits,nem?&nem_conv:nullptr,nem?&nem_state:nullptr))return fail("Decode forward pass failed");}
         result.decode_ms+=std::chrono::duration<double,std::milli>(clock::now()-d0).count();
         // Swap, not copy: result.last_logits takes the fresh row, and the stale
         // buffer handed back to `logits` is fully rewritten by the next forward

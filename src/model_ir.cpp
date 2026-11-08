@@ -3,8 +3,18 @@
 namespace zen::model {
 Architecture identify_architecture(std::string_view n) noexcept {
     if (n=="llama") return Architecture::llama;
-    if (n=="qwen" || n=="qwen2" || n=="qwen2moe" || n=="qwen3" || n=="qwen3moe") return Architecture::qwen;
-    if (n=="qwen35" || n=="qwen3next" || n=="qwen35moe") return Architecture::qwen_hybrid;
+    if (n=="mistral3" || n=="llada-moe") return Architecture::llama;
+    if (n=="qwen" || n=="qwen2" || n=="qwen2moe" || n=="qwen3" || n=="qwen3moe" || n=="olmoe" || n=="laguna" || n=="dflash" || n=="lfm2moe" || n=="gemma4") return Architecture::qwen;
+    if (n=="phi3" || n=="deepseek2") return Architecture::qwen;
+    if (n=="starcoder2") return Architecture::qwen;
+    if (n=="k2-horizon") return Architecture::qwen;
+    if (n=="gpt-oss") return Architecture::qwen;
+    if (n=="spark2_5") return Architecture::qwen;
+    if (n=="qwen3vl") return Architecture::qwen;
+    if (n=="flint") return Architecture::qwen;
+    if (n=="mellum") return Architecture::qwen;
+    if (n=="muse-glimmer") return Architecture::qwen;
+    if (n=="qwen35" || n=="qwen3next" || n=="qwen35moe" || n=="nemotron_h" || n=="nemotron_h_moe") return Architecture::qwen_hybrid;
     if (n.find("bitnet")!=std::string_view::npos || n.find("b1")!=std::string_view::npos) return Architecture::bitnet;
     if (n.find("bonsai")!=std::string_view::npos) return Architecture::bonsai;
     return Architecture::unknown;

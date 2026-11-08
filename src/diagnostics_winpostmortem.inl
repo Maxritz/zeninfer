@@ -18,9 +18,9 @@ static void zen_diag_dump_breadcrumbs_text(HANDLE f) noexcept {
         return;
     }
     const std::uint64_t end = g_breadcrumb_next.load(std::memory_order_acquire);
-    const std::uint64_t limit = (std::min)(static_cast<std::uint64_t>(256), kBreadcrumbCapacity);
+    const std::uint64_t limit = (std::min)(static_cast<std::uint64_t>(256), static_cast<std::uint64_t>(kBreadcrumbCapacity));
     const std::uint64_t begin = (end > limit) ? (end - limit) : 0;
-    char buf[384];
+    char buf[32768];
     std::size_t n = 0;
     n += std::sprintf(buf + n, "\nBreadcrumbs (global atomic ring; oldest first; event IDs are defined by caller)\n");
     for (std::uint64_t seq = begin; seq < end; ++seq) {
@@ -37,7 +37,7 @@ static void zen_diag_dump_breadcrumbs_text(HANDLE f) noexcept {
                           static_cast<unsigned int>(ev),
                           static_cast<long long>(a0),
                           static_cast<long long>(a1));
-        if (++seq >= end) break;
+        if (n > sizeof(buf) - 128) break;
     }
     DWORD written = 0;
     WriteFile(f, buf, static_cast<DWORD>(n), &written, nullptr);

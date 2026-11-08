@@ -47,6 +47,58 @@ std::unique_ptr<ModelRuntime> create_model_runtime(const model::ModelConfig& con
     if (config.architecture==model::Architecture::qwen_hybrid) {
         return std::make_unique<DenseTransformerAdapter>();
     }
+    if (config.architecture_name=="nemotron_h" || config.architecture_name=="nemotron_h_moe") {
+        return std::make_unique<DenseTransformerAdapter>();
+    }
+    if (config.architecture_name=="nemotron_h" || config.architecture_name=="nemotron_h_moe" ||
+        config.architecture_name=="lfm2moe" || config.architecture_name=="dflash") {
+        // Hybrid SSM/shortconv families: route through the same adapter so
+        // load() can report the precise missing forward (per-layer arrays
+        // already parsed) instead of an opaque factory rejection.
+        return std::make_unique<DenseTransformerAdapter>();
+    }
+    if (config.architecture==model::Architecture::qwen && (config.architecture_name=="qwen3moe" || config.architecture_name=="olmoe" || config.architecture_name=="qwen2moe" || (config.architecture_name=="laguna" && config.expert_count>0))) {
+        return std::make_unique<DenseTransformerAdapter>();
+    }
+    if (config.architecture==model::Architecture::qwen && config.architecture_name=="dflash") {
+        return std::make_unique<DenseTransformerAdapter>();
+    }
+    if (config.architecture==model::Architecture::qwen && config.architecture_name=="lfm2moe") {
+        return std::make_unique<DenseTransformerAdapter>();
+    }
+    if (config.architecture==model::Architecture::qwen && config.architecture_name=="gemma4") {
+        return std::make_unique<DenseTransformerAdapter>();
+    }
+    if (config.architecture==model::Architecture::qwen && config.architecture_name=="starcoder2") {
+        return std::make_unique<DenseTransformerAdapter>();
+    }
+    if (config.architecture==model::Architecture::qwen && config.architecture_name=="k2-horizon") {
+        return std::make_unique<DenseTransformerAdapter>();
+    }
+    if (config.architecture==model::Architecture::qwen && config.architecture_name=="gpt-oss") {
+        return std::make_unique<DenseTransformerAdapter>();
+    }
+    if (config.architecture==model::Architecture::qwen && config.architecture_name=="spark2_5") {
+        return std::make_unique<DenseTransformerAdapter>();
+    }
+    if (config.architecture==model::Architecture::qwen && config.architecture_name=="qwen3vl") {
+        return std::make_unique<DenseTransformerAdapter>();
+    }
+    if (config.architecture==model::Architecture::qwen && config.architecture_name=="flint") {
+        return std::make_unique<DenseTransformerAdapter>();
+    }
+    if (config.architecture==model::Architecture::qwen && (config.architecture_name=="mellum" || config.architecture_name=="muse-glimmer")) {
+        return std::make_unique<DenseTransformerAdapter>();
+    }
+    if (config.architecture==model::Architecture::qwen && config.architecture_name=="deepseek2") {
+        return std::make_unique<DenseTransformerAdapter>();
+    }
+    if (config.architecture==model::Architecture::qwen && config.architecture_name=="phi3") {
+        return std::make_unique<DenseTransformerAdapter>();
+    }
+    if (config.architecture==model::Architecture::llama && config.expert_count>0) {
+        return std::make_unique<DenseTransformerAdapter>();
+    }
     if(error) *error="No executable model adapter is registered for GGUF architecture '"+
         (config.architecture_name.empty()?std::string("unknown"):config.architecture_name)+"'";
     return {};

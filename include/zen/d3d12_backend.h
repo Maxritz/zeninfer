@@ -53,9 +53,10 @@ struct Stats {
     std::uint64_t fallbacks{};
 };
 
-// True when the process asked for this backend (ZEN_BACKEND=d3d12|dx12|gpu or
-// ZEN_D3D12=1) *and* a 12.1 device exists. Initialisation is lazy, cached and
-// thread-safe; a failed init is remembered so later calls stay on the CPU.
+// True when this backend is selected (default-on when a 12.1 device opens;
+// opt out with ZEN_BACKEND=cpu|none or ZEN_D3D12=0). Initialisation is lazy,
+// cached and thread-safe; a failed init is remembered so later calls stay on
+// the CPU.
 bool enabled() noexcept;
 bool init() noexcept;
 void shutdown() noexcept;
@@ -88,6 +89,12 @@ void release_q8_0_weights(const std::uint8_t* weights) noexcept;
 // Q4_K GPU GEMM (experimental, basic, no tiling). Falls back to CPU on failure.
 bool gemm_q4k(const std::uint8_t* weights, const float* input, float* output,
               std::size_t tokens, std::size_t rows, std::size_t columns) noexcept;
+// Native Q1_0 / Q6_K GPU matrix products (raw GGML block layout in VRAM,
+// in-shader decode). Handles T=1 (decode) and short prefills.
+bool gemm_q1_0(const std::uint8_t* weights, const float* input, float* output,
+               std::size_t tokens, std::size_t rows, std::size_t columns) noexcept;
+bool gemm_q6_k(const std::uint8_t* weights, const float* input, float* output,
+               std::size_t tokens, std::size_t rows, std::size_t columns) noexcept;
 
 // One matvec target for a batched submission. All tasks in a batch share the input
 // vector, which is exactly the Q|K|V and gate|up pattern in a transformer block.

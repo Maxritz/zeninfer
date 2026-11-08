@@ -60,11 +60,15 @@ public:
                        std::vector<float>& logits,
                        std::uint32_t start_pos = 0,
                        std::size_t tail_count = 1,
-                       std::vector<float>* tail_logits = nullptr) const;
+                       std::vector<float>* tail_logits = nullptr,
+                       std::vector<std::vector<float>>* nem_conv = nullptr,
+                       std::vector<std::vector<float>>* nem_state = nullptr) const;
     bool forward(std::uint32_t token, std::uint32_t pos,
                  std::vector<std::vector<float>>& kc,
                  std::vector<std::vector<float>>& vc,
-                 std::vector<float>& logits) const;
+                 std::vector<float>& logits,
+                 std::vector<std::vector<float>>* nem_conv = nullptr,
+                 std::vector<std::vector<float>>* nem_state = nullptr) const;
 
 public:
     struct Tensor { 
@@ -124,6 +128,21 @@ public:
     
     // Member functions
     const Tensor* tensor(const std::string& n) const noexcept;
+    // Mamba-2 SSM mixer for nemotron_h recurrent layers
+    // (llama.cpp build_mamba2_layer / ggml_ssm_scan semantics).
+    bool mamba2_forward(const std::string& prefix, const float* norm, float* x,
+                        std::size_t T, std::vector<float>& conv_state,
+                        std::vector<float>& ssm_state) const;
+    // Nemotron-H MoE FFN (llama.cpp nemotron-h build_ffn_layer):
+    // sigmoid routing, optional latent projection, gated experts with
+    // relu_sq activation, shared expert.
+    bool nemotron_moe_forward(const std::string& prefix, const float* norm, float* x,
+                              std::size_t T) const;
+    // Gemma4-MoE routed FFN (llama.cpp gemma4): softmax router on the
+    // post-attention hidden state (divided by sqrt(E), scaled by
+    // ffn_gate_inp.scale); fused gate_up_exps (gelu), down_exps, down scale.
+    bool gemma_moe_forward(const std::string& prefix, const float* attn_out,
+                           float* x, std::size_t T) const;
     void prefetch_layer(std::uint32_t layer) const noexcept;
     void hadamard_transform_input(float* x, std::size_t width, std::vector<float>& scratch) const;
     void hadamard_unrotate(float* x, std::size_t width, std::vector<float>& scratch) const;

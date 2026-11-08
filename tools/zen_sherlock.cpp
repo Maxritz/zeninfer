@@ -107,6 +107,8 @@ int main(int argc, char** argv) {
         }
     }
     const double prefill_wall = ms_since(t_pre);
+    std::ostringstream prefill_trace;
+    zen::diag::print_trace(prefill_trace);
 
     // ---- Decode: second call on the identical prompt hits the prefix cache, so
     // only the decode loop is measured.
@@ -132,9 +134,7 @@ int main(int argc, char** argv) {
 
     std::printf("\n---------------- PREFILL components ----------------\n");
     {
-        std::ostringstream o;
-        zen::diag::print_trace(o);
-        std::printf("%s", o.str().c_str());
+        std::printf("%s", prefill_trace.str().c_str());
     }
 
     // Re-run the decode trace on its own so the table is decode-only.

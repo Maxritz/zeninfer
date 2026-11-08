@@ -578,6 +578,13 @@ bool gemv_q8_0_avx2(const std::uint8_t* weights,const float* x,float* y,
         const std::uint8_t* row=weights+r*row_bytes;
         __m256 acc=_mm256_setzero_ps();
         for(std::size_t b=0;b<blocks;++b){
+            // Software prefetch for the streaming weights: decode is ~28 GB/s of
+            // a ~51 GB/s peak; pulling the next blocks in early closes part of
+            // the latency gap without changing results.
+            if(b+4<blocks){
+                _mm_prefetch(reinterpret_cast<const char*>(row+(b+4)*34),_MM_HINT_T0);
+                _mm_prefetch(reinterpret_cast<const char*>(x+(b+4)*32),_MM_HINT_T0);
+            }
             const std::uint8_t* p=row+b*34;
             const float d=q8_half_to_float(std::uint16_t(p[0])|(std::uint16_t(p[1])<<8));
             __m256 a0=_mm256_setzero_ps(),a1=_mm256_setzero_ps();
