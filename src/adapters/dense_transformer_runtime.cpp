@@ -3758,6 +3758,9 @@ bool DenseTransformerRuntime::forward(std::uint32_t token,std::uint32_t pos,
             pipeline_layers.push_back(std::move(lp));
         } else {
             all_layers_qualify = false;
+            if (const char* trace = std::getenv("ZEN_D3D12_TRACE"); trace && trace[0] == '1') {
+                std::printf("[d3d12] pipeline: layer %u FAILED qualification\n", l);
+            }
         }
     }
 
@@ -3774,12 +3777,18 @@ bool DenseTransformerRuntime::forward(std::uint32_t token,std::uint32_t pos,
         const char* e = std::getenv("ZEN_D3D12_PIPELINE");
         return !(e && e[0] == '0');
     }();
+    if (const char* trace = std::getenv("ZEN_D3D12_TRACE"); trace && trace[0] == '1') {
+        std::printf("[d3d12] pipeline: qualification START enabled=%d layers=%u\n", pipeline_enabled, config_.layers);
+    }
     // Fused LM head plumbing: the pipeline may record final-rmsnorm + vocab GEMV +
     // logits readback into its single submission; fused==true means logits[] is
     // already valid and the host skips both its final rms and the vocab matvec.
     // The backend rejects (fused=false) on kill-switch/VRAM-pressure/shape limits.
     zen::d3d12::LmHeadFuse lm_fuse{};
     if(pipeline_enabled && all_layers_qualify && pipeline_layers.size() == config_.layers && pipeline_layers.size() <= 64) {
+        if (const char* trace = std::getenv("ZEN_D3D12_TRACE"); trace && trace[0] == '1') {
+            std::printf("[d3d12] pipeline: RUNNING layers=%zu\n", pipeline_layers.size());
+        }
         setup_us = tm_setup.us();
         StageTimer tm_pipe(stage_trace);
         zen::d3d12::LayerDecodeParams d3d_layers[64];
@@ -4497,6 +4506,10 @@ bool DenseTransformerRuntime::forward(std::uint32_t token,std::uint32_t pos,
                 ffn_fused=tensor_ffn(*lg,*lu,*ldw,norm.data(),tmp.data(),F,E,E);
                 if(ffn_fused)for(std::uint32_t i=0;i<E;++i)x[i]+=tmp[i];
             }
+            // CPU fused FFN path for Q8_0 was tried here (gate+up+SiLU+down in one
+            // cache-hot pass) and removed: it produced wrong token ids and, because
+            // kernels/avx2.cpp must not depend on ComputePool, it also broke the CPU
+            // link. The separate gemv calls below stay the CPU FFN path.
             if(!ffn_fused&&config_.phi3_variant){
                 // Phi-3 decode FFN: up=[2F]; silu(first half) * second half.
                 std::vector<float> up2(2*F);
@@ -4580,6 +4593,58 @@ bool DenseTransformerRuntime::forward(std::uint32_t token,std::uint32_t pos,
     if(validate_logits)return finite_values(logits.data(),logits.size());
     return true;
 }
+// Residency warm-up. Weight upload, the Q8_0 GPU repack, heap/descriptor and
+// PSO creation all happen lazily on first touch, so the first generation used to
+// absorb ~1.3 s of one-time setup inside its prefill bracket (measured on
+// Qwen3-4B Q8_0/D3D12: upload 667 ms + alloc 399 ms + repack 217 ms against
+// 113 ms of steady-state prefill). Running a discarding 16-token prefill plus
+// one decode step here charges that to load() instead, which is where it
+// belongs: the weights are then resident for every real request.
+bool DenseTransformerRuntime::warm(std::string* error)const{
+    (void)error;
+    static const bool warm_on=[](){const char* e=std::getenv("ZEN_WARMUP");return !(e&&e[0]=='0');}();
+    if(!warm_on||!loaded_)return true;
+    // Hybrid/recurrent families keep extra per-layer state (GDN conv/SSM rings,
+    // mamba-2 states) that generate() threads through its own batch/token calls;
+    // warming them here would need that plumbing for no measurable benefit, so
+    // they keep the lazy first-touch cost.
+    if(config_.qwen35_variant)return true;
+    if(architecture_name_=="nemotron_h"||architecture_name_=="nemotron_h_moe")return true;
+    // 16 tokens is the smallest prompt that still takes the batched prefill path
+    // (use_prefill_gpu needs T>=16), so the warm pass exercises the GEMM tiles and
+    // the layer-fused attention+FFN chain, not just the decode GEMVs.
+    constexpr std::size_t kWT=16;
+    const std::size_t positions=kWT+1;
+    if(config_.context<positions||config_.head_dim==0||config_.kv_heads==0)return true;
+    const std::size_t kv_stride=config_.deepseek_variant
+        ?std::size_t(config_.kv_lora_rank)+config_.rope_dim
+        :std::size_t(config_.kv_heads)*config_.head_dim;
+    if(!kv_stride)return true;
+    const std::size_t kvsize=positions*kv_stride;
+    std::vector<std::vector<float>> kc(config_.layers,std::vector<float>(kvsize));
+    std::vector<std::vector<float>> vc(config_.layers,std::vector<float>(kvsize));
+    std::vector<float> logits;
+    // Token 1 exists in every tokenizer; id 0 is the fallback for a degenerate vocab.
+    const std::vector<std::uint32_t> prompt(kWT,config_.vocab>1?1u:0u);
+    if(forward_batch(prompt,kc,vc,logits,0,1,nullptr))forward(prompt.back(),
+        static_cast<std::uint32_t>(kWT),kc,vc,logits);
+#if defined(ZEN_HAS_D3D12)
+    // Whatever the warm pass left behind must not be visible to the first real
+    // request: drop the dummy prefix from the host cache, mark the device residual
+    // chain dead, then free and re-create the device KV cache so its allocation is
+    // also charged here rather than to the first prefill.
+    {
+        std::lock_guard<std::mutex> lock(prefix_cache_mutex_);
+        prefix_cache_.reset();
+    }
+    if(zen::d3d12::enabled()){
+        zen::d3d12::prefill_residual_invalidate();
+        zen::d3d12::kv_cache_reset();
+        zen::d3d12::kv_cache_configure(config_.layers,kDeviceKvTokens,config_.kv_heads,config_.head_dim);
+    }
+#endif
+    return true;
+}
 bool DenseTransformerRuntime::generate(const std::vector<std::uint32_t>& prompt,std::uint32_t max_new,
         Generation& result,std::string* error,
         const std::function<void(const std::vector<std::uint32_t>&)>& on_tokens,
@@ -4613,7 +4678,7 @@ bool DenseTransformerRuntime::generate(const std::vector<std::uint32_t>& prompt,
     std::uint64_t kv_bytes=std::uint64_t(cache_positions)*config_.layers*kv_stride*2*sizeof(float);
     if(kv_bytes>policy.transient_budget_bytes)return fail("KV cache exceeds ResourceGovernor transient-memory budget");
     const auto kvsize=static_cast<std::size_t>(std::uint64_t(cache_positions)*kv_stride);
-    std::vector<std::vector<float>> kc,vc;std::vector<float> logits;bool cache_hit=false;
+    std::vector<std::vector<float>> kc_local,vc_local;std::vector<float> logits;bool cache_hit=false;
     // qwen35 hybrid: additional recurrent caches (conv windows + GDN states).
     const bool q35=config_.qwen35_variant;
     // nemotron_h: mamba-2 recurrent caches (fixed conv ring + SSM state per layer).
@@ -4642,13 +4707,13 @@ bool DenseTransformerRuntime::generate(const std::vector<std::uint32_t>& prompt,
         }
     }
     using clock=std::chrono::steady_clock;auto t0=clock::now();
-    {std::lock_guard<std::mutex> lock(prefix_cache_mutex_);if(prefix_cache_&&prefix_cache_->tokens==prompt){kc=prefix_cache_->key;vc=prefix_cache_->value;logits=prefix_cache_->logits;if(q35){convc=prefix_cache_->conv;ssmc=prefix_cache_->ssm;}if(nem){nem_conv=prefix_cache_->conv;nem_state=prefix_cache_->ssm;for(auto& layer:nem_conv)layer.resize(nem_conv_size);for(auto& layer:nem_state)layer.resize(nem_state_size);}cache_hit=true;}}
+    {std::lock_guard<std::mutex> lock(prefix_cache_mutex_);if(prefix_cache_&&prefix_cache_->tokens==prompt){kc_local=prefix_cache_->key;vc_local=prefix_cache_->value;logits=prefix_cache_->logits;if(q35){convc=prefix_cache_->conv;ssmc=prefix_cache_->ssm;}if(nem){nem_conv=prefix_cache_->conv;nem_state=prefix_cache_->ssm;for(auto& layer:nem_conv)layer.resize(nem_conv_size);for(auto& layer:nem_state)layer.resize(nem_state_size);}cache_hit=true;}}
     // Cache entries were allocated for the previous request's max_new, which
     // need not match this one. Preserve the prompt state but size all request-
     // local buffers for the positions the current generation may visit.
     if(cache_hit){
-        for(auto& layer:kc)layer.resize(kvsize);
-        for(auto& layer:vc)layer.resize(kvsize);
+        for(auto& layer:kc_local)layer.resize(kvsize);
+        for(auto& layer:vc_local)layer.resize(kvsize);
         if(q35)for(auto& layer:convc)layer.resize(std::size_t(config_.ssm_d_conv-1+cache_positions)*conv_dim);
     }
 #if defined(ZEN_HAS_D3D12)
@@ -4674,13 +4739,13 @@ bool DenseTransformerRuntime::generate(const std::vector<std::uint32_t>& prompt,
             for(std::uint32_t l=0;l<config_.layers;++l)
                 for(std::size_t t=0;t<prompt.size();++t){
                     rl.push_back(l);rp.push_back(t);
-                    rk.push_back(kc[l].data()+t*rKW);rv.push_back(vc[l].data()+t*rKW);
+                    rk.push_back(kc_local[l].data()+t*rKW);rv.push_back(vc_local[l].data()+t*rKW);
                 }
             zen::d3d12::kv_cache_append_batched(rl.data(),rl.size(),rp.data(),rk.data(),rv.data(),config_.kv_heads,config_.head_dim);
         }
     }
 #endif
-    if(!cache_hit){kc.assign(config_.layers,std::vector<float>(kvsize));vc.assign(config_.layers,std::vector<float>(kvsize));
+    if(!cache_hit){kc_local.assign(config_.layers,std::vector<float>(kvsize));vc_local.assign(config_.layers,std::vector<float>(kvsize));
         if(q35){
             // [CK-1, conv_dim] state ring + one scratch window per reachable position
             convc.assign(config_.layers,std::vector<float>(std::size_t(config_.ssm_d_conv-1+cache_positions)*conv_dim));
@@ -4692,9 +4757,9 @@ bool DenseTransformerRuntime::generate(const std::vector<std::uint32_t>& prompt,
         }
         for(std::size_t i=0;i<prompt.size();++i){if(cancelled&&cancelled->load(std::memory_order_relaxed))return fail("Generation cancelled");if(prompt[i]>=config_.vocab)return fail("Prompt token ID is outside vocabulary");zen::diag::breadcrumb(401,static_cast<std::int64_t>(i),prompt[i]);}
         {zen::diag::Scope scope("transformer.prefill.batch",zen::diag::Phase::compute);
-         if(q35){if(!forward_q35_batch(prompt,kc,vc,convc,ssmc,logits))return fail("Batched prefill forward pass failed");}
-         else if(!forward_batch(prompt,kc,vc,logits,0,1,nullptr,nem?&nem_conv:nullptr,nem?&nem_state:nullptr))return fail("Batched prefill forward pass failed");}
-        if(kv_bytes<=policy.cache_budget_bytes){auto saved=std::make_shared<PrefixCache>();saved->tokens=prompt;saved->key=kc;saved->value=vc;saved->logits=logits;if(q35){saved->conv=convc;saved->ssm=ssmc;}if(nem){saved->conv=nem_conv;saved->ssm=nem_state;}std::lock_guard<std::mutex> lock(prefix_cache_mutex_);prefix_cache_=std::move(saved);}
+         if(q35){if(!forward_q35_batch(prompt,kc_local,vc_local,convc,ssmc,logits))return fail("Batched prefill forward pass failed");}
+         else if(!forward_batch(prompt,kc_local,vc_local,logits,0,1,nullptr,nem?&nem_conv:nullptr,nem?&nem_state:nullptr))return fail("Batched prefill forward pass failed");}
+        if(kv_bytes<=policy.cache_budget_bytes){auto saved=std::make_shared<PrefixCache>();saved->tokens=prompt;saved->key=kc_local;saved->value=vc_local;saved->logits=logits;if(q35){saved->conv=convc;saved->ssm=ssmc;}if(nem){saved->conv=nem_conv;saved->ssm=nem_state;}std::lock_guard<std::mutex> lock(prefix_cache_mutex_);prefix_cache_=std::move(saved);}
     }else zen::diag::breadcrumb(403,static_cast<std::int64_t>(prompt.size()),1);
     auto t1=clock::now();result.cache_hit=cache_hit;
     result.prefill_ms=std::chrono::duration<double,std::milli>(t1-t0).count();
@@ -4727,8 +4792,8 @@ bool DenseTransformerRuntime::generate(const std::vector<std::uint32_t>& prompt,
         if(pos>=config_.context)break;
         const auto d0=clock::now();
         {zen::diag::Scope scope("transformer.forward",zen::diag::Phase::compute);
-         if(q35){if(!forward_q35_token(next,pos,kc,vc,convc,ssmc,logits))return fail("Decode forward pass failed");}
-         else if(!forward(next,pos,kc,vc,logits,nem?&nem_conv:nullptr,nem?&nem_state:nullptr))return fail("Decode forward pass failed");}
+         if(q35){if(!forward_q35_token(next,pos,kc_local,vc_local,convc,ssmc,logits))return fail("Decode forward pass failed");}
+         else if(!forward(next,pos,kc_local,vc_local,logits,nem?&nem_conv:nullptr,nem?&nem_state:nullptr))return fail("Decode forward pass failed");}
         result.decode_ms+=std::chrono::duration<double,std::milli>(clock::now()-d0).count();
         // Swap, not copy: result.last_logits takes the fresh row, and the stale
         // buffer handed back to `logits` is fully rewritten by the next forward

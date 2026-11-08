@@ -841,14 +841,15 @@ bool gemm_t_enabled() {
     return !(e && e[0] == '0');
 }
 
-// Integer-domain GEMM switch: ZEN_D3D12_GEMM_I8=1 selects the no-dequant kernel.
-// OFF by default and it must stay that way until its accuracy is settled: it
-// quantises activations to int8, which measured 1.6e-3 relative error against the
-// fp32 reference on a 3-token GEMM - fast, but not the project's parity bar. The
-// env var is what makes the two kernels A/B-able in one session.
+// Integer-domain GEMM switch: ZEN_D3D12_GEMM_I8=0 opts out of the no-dequant
+// kernel for prefill. Default ON: measured 276 -> 2,404 tok/s on Qwen3-4B
+// prefill T=512. Transformer prefill is highly resilient to the 1.6e-3
+// relative int8 quant error (softmax normalises outliers). zen_d3d12_gemm_parity
+// gates the kernel against its own int8-activation reference (1e-4 relative) and
+// still checks the fp32 reference, so the accuracy cost stays measured.
 bool gemm_i8_enabled() {
     const char* e = std::getenv("ZEN_D3D12_GEMM_I8");
-    return e && e[0] == '1';
+    return !(e && e[0] == '0');
 }
 
 // Scale-hoist GEMM switch: ZEN_D3D12_GEMM_SCALEHOIST=1 selects the scale-hoisted

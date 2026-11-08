@@ -32,6 +32,10 @@ public:
         const ModelRuntime&, std::uint32_t, Generation&, std::string*,
         const std::function<void(const std::vector<std::uint32_t>&)>& = {},
         const GenerationOptions& = {}, const std::atomic<bool>* = nullptr) const = 0;
+    // Optional residency warm-up: adapters that lazily create device resources
+    // override this so load_model_runtime can charge the one-time setup to load
+    // instead of to the first generate(). Default is a no-op.
+    virtual bool warm(std::string* = nullptr) const { return true; }
 };
 
 // The factory dispatches by GGUF architecture. A registered name is not enough:

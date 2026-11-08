@@ -1080,6 +1080,47 @@ bool gemv(const Format& f,const std::uint8_t*w,const float*x,float*y,
     if(f.encoding==Encoding::q8_0 && scale==1.0f && zen::cpu_has_avx2_fma()) {
         g_gemv_routes.cpu_avx2.fetch_add(1,std::memory_order_relaxed);
         zen::ResourceGovernor governor;const unsigned workers=requested_workers?requested_workers:governor.current_policy().worker_threads;
+        // Opt-in: quantising the activations to int8 before the row sweep changes
+        // the arithmetic (and breaks the exact-parity GEMV test at small sizes).
+        // Measured on Qwen3-4B Q8_0 CPU decode it is also slower than the fp32
+        // activation path (1072 ms vs 925 ms for 8 tokens), because the weights,
+        // not the activations, set the bandwidth. Default stays exact.
+        static const bool use_int8 = [] {
+            const char* e = std::getenv("ZEN_CPU_Q8_ACT");
+            return e && e[0] == '1';
+        }();
+        if(use_int8){
+            // Quantize activations once, then parallelize rows with pre-quantized data
+            const std::size_t blocks = cols / 32;
+            std::vector<std::int8_t> xq(blocks * 32);
+            std::vector<float> xsc(blocks);
+            for (std::size_t b = 0; b < blocks; ++b) {
+                const float* xb = x + b * 32;
+                float amax = 0.0f;
+                for (unsigned i = 0; i < 32; ++i) {
+                    const float a = std::fabs(xb[i]);
+                    amax = a > amax ? a : amax;
+                }
+                const float d = amax > 0.0f ? amax / 127.0f : 0.0f;
+                const float inv = d > 0.0f ? 1.0f / d : 0.0f;
+                xsc[b] = d;
+                std::int8_t* qb = xq.data() + b * 32;
+                for (unsigned i = 0; i < 32; ++i) {
+                    float v = xb[i] * inv;
+                    v = v > 127.0f ? 127.0f : (v < -127.0f ? -127.0f : v);
+                    qb[i] = static_cast<std::int8_t>(std::lround(v));
+                }
+            }
+            if(rows>=128&&workers>1){
+                const unsigned count=std::min<unsigned>(workers,static_cast<unsigned>(rows));
+                std::atomic<bool> success{true};
+                zen::ComputePool::instance().parallel_for(rows,count,[&](std::size_t first,std::size_t last){
+                    if(!zen::gemv_q8_0_avx2_int8_prequant(w+first*rb,xq.data(),xsc.data(),y+first,last-first,cols))success.store(false,std::memory_order_relaxed);
+                });
+                return success.load();
+            }
+            return zen::gemv_q8_0_avx2_int8_prequant(w,xq.data(),xsc.data(),y,rows,cols);
+        }
         if(rows>=128&&workers>1){
             const unsigned count=std::min<unsigned>(workers,static_cast<unsigned>(rows));
             std::atomic<bool> success{true};
@@ -1425,6 +1466,36 @@ bool gemv_batch(const Format& format,const std::uint8_t* const* weights,const fl
         if(ready&&zen::hip::gemv_q8_0_batch(input,tasks,count))return true;
     }
 #endif
+    // CPU fused batch (A3): one parallel_for over the concatenated rows of
+    // all projections. The naive per-weight loop dispatched one
+    // ComputePool handoff per projection (≈250/token), mostly waking
+    // spinning workers. Same kernels, same outputs — fewer syncs.
+    if(format.encoding==Encoding::q8_0&&scale==1.0f&&count>1&&zen::cpu_has_avx2_fma()){
+        zen::ResourceGovernor governor;
+        const unsigned wreq=workers?workers:governor.current_policy().worker_threads;
+        std::size_t total=0;for(std::size_t i=0;i<count;++i){if(!weights[i]||!rows[i]){total=0;break;}total+=rows[i];}
+        if(total>=64&&wreq>1&&columns%32==0){
+            const auto rb=(columns/32)*34; // matches gemv_q8_0_avx2 row_bytes
+            const unsigned cnt=std::min<unsigned>(wreq,static_cast<unsigned>(total));
+            std::atomic<bool> ok{true};
+            // Prefix sums of row counts so a global row maps to its weight slice.
+            std::size_t* offs=new std::size_t[count];std::size_t acc=0;
+            for(std::size_t i=0;i<count;++i){offs[i]=acc;acc+=rows[i];}
+            zen::ComputePool::instance().parallel_for(total,cnt,[&](std::size_t first,std::size_t last){
+                std::size_t i=0;
+                while(i<count&&offs[i]+rows[i]<=first)++i; // skip completed slices
+                for(std::size_t g=first;g<last&&ok.load(std::memory_order_relaxed);){
+                    while(g>=offs[i]+rows[i])++i; // advance source slice
+                    const std::size_t local=g-offs[i];
+                    const std::size_t take=std::min<std::size_t>(last-g,rows[i]-local);
+                    if(!zen::gemv_q8_0_avx2(weights[i]+local*rb,input,outputs[i]+local,take,columns))ok.store(false,std::memory_order_relaxed);
+                    g+=take;
+                }
+            });
+            delete[] offs;
+            return ok.load();
+        }
+    }
     for(std::size_t i=0;i<count;++i)
         if(!gemv(format,weights[i],input,outputs[i],rows[i],columns,scale,workers))return false;
     return true;

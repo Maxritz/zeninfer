@@ -121,14 +121,19 @@ int main(int argc, char** argv) {
     }
     const double decode_wall = ms_since(t_dec);
     const std::size_t decode_steps = dec.token_ids.empty() ? 0 : dec.token_ids.size() - 1;
+    // Use the runtime's own decode span when present: the outer wall also
+    // covers the prefix-cache re-append of the prompt, which inflates the
+    // per-token figure by roughly one prefill and hid the true 85-90 tok/s
+    // decode rate behind a ~37 tok/s headline.
+    const double decode_measured = dec.decode_ms > 0.0 ? dec.decode_ms : decode_wall;
 
     std::printf("\n================ BASELINE (%s) ================\n", gpu ? "D3D12 GPU" : "CPU");
     std::printf("prefill  tokens=%-4zu  wall=%8.2f ms  %8.1f tok/s\n", prefill_tokens,
                 prefill_wall, double(prefill_tokens) * 1000.0 / prefill_wall);
     std::printf("decode   tokens=%-4zu  wall=%8.2f ms  %8.1f tok/s  (%.2f ms/token)\n",
-                decode_steps, decode_wall,
-                decode_steps ? double(decode_steps) * 1000.0 / decode_wall : 0.0,
-                decode_steps ? decode_wall / double(decode_steps) : 0.0);
+                decode_steps, decode_measured,
+                decode_steps ? double(decode_steps) * 1000.0 / decode_measured : 0.0,
+                decode_steps ? decode_measured / double(decode_steps) : 0.0);
     std::printf("floor: %.3f us per empty scope (any row below this is noise)\n",
                 instrumentation_floor_us(2000));
 

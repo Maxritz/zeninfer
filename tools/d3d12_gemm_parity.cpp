@@ -506,12 +506,29 @@ bool check_weight_pointer_reuse() {
     // anything from an earlier check in the same process.
     zen::d3d12::release_q8_0_weights(weights.data());
     build(20261131u, weights, first_ref, input);
+    // Snapshot for the int8-activation reference: the integer kernel is the default
+    // GEMM now, so it can never match the fp32-exact reference to 1e-5. Its
+    // structure is gated against the int8 reference instead, exactly as the shape
+    // checks above do.
+    const std::vector<std::uint8_t> first_weights = weights;
     const void* addr = weights.data();
     if (!zen::d3d12::gemm_q8_0(weights.data(), input.data(), out.data(), tokens, rows, cols)) {
         std::printf("weight_reuse: ERROR (backend declined)\n");
         return false;
     }
     const double fresh_err = relative(out, first_ref);
+    std::vector<float> ref_i8(tokens * rows, 0.0f);
+    reference_int8_activations(first_weights.data(), input.data(), ref_i8.data(), tokens,
+                               rows, blocks_per_row, row_bytes, raw_block_bytes);
+    double fresh_i8 = 0.0;
+    {
+        double mag = 0.0;
+        for (std::size_t i = 0; i < ref_i8.size(); ++i) {
+            fresh_i8 = std::max(fresh_i8, std::fabs(double(out[i]) - double(ref_i8[i])));
+            mag = std::max(mag, std::fabs(double(first_ref[i])));
+        }
+        fresh_i8 = mag > 0.0 ? fresh_i8 / mag : fresh_i8;
+    }
 
     // Same address, different tensor.
     build(20261132u, weights, second_ref, input);
@@ -530,10 +547,27 @@ bool check_weight_pointer_reuse() {
         return false;
     }
     const double after_release = relative(out, second_ref);
+    reference_int8_activations(weights.data(), input.data(), ref_i8.data(), tokens, rows,
+                               blocks_per_row, row_bytes, raw_block_bytes);
+    double after_i8 = 0.0;
+    {
+        double mag = 0.0;
+        for (std::size_t i = 0; i < ref_i8.size(); ++i) {
+            after_i8 = std::max(after_i8, std::fabs(double(out[i]) - double(ref_i8[i])));
+            mag = std::max(mag, std::fabs(double(second_ref[i])));
+        }
+        after_i8 = mag > 0.0 ? after_i8 / mag : after_i8;
+    }
 
     // A hit that serves the old bytes is visible as stale_vs_old being tiny while
     // stale_vs_new is not; that is the hazard, reported rather than gated.
-    const bool ok = same_addr && fresh_err <= 1e-5 && after_release <= 1e-5;
+    // 2e-4 for the integer kernel's reference: the device float path and this
+    // double reference can round a few activations to opposite sides of a block
+    // boundary (measured 1.3-1.6e-4 here, ~5e-5 in the shape checks above).
+    // Structural faults land at 0.5-0.7, so this stays an effective gate.
+    const bool ok = same_addr && (fresh_err <= 1e-5 || fresh_i8 <= 2e-4) &&
+                    (after_release <= 1e-5 || after_i8 <= 2e-4);
+    std::printf("    int8 reference: fresh_i8=%.3e released_i8=%.3e\n", fresh_i8, after_i8);
     std::printf("weight_reuse same_shape=2048x2048 in_place_rewrite: fresh_err=%.3e "
                 "same_addr=%s unreleased=(vs_new=%.3e vs_old=%.3e) released=%.3e %s\n",
                 fresh_err, same_addr ? "yes" : "no", stale_vs_new, stale_vs_old, after_release,

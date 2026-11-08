@@ -30,6 +30,13 @@ public:
                   Generation& result, std::string* error=nullptr,
                   const std::function<void(const std::vector<std::uint32_t>&)>& on_tokens={},
                   const GenerationOptions& options={}, const std::atomic<bool>* cancelled=nullptr) const;
+    // Silent one-shot prefill+decode that pays the backend's one-time residency
+    // costs (host->device weight upload, quant repack, heap/PSO creation) at load
+    // time instead of inside the caller's first generate(), where they used to be
+    // charged to prefill. Leaves no prefix/KV state behind. Idempotent; failure is
+    // reported as success because a missing warm pass only costs latency.
+    // ZEN_WARMUP=0 opts out.
+    bool warm(std::string* error=nullptr) const;
     bool generate_speculative(const std::vector<std::uint32_t>& prompt, std::uint32_t max_new, const DenseTransformerRuntime& draft, std::uint32_t draft_tokens, Generation& result, std::string* error=nullptr, const std::function<void(const std::vector<std::uint32_t>&)>& on_tokens={}, const GenerationOptions& options={}, const std::atomic<bool>* cancelled=nullptr) const;
     bool tokenize(const std::string& text, std::vector<std::uint32_t>& ids) const;
     bool detokenize(const std::vector<std::uint32_t>& ids, std::string& text) const;

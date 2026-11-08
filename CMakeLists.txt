@@ -549,7 +549,10 @@ if(ZEN_BUILD_TESTS)
   add_test(NAME zen_core_tests COMMAND zen_core_tests)
   # Coverage builds with atomic profile counters can be much slower on shared
   # CI runners; retain a bounded timeout without killing valid coverage runs.
-  set_tests_properties(zen_core_tests PROPERTIES TIMEOUT 600)
+  # These are CPU-reference assertions (exact Q8_0 GEMV/GEMV-batch parity), so the
+  # D3D12 build's backend auto-opt-in must not route them to the device kernel:
+  # pin the backend off, exactly as the d3d12_* parity suites pin it on.
+  set_tests_properties(zen_core_tests PROPERTIES TIMEOUT 600 ENVIRONMENT "ZEN_BACKEND=cpu")
   add_executable(zen_q35_incremental_tests tests/q35_incremental_tests.cpp)
   target_link_libraries(zen_q35_incremental_tests PRIVATE zen_model_adapters)
   add_executable(zen_q8_1_layout_tests tests/q8_1_layout_tests.cpp)
@@ -567,7 +570,9 @@ if(ZEN_BUILD_TESTS)
   add_executable(zen_cpu_quant_sweep_tests tests/cpu_quant_sweep_tests.cpp)
   target_link_libraries(zen_cpu_quant_sweep_tests PRIVATE zen_core)
   add_test(NAME zen_cpu_quant_sweep_tests COMMAND zen_cpu_quant_sweep_tests)
-  set_tests_properties(zen_cpu_quant_sweep_tests PROPERTIES LABELS "quant;parity;cpu" TIMEOUT 120)
+  # CPU sweep by name and by intent: the D3D12 build must not hand these Q8_0
+  # GEMMs to the integer device kernel, which has different (documented) precision.
+  set_tests_properties(zen_cpu_quant_sweep_tests PROPERTIES LABELS "quant;parity;cpu" TIMEOUT 120 ENVIRONMENT "ZEN_BACKEND=cpu")
   add_executable(zen_q3k_cpu_tests tests/q3k_cpu_tests.cpp)
   target_link_libraries(zen_q3k_cpu_tests PRIVATE zen_core)
   add_test(NAME zen_q3k_cpu_tests COMMAND zen_q3k_cpu_tests)

@@ -29,6 +29,7 @@ public:
         if(!draft){if(e)*e="Draft and target models must use compatible executable adapters";return false;}
         return runtime_.generate_speculative(p,n,draft->runtime_,k,g,e,cb,o,c);
     }
+    bool warm(std::string* e) const override { return runtime_.warm(e); }
 private:
     DenseTransformerRuntime runtime_;
 };
@@ -112,6 +113,11 @@ std::unique_ptr<ModelRuntime> load_model_runtime(const std::filesystem::path& pa
     auto runtime=create_model_runtime(report.config,error);
     if(!runtime)return {};
     if(!runtime->load(path,error))return {};
+    // Charge the backend's one-time residency cost (weight upload, quant repack,
+    // heap/PSO creation) to load rather than to the caller's first generate(),
+    // where it used to show up as prefill. Failure is not fatal: an unwarmed
+    // runtime is only slower on its first request. ZEN_WARMUP=0 opts out.
+    runtime->warm(nullptr);
     return runtime;
 }
 }

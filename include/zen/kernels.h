@@ -57,6 +57,15 @@ bool gemv_tq2_avx2(const std::uint8_t* weights, const float* x, float* y,
                    std::size_t rows, std::size_t columns);
 bool gemv_f16_avx2(const std::uint8_t* weights, const float* x, float* y,
                    std::size_t rows, std::size_t columns);
+// Pre-quantized activation path for Q8_0 int8 GEMV: caller provides xq (int8)
+// and xsc (scales) already quantized once. Used when activation quantization
+// is hoisted out of the parallel row loop.
+bool gemv_q8_0_avx2_int8_prequant(const std::uint8_t* weights,
+                                  const std::int8_t* xq,
+                                  const float* xsc,
+                                  float* y,
+                                  std::size_t rows, std::size_t columns);
+
 // ZI-P5 batched Q8_0 kernel: dequantise one row, then feed each weight vector to
 // up to 8 token accumulators. output points at the first row of this range and
 // is advanced by output_row_stride per token, matching the row-major
