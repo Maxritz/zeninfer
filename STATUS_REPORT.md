@@ -26,20 +26,20 @@ All D3D12 backend parity tests pass. The backend implementation is numerically c
 - **AddN**: Element-wise addition numerically verified
 - **FlashAttention**: Implemented and invoked (trace confirmed), backend UAV fix applied
 
-### ⚠️ Runtime Adapter Issues
-The `dense_transformer_runtime.cpp` has pre-existing structural issues:
-- Brace matching errors when any modifications are made
-- `static_cast<std::uint32_t}(t)` syntax typo in original code (missing `(`)
-- Duplicate `inv_scale` variable declarations in attention block
-- `layer_decode_pipeline` signature mismatch (10 args vs expected)
+### ⚠️ Runtime Adapter Notes (accuracy audit against revision `27e1ade`)
+An evidence-led syntax check of `src/adapters/dense_transformer_runtime.cpp` (`g++ -std=c++20 -Wall -Wextra -Wpedantic`, exit 0) found NONE of the following, so they are treated as stale / already-resolved rather than current defects:
+- No brace-matching errors; the file compiles cleanly.
+- No `static_cast<std::uint32_t}(t)` typo occurs anywhere in the tree.
+- No duplicate `inv_scale` declaration in a single block (the 4 occurrences are in separate functions/scopes).
+- `layer_decode_pipeline` has 3 overloads in `include/zen/d3d12_backend.h`; the runtime's 11-arg call matches overload 3 exactly. All D3D12 calls are `#if defined(ZEN_HAS_D3D12)`-guarded.
 
-These are pre-existing codebase issues, not introduced by the backend work.
+These items should not be re-opened as defects unless they reproduce on a clean build. All D3D12 statements in this report (backend fixes, FlashAttention invocation, tok/s figures) are reporter claims measured on a Windows/RX 9070 XT machine and are NOT independently validated on this Linux checkout.
 
 ### 🔧 Fixes Applied
-1. **Backend UAV Flag Fix** (`d3d12_backend.cpp`): Added `D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS` to FlashAttention output buffer creation
-2. **Device Attention Available** (`dense_transformer_runtime.cpp`): Removed permanent failure latch, allow retries
-3. **Backend Initialization** (`dense_transformer_runtime.cpp`): Added explicit `zen::d3d12::init()` call in `forward_batch`
-4. **FlashAttention Trace**: Comprehensive STRACE logging for debugging
+1. **Backend UAV Flag Fix** (`d3d12_backend.cpp`): Added `D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS` to FlashAttention output buffer creation (reporter-claimed; Windows-only, not run here).
+2. **Device Attention Available** (`dense_transformer_runtime.cpp`): Removed permanent failure latch, allow retries (reporter-claimed).
+3. **Backend Initialization** (`dense_transformer_runtime.cpp`): Added explicit `zen::d3d12::init()` call in `forward_batch` (reporter-claimed).
+4. **FlashAttention Trace**: Comprehensive STRACE logging for debugging (reporter-claimed).
 
 ### 📊 FlashAttention Status
 - **Invocation**: Confirmed via STRACE logging (`[d3d12] flash_attention: START tokens=128 heads=32 kv_heads=8 head_dim=64 layer=0 start_pos=0`)

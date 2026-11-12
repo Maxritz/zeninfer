@@ -37,7 +37,7 @@ Started the newly built `zen_server` with `tinyllama-15M-stories-Q2_K.gguf` on l
 
 - This verifies Linux/GCC, not Windows/MSVC. The repository has a Windows CI matrix, but no Windows runner was executed during this work.
 - The two supplied fixtures are Llama fixtures. No Qwen2 reference fixture was supplied, so Qwen2 execution and independent parity are not verified here.
-- Qwen3, MoE, BitNet and Bonsai remain unsupported and are rejected by architecture dispatch.
+- The factory (`src/adapters/dense_transformer_adapter.cpp`) dispatches `qwen3`, `qwen3moe` and `bitnet` to an executable `DenseTransformerAdapter` (asserted non-null in `tests/core_tests.cpp`); `bonsai` is correctly rejected (`== nullptr`). Real-model parity for Qwen3/BitNet/Qwen2 remains open and is tracked in `docs/REMAINING_WORK.md` (ZI-001/ZI-002/ZI-003/ZI-010), not by factory dispatch alone.
 - Chat formatting is separated from the HTTP backend, but the formatter still implements legacy format heuristics. It is not a general Jinja interpreter.
 - FP16 storage/decode is not native CPU FP16 arithmetic.
 - Existing mmap/prefetch is not application-managed NVMe eviction/streaming.
