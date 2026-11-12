@@ -21,12 +21,11 @@ scalar-only and ASan/UBSan configurations after the changes.
    (`zen_governance_check`) whenever Python 3 is available.
 
 3. **Compiler warnings in the newest forward path.**
-   `src/adapters/dense_transformer_runtime.cpp` (`forward_q35_batch`) carried
-   `-Wunused-variable` (`head_v`, `head_v_dim`) and `-Wmisleading-indentation`
-   in the full-attention softmax loop, where the guard `return false` and the
-   running max update were crammed onto one line. Dead variables are removed
-   and the guard/max statements are split so the control flow reads the way it
-   compiles.
+   Audit against revision `27e1ade`: `head_v` / `head_v_dim` do not occur in
+   `src/adapters/dense_transformer_runtime.cpp`, and the file compiles cleanly
+   under `-Wall -Wextra -Wpedantic` (exit 0). No `-Wunused-variable` or
+   `-Wmisleading-indentation` finding reproduces; this entry is treated as
+   already-resolved / stale and is not a current defect.
 
 4. **Stale verification claims.** `docs/WORKING_COPY_0.4.6.md` reported "8/8"
    for a suite that no longer matches that count in either direction. The

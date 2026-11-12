@@ -165,7 +165,10 @@ bool finite_values(const float* p,std::size_t n){
     static const bool avx2=zen::cpu_has_avx2_fma();
     if(avx2&&n>=8)return zen::all_finite_f32_avx2(p,n);
 #endif
-    for(std::size_t i=0;i<n;++i)if(!std::isfinite(p[i]))return false;return true;}
+    for(std::size_t i=0;i<n;++i){
+        if(!std::isfinite(p[i]))return false;
+    }
+    return true;}
 // ZI-P4: elementwise helpers. The scalar path stays the numerical reference for
 // non-AVX2 builds; the AVX2 implementations live in kernels/avx2.cpp.
 static inline float dot_f32(const float* a,const float* b,std::size_t n){
@@ -730,9 +733,10 @@ bool DenseTransformerRuntime::load(const std::filesystem::path& path,std::string
     const bool muse_arch=(report.config.architecture==model::Architecture::qwen&&architecture_name_=="muse-glimmer");
     const bool mellum_arch=(report.config.architecture==model::Architecture::qwen&&architecture_name_=="mellum");
     const bool phi3_arch=(report.config.architecture==model::Architecture::qwen&&architecture_name_=="phi3");
-    const bool hybrid_stmt=(architecture_name_=="nemotron_h_moe"&&false);
-    if(!llama_arch&&!qwen2_arch&&!qwen3_arch&&!bitnet_arch&&!qwen35_arch&&!qwen3moe_arch&&!olmoe_arch&&!qwen2moe_arch&&!laguna_arch&&!lfm2moe_arch&&!llama_moe_arch&&!nemotron_arch&&!dflash_arch&&!gemma_arch&&!phi3_arch&&!deepseek_arch&&!starcoder2_arch&&!k2_arch&&!gpt_oss_arch&&!spark_arch&&!mellum_arch&&!muse_arch&&!flint_arch&&!hybrid_stmt)return fail("Recognised architecture '"+architecture_name_+"' has no executable runtime adapter yet (dense Llama, Qwen2, Qwen3, BitNet, Qwen3.5-hybrid, Phi3, DeepSeek2, Starcoder2, K2-Horizon, GPT-OSS, Spark-X2.5, Mellum, Muse-Glimmer, DFlash/LFM2MoE/Nemotron/Gemma4 and Qwen2/3/Llama/OLMoE/Laguna-MoE are supported)");
-    if(hybrid_stmt)return fail("Hybrid SSM/shortconv forward not yet implemented for '"+architecture_name_+"' (per-layer arrays parsed; needs mamba2/shortconv kernels)");
+    // `nemotron_h_moe` is already covered by `nemotron_arch` above; no separate
+    // hybrid flag is needed. Keep this single dispatch gate so the factory and
+    // load() stay aligned (see docs/AUDIT_REPORT_0.4.6.md F-04).
+    if(!llama_arch&&!qwen2_arch&&!qwen3_arch&&!bitnet_arch&&!qwen35_arch&&!qwen3moe_arch&&!olmoe_arch&&!qwen2moe_arch&&!laguna_arch&&!lfm2moe_arch&&!llama_moe_arch&&!nemotron_arch&&!dflash_arch&&!gemma_arch&&!phi3_arch&&!deepseek_arch&&!starcoder2_arch&&!k2_arch&&!gpt_oss_arch&&!spark_arch&&!mellum_arch&&!muse_arch&&!flint_arch)return fail("Recognised architecture '"+architecture_name_+"' has no executable runtime adapter yet (dense Llama, Qwen2, Qwen3, BitNet, Qwen3.5-hybrid, Phi3, DeepSeek2, Starcoder2, K2-Horizon, GPT-OSS, Spark-X2.5, Mellum, Muse-Glimmer, DFlash/LFM2MoE/Nemotron/Gemma4 and Qwen2/3/Llama/OLMoE/Laguna-MoE are supported)");
     const bool moe_arch=qwen3moe_arch||olmoe_arch||qwen2moe_arch||laguna_arch||lfm2moe_arch||llama_moe_arch||(architecture_name_=="nemotron_h_moe")||(architecture_name_=="qwen35moe")||(gemma_arch&&report.config.expert_count>0)||(deepseek_arch&&report.config.expert_count>0)||(k2_arch&&report.config.expert_count>0)||(gpt_oss_arch&&report.config.expert_count>0)||(mellum_arch&&report.config.expert_count>0)||(flint_arch&&report.config.expert_count>0);
     if((report.config.expert_count>0||architecture_name_.find("moe")!=std::string::npos)&&!moe_arch)return fail("MoE execution is not supported by this dense-model adapter");
     if(moe_arch){config_.moe_expert_count=report.config.expert_count;config_.moe_used_count=report.config.expert_used_count;config_.moe_sigmoid=laguna_arch||(architecture_name_=="nemotron_h_moe")||k2_arch||flint_arch;}
@@ -3493,7 +3497,7 @@ bool DenseTransformerRuntime::forward_batch(const std::vector<std::uint32_t>& to
                     if(!tensor_matvec(su,norm.data()+t*E,eUp.data(),EF,E)){std::fprintf(stderr,"[fl] su fail t=%zu\n",t);std::fflush(stderr);return false;}
                     if(config_.gpt_oss_variant){
                         // per-expert biases: [row, N] bundled, col e at e*row.
-                        const auto* gb=tensor(p+"ffn_gate_exps.bias");const auto* ub=tensor(p+"ffn_up_exps.bias");const auto* db=tensor(p+"ffn_down_exps.bias");
+                        const auto* gb=tensor(p+"ffn_gate_exps.bias");const auto* ub=tensor(p+"ffn_up_exps.bias");
                         if(!gb||!ub||gb->values.size()<EF*EN||ub->values.size()<EF*EN)return false;
                         for(std::size_t k2=0;k2<EF;++k2){eGate[k2]+=gb->values[std::size_t(e)*EF+k2];eUp[k2]+=ub->values[std::size_t(e)*EF+k2];}
                     }
